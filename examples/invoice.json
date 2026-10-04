@@ -1,0 +1,8 @@
+{
+  "number": "INV-2044",
+  "vendor": "ABC Supplies",
+  "currency": "USD",
+  "items": [
+    {"sku": "A100", "qty": 100, "price": 10}
+  ]
+}

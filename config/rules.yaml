@@ -1,0 +1,15 @@
+# Percentages are relative to the expected value. Currency rates convert each
+# document currency into base_currency; keep these rates current in production.
+rules:
+  quantity_variance:
+    tolerance: 2%
+  price_variance:
+    tolerance: 1%
+  tax_variance:
+    tolerance: 0.5%
+  currency:
+    base_currency: USD
+    rates_to_base:
+      USD: 1
+  approval:
+    auto_approve_matches: false

@@ -1,0 +1,24 @@
+{
+  "po": {
+    "number": "PO-10291",
+    "vendor": "ABC Supplies",
+    "currency": "USD",
+    "items": [
+      {"sku": "A100", "qty": 100, "price": 10}
+    ]
+  },
+  "receipt": {
+    "number": "GR-10291",
+    "items": [
+      {"sku": "A100", "qty": 95}
+    ]
+  },
+  "invoice": {
+    "number": "INV-2044",
+    "vendor": "ABC Supplies",
+    "currency": "USD",
+    "items": [
+      {"sku": "A100", "qty": 100, "price": 10}
+    ]
+  }
+}

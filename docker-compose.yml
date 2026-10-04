@@ -1,0 +1,32 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://invoice_match:invoice_match@db:5432/invoice_match
+      INVOICE_MATCH_RULES: /app/config/rules.yaml
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: invoice_match
+      POSTGRES_USER: invoice_match
+      POSTGRES_PASSWORD: invoice_match
+    ports:
+      - "5432:5432"
+    volumes:
+      - invoice_match_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoice_match -d invoice_match"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  invoice_match_data:
