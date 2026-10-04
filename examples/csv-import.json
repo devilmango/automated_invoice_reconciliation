@@ -1,0 +1,5 @@
+{
+  "po_csv": "number,vendor,currency,cost_center,sku,qty,price,tax_rate,tax_code\nPO-10291,ABC Supplies,USD,OPS,A100,100,10,0.08,STANDARD\n",
+  "receipt_csv": "number,sku,qty\nGR-2044,A100,95\n",
+  "invoice_csv": "number,vendor,currency,sku,qty,price,tax_amount\nINV-2044,ABC Supplies,USD,A100,100,10,80\n"
+}

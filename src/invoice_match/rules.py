@@ -3,9 +3,45 @@ from __future__ import annotations
 import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class ApprovalPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    min_invoice_total: Decimal | None = Field(default=None, ge=0)
+    max_invoice_total: Decimal | None = Field(default=None, ge=0)
+    min_variance_amount: Decimal | None = Field(default=None, ge=0)
+    max_variance_amount: Decimal | None = Field(default=None, ge=0)
+    vendor: str | None = None
+    cost_center: str | None = None
+    required_role: Literal["approver", "admin"] = "approver"
+    approvals_required: int = Field(default=1, ge=1, le=10)
+    assigned_to: str | None = None
+    sla_hours: int = Field(default=72, ge=1, le=8760)
+
+    def matches(
+        self,
+        *,
+        vendor: str,
+        cost_center: str | None,
+        invoice_total: Decimal,
+        variance_amount: Decimal,
+    ) -> bool:
+        def normalized(value: str | None) -> str | None:
+            return " ".join(value.casefold().split()) if value else None
+
+        return all((
+            self.min_invoice_total is None or invoice_total >= self.min_invoice_total,
+            self.max_invoice_total is None or invoice_total <= self.max_invoice_total,
+            self.min_variance_amount is None or variance_amount >= self.min_variance_amount,
+            self.max_variance_amount is None or variance_amount <= self.max_variance_amount,
+            self.vendor is None or normalized(vendor) == normalized(self.vendor),
+            self.cost_center is None or normalized(cost_center) == normalized(self.cost_center),
+        ))
 
 
 class ToleranceRules(BaseModel):
@@ -13,9 +49,31 @@ class ToleranceRules(BaseModel):
     quantity_variance: Decimal = Decimal("0.02")
     price_variance: Decimal = Decimal("0.01")
     tax_variance: Decimal = Decimal("0.005")
+    amount_variance: Decimal = Decimal("0.005")
     base_currency: str = "USD"
     rates_to_base: dict[str, Decimal] = Field(default_factory=lambda: {"USD": Decimal(1)})
+    minor_units: dict[str, int] = Field(default_factory=lambda: {"USD": 2})
     auto_approve_matches: bool = False
+    approval_policies: list[ApprovalPolicy] = Field(default_factory=list)
+
+
+def select_approval_policy(
+    rules: ToleranceRules,
+    *,
+    vendor: str,
+    cost_center: str | None,
+    invoice_total: Decimal,
+    variance_amount: Decimal,
+) -> ApprovalPolicy:
+    for policy in rules.approval_policies:
+        if policy.matches(
+            vendor=vendor,
+            cost_center=cost_center,
+            invoice_total=invoice_total,
+            variance_amount=variance_amount,
+        ):
+            return policy
+    return ApprovalPolicy(name="default")
 
 
 def _ratio(value: object, key: str) -> Decimal:
@@ -48,11 +106,20 @@ def load_rules(path: str | Path | None = None) -> ToleranceRules:
     base = str(currencies.get("base_currency", "USD")).upper()
     if base not in parsed_rates or parsed_rates.get(base) != Decimal(1) or any(rate <= 0 for rate in parsed_rates.values()):
         raise ValueError("currency rates must be positive and set the base currency rate to 1")
+    minor_units = {str(code).upper(): int(value) for code, value in currencies.get("minor_units", {}).items()}
+    if any(places < 0 or places > 6 for places in minor_units.values()):
+        raise ValueError("currency minor-unit precision must be between 0 and 6")
+    minor_units.setdefault(base, 2)
+
+    policies = [ApprovalPolicy.model_validate(policy) for policy in approval.get("policies", [])]
     return ToleranceRules(
         quantity_variance=_ratio(rules.get("quantity_variance", {}).get("tolerance", "2%"), "quantity_variance"),
         price_variance=_ratio(rules.get("price_variance", {}).get("tolerance", "1%"), "price_variance"),
         tax_variance=_ratio(rules.get("tax_variance", {}).get("tolerance", "0.5%"), "tax_variance"),
+        amount_variance=_ratio(rules.get("amount_variance", {}).get("tolerance", "0.5%"), "amount_variance"),
         base_currency=base,
         rates_to_base=parsed_rates,
+        minor_units=minor_units,
         auto_approve_matches=bool(approval.get("auto_approve_matches", False)),
+        approval_policies=policies,
     )

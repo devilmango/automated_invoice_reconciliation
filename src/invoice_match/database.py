@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, create_engine
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -29,6 +29,9 @@ def utc_now() -> datetime:
 
 class MatchRecord(Base):
     __tablename__ = "matches"
+    __table_args__ = (
+        Index("uq_matches_vendor_invoice_number", "vendor_key", "invoice_number_key", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     status: Mapped[str] = mapped_column(String(16), index=True)
@@ -36,7 +39,18 @@ class MatchRecord(Base):
     po_number: Mapped[str] = mapped_column(String(100), index=True)
     invoice_number: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     vendor: Mapped[str] = mapped_column(String(255), index=True)
+    vendor_key: Mapped[str] = mapped_column(String(255))
     reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    invoice_number_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cost_center: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approval_policy: Mapped[str] = mapped_column(String(100), default="default")
+    required_role: Mapped[str] = mapped_column(String(32), default="approver")
+    approvals_required: Mapped[int] = mapped_column(Integer, default=1)
+    approvals_received: Mapped[int] = mapped_column(Integer, default=0)
+    assigned_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     input_data: Mapped[dict] = mapped_column(JSON)
     result_data: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -61,3 +75,13 @@ class AuditEvent(Base):
     actor: Mapped[str] = mapped_column(String(255))
     details: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class APOutboxRecord(Base):
+    __tablename__ = "ap_outbox"
+
+    match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

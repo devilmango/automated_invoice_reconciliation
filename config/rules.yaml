@@ -9,7 +9,27 @@ rules:
     tolerance: 0.5%
   currency:
     base_currency: USD
+    minor_units:
+      USD: 2
+      EUR: 2
+      JPY: 0
+      KWD: 3
     rates_to_base:
       USD: 1
+      EUR: 1.08
+      JPY: 0.0067
+      KWD: 3.25
+  amount_variance:
+    tolerance: 0.5%
   approval:
     auto_approve_matches: false
+    policies:
+      - name: high-value-two-step
+        min_invoice_total: 10000
+        required_role: admin
+        approvals_required: 2
+        sla_hours: 24
+      - name: default
+        required_role: approver
+        approvals_required: 1
+        sla_hours: 72

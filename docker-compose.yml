@@ -7,6 +7,7 @@ services:
       DATABASE_URL: postgresql+psycopg://invoice_match:invoice_match@db:5432/invoice_match
       INVOICE_MATCH_RULES: /app/config/rules.yaml
       REVIEWER_TOKENS: "${REVIEWER_TOKENS:?Set REVIEWER_TOKENS in .env; see .env.example}"
+      INTEGRATION_TOKENS: "${INTEGRATION_TOKENS:?Set INTEGRATION_TOKENS in .env; see .env.example}"
     volumes:
       - ./config:/app/config:ro
     depends_on:

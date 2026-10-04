@@ -96,7 +96,7 @@ def test_prices_in_different_currencies_compare_in_base_currency():
 
 def test_currency_without_configured_conversion_rate_is_an_exception():
     payload = sample_request()
-    payload["po"]["currency"] = "EUR"
+    payload["po"]["currency"] = "CAD"
     payload["receipt"]["items"][0]["qty"] = 100
 
     result = evaluate(payload)
@@ -141,3 +141,65 @@ def test_duplicate_sku_rows_use_weighted_average_unit_price():
     result = evaluate(payload)
 
     assert result.status == MatchStatus.MATCHED
+
+
+def test_line_discounts_are_included_in_unit_price_matching():
+    payload = sample_request()
+    payload["receipt"]["items"][0]["qty"] = 100
+    payload["po"]["items"][0]["discount_rate"] = "0.10"
+    payload["invoice"]["items"][0]["discount_rate"] = "0.10"
+
+    result = evaluate(payload)
+
+    assert result.status == MatchStatus.MATCHED
+
+
+def test_line_tax_code_mismatch_is_reported():
+    payload = sample_request()
+    payload["receipt"]["items"][0]["qty"] = 100
+    payload["po"]["items"][0].update({"tax_code": "STANDARD", "tax_rate": "0.1"})
+    payload["invoice"]["items"][0].update({"tax_code": "REDUCED", "tax_rate": "0.05"})
+
+    result = evaluate(payload)
+
+    reasons = {issue.reason for issue in result.discrepancies}
+    assert "TAX_CODE_MISMATCH" in reasons
+    assert "TAX_RATE_MISMATCH" in reasons
+
+
+def test_freight_variance_is_reported():
+    payload = sample_request()
+    payload["receipt"]["items"][0]["qty"] = 100
+    payload["po"]["freight_amount"] = "10"
+    payload["invoice"]["freight_amount"] = "25"
+
+    result = evaluate(payload)
+
+    assert "FREIGHT_MISMATCH" in {issue.reason for issue in result.discrepancies}
+
+
+def test_money_rounding_uses_base_currency_minor_units():
+    payload = sample_request()
+    payload["receipt"]["items"][0]["qty"] = 100
+    payload["invoice"]["items"][0]["price"] = "10.004"
+    rules = ToleranceRules(price_variance=Decimal(0), minor_units={"USD": 2})
+
+    result = evaluate(payload, rules)
+
+    assert result.status == MatchStatus.MATCHED
+
+
+def test_invoice_total_includes_tax_freight_and_document_discount():
+    payload = sample_request()
+    payload["receipt"]["items"][0]["qty"] = 100
+    payload["po"]["tax_rate"] = "0.1"
+    payload["po"]["freight_amount"] = "50"
+    payload["po"]["discount_amount"] = "10"
+    payload["invoice"]["tax_amount"] = "100"
+    payload["invoice"]["freight_amount"] = "50"
+    payload["invoice"]["discount_amount"] = "10"
+    payload["invoice"]["total_amount"] = "1080"
+
+    result = evaluate(payload)
+
+    assert "INVOICE_TOTAL_MISMATCH" in {issue.reason for issue in result.discrepancies}
