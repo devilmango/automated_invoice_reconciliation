@@ -61,7 +61,3 @@ class AuditEvent(Base):
     actor: Mapped[str] = mapped_column(String(255))
     details: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-
-
-def init_db() -> None:
-    Base.metadata.create_all(bind=engine)

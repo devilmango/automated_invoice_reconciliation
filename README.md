@@ -12,9 +12,12 @@ Documents enter as validated JSON. Connect an ERP, document management system, o
 - **Tolerance rules:** Tune quantity, price, and tax variances in YAML.
 - **Currency conversion:** Compare document prices in a configured base currency using operator-supplied rates.
 - **Exception queue:** List, approve, and reject discrepancies through the API.
-- **Audit history:** Record match creation and approval decisions with actor and comment details.
+- **Reviewer authentication:** Protect exception, match-read, and audit routes with named bearer-token credentials.
+- **Audit history:** Record match creation and approval decisions with authenticated reviewer identity and comment details.
+- **Database migrations:** Evolve PostgreSQL and SQLite schemas with Alembic revisions.
 - **Persistent storage:** Use PostgreSQL in Docker Compose or SQLite for local development.
 - **Two interfaces:** Run one-off matches from the CLI or submit matches to the FastAPI service.
+- **Continuous integration:** Run the matching and reviewer workflow suite on pushes and pull requests.
 
 ## How matching works
 
@@ -72,11 +75,16 @@ invoice-match match --help
 
 ## Run the API locally
 
-The API uses SQLite by default and creates `invoice_match.db` in the current working directory when it starts.
+For local use, the API stores data in SQLite. Configure at least one named reviewer token and apply the initial database migration before starting the API:
 
 ```bash
+export DATABASE_URL='sqlite:///./invoice_match.db'
+export REVIEWER_TOKENS='{"finance-reviewer":"replace-with-a-long-random-secret"}'
+alembic upgrade head
 invoice-match serve
 ```
+
+Reviewer routes fail closed with HTTP `503` when `REVIEWER_TOKENS` is not configured or contains invalid credentials. The value is a JSON object mapping reviewer names to unique bearer tokens of at least 32 characters. Keep real tokens in a secret manager or local environment file, and do not commit them.
 
 The service listens on `http://127.0.0.1:8000`. Open [the interactive Swagger UI](http://127.0.0.1:8000/docs) or [the ReDoc API reference](http://127.0.0.1:8000/redoc).
 
@@ -101,39 +109,44 @@ The API returns a match ID, status, discrepancies, and approval status. An excep
 
 ### Review and decide an exception
 
-List open exceptions, oldest first:
+Reviewer routes require an `Authorization: Bearer <token>` header. The example below uses the `finance-reviewer` token configured above. List open exceptions, oldest first:
 
 ```bash
-curl http://127.0.0.1:8000/exceptions
+curl http://127.0.0.1:8000/exceptions \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret'
 ```
 
 Get all exceptions, including closed items:
 
 ```bash
-curl 'http://127.0.0.1:8000/exceptions?status=ALL'
+curl 'http://127.0.0.1:8000/exceptions?status=ALL' \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret'
 ```
 
 Approve or reject a pending exception using its `match_id`:
 
 ```bash
 curl --request POST http://127.0.0.1:8000/exceptions/MATCH_ID/approve \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret' \
   --header 'Content-Type: application/json' \
-  --data '{"actor":"finance-reviewer","comment":"Approved against supplier confirmation."}'
+  --data '{"comment":"Approved against supplier confirmation."}'
 ```
 
 ```bash
 curl --request POST http://127.0.0.1:8000/exceptions/MATCH_ID/reject \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret' \
   --header 'Content-Type: application/json' \
-  --data '{"actor":"finance-reviewer","comment":"Please request a corrected invoice."}'
+  --data '{"comment":"Please request a corrected invoice."}'
 ```
 
 Retrieve the decision history for a match:
 
 ```bash
-curl http://127.0.0.1:8000/matches/MATCH_ID/audit
+curl http://127.0.0.1:8000/matches/MATCH_ID/audit \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret'
 ```
 
-An exception can only be decided once. A repeated decision returns HTTP `409`; an unknown match ID returns HTTP `404`.
+Audit actor identity comes from the matched bearer token's configured reviewer name; clients cannot choose or spoof the reviewer name in the decision body. An exception can only be decided once. A repeated decision returns HTTP `409`; an unknown match ID returns HTTP `404`; missing or invalid credentials return HTTP `401`.
 
 ## API reference
 
@@ -141,11 +154,11 @@ An exception can only be decided once. A repeated decision returns HTTP `409`; a
 | --- | --- | --- |
 | `GET` | `/health` | Service health check |
 | `POST` | `/matches` | Match and persist PO, receipt, and invoice documents |
-| `GET` | `/matches/{match_id}` | Retrieve a stored match result |
-| `GET` | `/matches/{match_id}/audit` | Retrieve the match audit events |
-| `GET` | `/exceptions?status=OPEN\|CLOSED\|ALL` | List exceptions; defaults to `OPEN` |
-| `POST` | `/exceptions/{match_id}/approve` | Approve a pending exception |
-| `POST` | `/exceptions/{match_id}/reject` | Reject a pending exception |
+| `GET` | `/matches/{match_id}` | Retrieve a stored match result (reviewer bearer token required) |
+| `GET` | `/matches/{match_id}/audit` | Retrieve audit events (reviewer bearer token required) |
+| `GET` | `/exceptions?status=OPEN\|CLOSED\|ALL` | List exceptions; defaults to `OPEN` (reviewer bearer token required) |
+| `POST` | `/exceptions/{match_id}/approve` | Approve a pending exception (reviewer bearer token required) |
+| `POST` | `/exceptions/{match_id}/reject` | Reject a pending exception (reviewer bearer token required) |
 
 Interactive API documentation is available at `/docs` and `/redoc` while the service is running.
 
@@ -212,9 +225,11 @@ Rates are static configuration values supplied by the operator. This application
 
 ## Run with Docker Compose
 
-Docker Compose starts the API and PostgreSQL with a persistent database volume:
+Set reviewer credentials, then start the API and PostgreSQL with a persistent database volume. The Compose startup command applies pending migrations before serving requests.
 
 ```bash
+cp .env.example .env
+# Edit REVIEWER_TOKENS in .env and replace the example token.
 docker compose up --build
 ```
 
@@ -228,15 +243,18 @@ The Compose file uses development credentials. Change credentials and manage the
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite:///./invoice_match.db` | SQLAlchemy database URL |
 | `INVOICE_MATCH_RULES` | `config/rules.yaml` | YAML rules path |
+| `REVIEWER_TOKENS` | unset | JSON object mapping reviewer names to bearer tokens |
 
 Example PostgreSQL URL:
 
 ```bash
 export DATABASE_URL='postgresql+psycopg://invoice_match:your-password@localhost:5432/invoice_match'
+export REVIEWER_TOKENS='{"finance-reviewer":"replace-with-a-long-random-secret"}'
+alembic upgrade head
 invoice-match serve
 ```
 
-The application creates its tables at startup. Match inputs and results are stored in `matches`; open and closed review items in `exceptions`; and submission and decision events in `audit_events`.
+Schema changes are managed with Alembic. Run `alembic upgrade head` after installing a new version and before starting the API; Docker Compose does this at container start. To inspect migration state or generate a migration during development, use `alembic current`, `alembic history`, and `alembic revision --autogenerate -m "describe schema change"`, then review and edit generated migration scripts before applying them. If upgrading a database created by an earlier version of this project that used `create_all`, stop the API and run `alembic stamp 0001_initial` once to mark the existing schema as the initial revision; then use `alembic upgrade head` normally. Match inputs and results are stored in `matches`; open and closed review items in `exceptions`; and submission and decision events in `audit_events`.
 
 ## Project layout
 
@@ -250,6 +268,8 @@ src/invoice_match/matcher.py  Three-way matching rules
 src/invoice_match/parsers.py  JSON document parsers
 src/invoice_match/rules.py    YAML rule loading and validation
 src/invoice_match/schemas.py  Pydantic request and response schemas
+migrations/                   Alembic environment and schema revisions
+tests/                        Matching and reviewer workflow tests
 ```
 
 ## Development
@@ -257,15 +277,16 @@ src/invoice_match/schemas.py  Pydantic request and response schemas
 Install the package in editable mode and inspect the available commands:
 
 ```bash
-python -m pip install -e .
+python -m pip install -e '.[dev]'
+pytest
 invoice-match --help
 ```
 
-The database schema is initialized automatically when the API starts. If you change model schemas for a deployed database, add and apply a database migration as part of that change; `create_all` does not migrate existing tables.
+The automated suite covers matching decisions, tolerance boundaries, currency conversion, tax checks, and authenticated approval/rejection behavior including audit identity and one-time decisions.
 
 ## Security and scope
 
-The API does not implement authentication or role-based access control. `X-Actor` and approval `actor` fields identify the caller for the audit record; they do not authenticate that caller. Put the API behind an authenticated gateway and restrict access to approval routes before using real financial records.
+Reviewer list, read, audit, approve, and reject routes use bearer tokens configured by reviewer name in `REVIEWER_TOKENS`. Every configured reviewer has the same read, approve, and reject permissions; per-role authorization is not implemented. Store tokens in a secret manager in deployed environments and rotate them when access changes. `POST /matches` and `/health` remain unauthenticated integration endpoints; restrict network access to match submission and place the API behind an authenticated gateway or service network before using real financial records. The example PostgreSQL credentials in Docker Compose are for local development only.
 
 This project validates and matches structured JSON. It does not perform OCR, connect to ERP/AP systems, initiate payments, or fetch live exchange rates. Tax is checked only when both the PO tax rate and invoice tax amount are supplied. Review tolerances, tax assumptions, and rates against your accounting policy before processing live invoices.
 

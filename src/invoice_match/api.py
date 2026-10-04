@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from datetime import timezone
 from uuid import uuid4
 
@@ -8,23 +7,17 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .database import AuditEvent, ExceptionRecord, MatchRecord, SessionLocal, init_db
+from .database import AuditEvent, ExceptionRecord, MatchRecord, SessionLocal
 from .matcher import match_documents
 from .rules import load_rules
+from .reviewer_auth import require_reviewer
 from .schemas import ApprovalDecision, AuditEntry, ExceptionQueueItem, MatchRequest, MatchResult, MatchStatus
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    init_db()
-    yield
 
 
 app = FastAPI(
     title="invoice-match",
     description="A lightweight, self-hosted three-way invoice matching engine for SMB finance teams.",
     version="0.1.0",
-    lifespan=lifespan,
 )
 
 
@@ -83,7 +76,11 @@ def create_match(
 
 
 @app.get("/matches/{match_id}", response_model=MatchResult)
-def get_match(match_id: str, session: Session = Depends(get_session)):
+def get_match(
+    match_id: str,
+    session: Session = Depends(get_session),
+    reviewer: str = Depends(require_reviewer),
+):
     record = session.get(MatchRecord, match_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Match not found")
@@ -94,6 +91,7 @@ def get_match(match_id: str, session: Session = Depends(get_session)):
 def list_exceptions(
     status: str = Query(default="OPEN", pattern="^(OPEN|CLOSED|ALL)$"),
     session: Session = Depends(get_session),
+    reviewer: str = Depends(require_reviewer),
 ):
     query = select(ExceptionRecord, MatchRecord).join(MatchRecord, ExceptionRecord.match_id == MatchRecord.id)
     if status != "ALL":
@@ -116,6 +114,7 @@ def _decide(
     match_id: str,
     decision: ApprovalDecision,
     outcome: str,
+    reviewer: str,
     session: Session,
 ):
     record = session.get(MatchRecord, match_id)
@@ -132,7 +131,7 @@ def _decide(
     session.add(AuditEvent(
         match_id=match_id,
         event_type=f"EXCEPTION_{outcome}",
-        actor=decision.actor,
+        actor=reviewer,
         details={"comment": decision.comment},
     ))
     session.commit()
@@ -144,8 +143,9 @@ def approve_exception(
     match_id: str,
     decision: ApprovalDecision,
     session: Session = Depends(get_session),
+    reviewer: str = Depends(require_reviewer),
 ):
-    return _decide(match_id, decision, "APPROVED", session)
+    return _decide(match_id, decision, "APPROVED", reviewer, session)
 
 
 @app.post("/exceptions/{match_id}/reject", response_model=MatchResult)
@@ -153,12 +153,17 @@ def reject_exception(
     match_id: str,
     decision: ApprovalDecision,
     session: Session = Depends(get_session),
+    reviewer: str = Depends(require_reviewer),
 ):
-    return _decide(match_id, decision, "REJECTED", session)
+    return _decide(match_id, decision, "REJECTED", reviewer, session)
 
 
 @app.get("/matches/{match_id}/audit", response_model=list[AuditEntry])
-def match_audit(match_id: str, session: Session = Depends(get_session)):
+def match_audit(
+    match_id: str,
+    session: Session = Depends(get_session),
+    reviewer: str = Depends(require_reviewer),
+):
     if session.get(MatchRecord, match_id) is None:
         raise HTTPException(status_code=404, detail="Match not found")
     events = session.scalars(

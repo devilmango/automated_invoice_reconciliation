@@ -75,7 +75,6 @@ class MatchResult(StrictModel):
 
 
 class ApprovalDecision(StrictModel):
-    actor: str = Field(min_length=1)
     comment: str | None = None
 
 
