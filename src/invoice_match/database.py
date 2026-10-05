@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, String, create_engine
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, String, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -47,10 +47,14 @@ class MatchRecord(Base):
     cost_center: Mapped[str | None] = mapped_column(String(100), nullable=True)
     approval_policy: Mapped[str] = mapped_column(String(100), default="default")
     required_role: Mapped[str] = mapped_column(String(32), default="approver")
+    escalation_role: Mapped[str] = mapped_column(String(32), default="admin")
     approvals_required: Mapped[int] = mapped_column(Integer, default=1)
     approvals_received: Mapped[int] = mapped_column(Integer, default=0)
     assigned_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rule_version_id: Mapped[str | None] = mapped_column(ForeignKey("rule_versions.id"), nullable=True)
+    rule_digest: Mapped[str] = mapped_column(String(64), default="")
+    rule_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     input_data: Mapped[dict] = mapped_column(JSON)
     result_data: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -63,6 +67,9 @@ class ExceptionRecord(Base):
     match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), unique=True, index=True)
     queue_status: Mapped[str] = mapped_column(String(16), default="OPEN", index=True)
     discrepancies: Mapped[list] = mapped_column(JSON)
+    escalated: Mapped[bool] = mapped_column(default=False, index=True)
+    escalated_to: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -114,6 +121,41 @@ class DocumentCaptureEvent(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     document_id: Mapped[str] = mapped_column(ForeignKey("captured_documents.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    actor: Mapped[str] = mapped_column(String(255))
+    details: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class RuleVersionRecord(Base):
+    __tablename__ = "rule_versions"
+    __table_args__ = (
+        Index(
+            "uq_rule_versions_single_active",
+            "status",
+            unique=True,
+            sqlite_where=text("status = 'ACTIVE'"),
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    digest: Mapped[str] = mapped_column(String(64), index=True)
+    content: Mapped[str] = mapped_column(String)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT", index=True)
+    created_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    activated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RuleVersionEvent(Base):
+    __tablename__ = "rule_version_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rule_version_id: Mapped[str] = mapped_column(ForeignKey("rule_versions.id"), index=True)
     event_type: Mapped[str] = mapped_column(String(40), index=True)
     actor: Mapped[str] = mapped_column(String(255))
     details: Mapped[dict] = mapped_column(JSON)

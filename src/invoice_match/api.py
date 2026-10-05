@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,16 +22,19 @@ from .database import (
     DocumentCaptureEvent,
     ExceptionRecord,
     MatchRecord,
+    RuleVersionEvent,
+    RuleVersionRecord,
     SessionLocal,
 )
 from .document_capture import extract_document
 from .integration_auth import require_integration
 from .matcher import match_documents
-from .reviewer_auth import Principal, require_approver, require_reviewer
-from .rules import load_rules
+from .reviewer_auth import Principal, require_admin, require_approver, require_reviewer
+from .rules import ToleranceRules, load_rules, parse_rules_yaml
 from .schemas import (
     APOutboxItem,
     ApprovalDecision,
+    BulkApprovalDecision,
     AuditEntry,
     CapturedMatchRequest,
     CapturedDocumentResult,
@@ -39,6 +44,9 @@ from .schemas import (
     MatchRequest,
     MatchResult,
     MatchStatus,
+    RuleVersionCreate,
+    RuleVersionAuditEntry,
+    RuleVersionResult,
     SupplierInvoice,
     VerifyCapturedInvoice,
 )
@@ -95,6 +103,29 @@ def _add_outbox(session: Session, match_id: str, request: MatchRequest, rules) -
     ))
 
 
+def _active_rules(session: Session) -> tuple[ToleranceRules, RuleVersionRecord | None, str]:
+    active = session.scalar(select(RuleVersionRecord).where(RuleVersionRecord.status == "ACTIVE"))
+    if active is not None:
+        return parse_rules_yaml(active.content), active, active.digest
+    path = Path(os.getenv("INVOICE_MATCH_RULES", "config/rules.yaml"))
+    content = path.read_text(encoding="utf-8") if path.exists() else "{}"
+    return load_rules(), None, hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _rule_version_result(record: RuleVersionRecord) -> RuleVersionResult:
+    return RuleVersionResult(
+        id=record.id,
+        version=record.version,
+        digest=record.digest,
+        status=record.status,
+        created_by=record.created_by,
+        created_at=_timestamp(record.created_at),
+        activated_by=record.activated_by,
+        activated_at=_timestamp(record.activated_at),
+        snapshot=record.snapshot,
+    )
+
+
 def _submit_match(
     request: MatchRequest,
     *,
@@ -143,7 +174,7 @@ def _submit_match(
         if record.approval_status != "REJECTED"
     ]
 
-    rules = load_rules()
+    rules, rule_version, rule_digest = _active_rules(session)
     result = match_documents(request, rules, previously_invoiced=previously_invoiced)
     match_id = str(uuid4())
     result.match_id = match_id
@@ -162,10 +193,17 @@ def _submit_match(
         reason=result.reason,
         approval_policy=result.approval_policy,
         required_role=result.required_role,
+        escalation_role=next((
+            policy.escalation_role for policy in rules.approval_policies
+            if policy.name == result.approval_policy
+        ), "admin"),
         approvals_required=result.approvals_required,
         approvals_received=0,
         assigned_to=result.assigned_to,
         due_at=result.due_at,
+        rule_version_id=rule_version.id if rule_version else None,
+        rule_digest=rule_digest,
+        rule_snapshot=rules.model_dump(mode="json"),
         input_data=request.model_dump(mode="json"),
         result_data=result.model_dump(mode="json"),
     )
@@ -189,6 +227,8 @@ def _submit_match(
             "po_revision": request.po.revision,
             "po_change_reason": request.po.change_reason,
             "previous_invoice_count": len(previously_invoiced),
+            "rule_version_id": rule_version.id if rule_version else None,
+            "rule_digest": rule_digest,
         },
     ))
     try:
@@ -354,6 +394,8 @@ def verify_captured_document(
         raise HTTPException(status_code=404, detail="Captured document not found")
     if record.status != "REVIEW_REQUIRED":
         raise HTTPException(status_code=409, detail="Captured document has already been verified")
+    if record.created_by == reviewer.name:
+        raise HTTPException(status_code=403, detail="The document preparer cannot verify their own capture")
     record.status = "VERIFIED"
     record.reviewed_invoice = body.invoice.model_dump(mode="json")
     record.reviewed_by = reviewer.name
@@ -449,13 +491,52 @@ def get_match(
 @app.get("/exceptions", response_model=list[ExceptionQueueItem])
 def list_exceptions(
     status: str = Query(default="OPEN", pattern="^(OPEN|CLOSED|ALL)$"),
+    q: str | None = Query(default=None, max_length=200),
+    vendor: str | None = Query(default=None, max_length=255),
+    po_number: str | None = Query(default=None, max_length=100),
+    invoice_number: str | None = Query(default=None, max_length=100),
+    reason: str | None = Query(default=None, max_length=100),
+    assigned_to: str | None = Query(default=None, max_length=255),
+    overdue_only: bool = False,
+    escalated_only: bool = False,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_session),
     reviewer: Principal = Depends(require_reviewer),
 ):
     query = select(ExceptionRecord, MatchRecord).join(MatchRecord, ExceptionRecord.match_id == MatchRecord.id)
     if status != "ALL":
         query = query.where(ExceptionRecord.queue_status == status)
-    rows = session.execute(query.order_by(ExceptionRecord.created_at.asc())).all()
+    if q:
+        needle = f"%{q.strip()}%"
+        query = query.where(or_(
+            MatchRecord.vendor.ilike(needle),
+            MatchRecord.po_number.ilike(needle),
+            MatchRecord.invoice_number.ilike(needle),
+        ))
+    if vendor:
+        query = query.where(MatchRecord.vendor.ilike(f"%{vendor.strip()}%"))
+    if po_number:
+        query = query.where(MatchRecord.po_number.ilike(f"%{po_number.strip()}%"))
+    if invoice_number:
+        query = query.where(MatchRecord.invoice_number.ilike(f"%{invoice_number.strip()}%"))
+    if reason:
+        query = query.where(MatchRecord.reason.ilike(f"%{reason.strip()}%"))
+    if assigned_to:
+        query = query.where(MatchRecord.assigned_to.ilike(f"%{assigned_to.strip()}%"))
+    if escalated_only:
+        query = query.where(ExceptionRecord.escalated.is_(True))
+    rows = session.execute(query.order_by(
+        ExceptionRecord.escalated.desc(), ExceptionRecord.created_at.asc()
+    )).all()
+    if overdue_only:
+        now = datetime.now(timezone.utc)
+        rows = [
+            (exception, match) for exception, match in rows
+            if match.due_at is not None
+            and (match.due_at.replace(tzinfo=timezone.utc) if match.due_at.tzinfo is None else match.due_at) < now
+        ]
+    rows = rows[offset:offset + limit]
     return [ExceptionQueueItem(
         match_id=match.id,
         status=MatchStatus(match.status),
@@ -471,10 +552,20 @@ def list_exceptions(
         approvals_required=match.approvals_required,
         assigned_to=match.assigned_to,
         due_at=_timestamp(match.due_at),
+        escalated=exception.escalated,
+        escalated_to=exception.escalated_to,
     ) for exception, match in rows]
 
 
-def _decide(match_id: str, decision: ApprovalDecision, outcome: str, principal: Principal, session: Session):
+def _decide(
+    match_id: str,
+    decision: ApprovalDecision,
+    outcome: str,
+    principal: Principal,
+    session: Session,
+    *,
+    commit: bool = True,
+):
     record = session.scalar(
         select(MatchRecord).where(MatchRecord.id == match_id).with_for_update()
     )
@@ -487,6 +578,12 @@ def _decide(match_id: str, decision: ApprovalDecision, outcome: str, principal: 
         raise HTTPException(status_code=403, detail="This approval requires an admin role")
     if record.assigned_to and principal.name != record.assigned_to and "admin" not in principal.roles:
         raise HTTPException(status_code=403, detail="This exception is assigned to another reviewer")
+    submitter = session.scalar(select(AuditEvent.actor).where(
+        AuditEvent.match_id == match_id,
+        AuditEvent.event_type == "MATCH_CREATED",
+    ))
+    if submitter == principal.name:
+        raise HTTPException(status_code=403, detail="The match submitter cannot approve or reject their own exception")
     prior_vote = session.scalar(select(AuditEvent).where(
         AuditEvent.match_id == match_id,
         AuditEvent.event_type.in_(["EXCEPTION_APPROVAL_RECORDED", "EXCEPTION_APPROVED"]),
@@ -526,7 +623,7 @@ def _decide(match_id: str, decision: ApprovalDecision, outcome: str, principal: 
                 },
             ))
             request = MatchRequest.model_validate(record.input_data)
-            _add_outbox(session, match_id, request, load_rules())
+            _add_outbox(session, match_id, request, ToleranceRules.model_validate(record.rule_snapshot))
         else:
             record.result_data = result
             session.add(AuditEvent(
@@ -535,7 +632,8 @@ def _decide(match_id: str, decision: ApprovalDecision, outcome: str, principal: 
                 actor=principal.name,
                 details={"comment": decision.comment, "approvals_received": record.approvals_received},
             ))
-    session.commit()
+    if commit:
+        session.commit()
     return _result(record)
 
 
@@ -557,6 +655,174 @@ def reject_exception(
     reviewer: Principal = Depends(require_approver),
 ):
     return _decide(match_id, decision, "REJECTED", reviewer, session)
+
+
+@app.post("/exceptions/bulk-approve", response_model=list[MatchResult])
+def bulk_approve_exceptions(
+    body: BulkApprovalDecision,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_approver),
+):
+    try:
+        results = [
+            _decide(match_id, body, "APPROVED", reviewer, session, commit=False)
+            for match_id in body.match_ids
+        ]
+        session.commit()
+        return results
+    except Exception:
+        session.rollback()
+        raise
+
+
+@app.post("/exceptions/bulk-reject", response_model=list[MatchResult])
+def bulk_reject_exceptions(
+    body: BulkApprovalDecision,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_approver),
+):
+    try:
+        results = [
+            _decide(match_id, body, "REJECTED", reviewer, session, commit=False)
+            for match_id in body.match_ids
+        ]
+        session.commit()
+        return results
+    except Exception:
+        session.rollback()
+        raise
+
+
+@app.post("/exceptions/escalate-overdue")
+def escalate_overdue_exceptions(
+    session: Session = Depends(get_session),
+    actor: Principal = Depends(require_approver),
+):
+    rows = session.execute(select(ExceptionRecord, MatchRecord).join(
+        MatchRecord, ExceptionRecord.match_id == MatchRecord.id
+    ).where(
+        ExceptionRecord.queue_status == "OPEN",
+        ExceptionRecord.escalated.is_(False),
+        MatchRecord.due_at.is_not(None),
+    )).all()
+    now = datetime.now(timezone.utc)
+    escalated = []
+    for exception, match in rows:
+        due_at = match.due_at.replace(tzinfo=timezone.utc) if match.due_at.tzinfo is None else match.due_at
+        if due_at > now:
+            continue
+        match.required_role = match.escalation_role
+        match.assigned_to = None
+        exception.escalated = True
+        exception.escalated_to = match.escalation_role
+        exception.escalated_at = now
+        session.add(AuditEvent(
+            match_id=match.id,
+            event_type="EXCEPTION_ESCALATED",
+            actor=actor.name,
+            details={"escalated_to": match.escalation_role, "due_at": _timestamp(match.due_at)},
+        ))
+        escalated.append(match.id)
+    session.commit()
+    return {"escalated_count": len(escalated), "match_ids": escalated}
+
+
+@app.get("/rules/versions", response_model=list[RuleVersionResult])
+def list_rule_versions(
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    versions = session.scalars(select(RuleVersionRecord).order_by(RuleVersionRecord.version.desc())).all()
+    return [_rule_version_result(version) for version in versions]
+
+
+@app.post("/rules/versions", response_model=RuleVersionResult, status_code=201)
+def create_rule_version(
+    body: RuleVersionCreate,
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    try:
+        rules = parse_rules_yaml(body.content)
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+    digest = hashlib.sha256(body.content.encode("utf-8")).hexdigest()
+    existing = session.scalar(select(RuleVersionRecord).where(RuleVersionRecord.digest == digest))
+    if existing:
+        raise HTTPException(status_code=409, detail={"code": "RULE_VERSION_ALREADY_EXISTS", "id": existing.id})
+    latest = session.scalar(select(func.max(RuleVersionRecord.version))) or 0
+    record = RuleVersionRecord(
+        id=str(uuid4()), version=latest + 1, digest=digest, content=body.content,
+        snapshot=rules.model_dump(mode="json"), status="DRAFT", created_by=admin.name,
+    )
+    session.add(record)
+    session.flush()
+    session.add(RuleVersionEvent(
+        rule_version_id=record.id, event_type="RULE_VERSION_CREATED", actor=admin.name,
+        details={"version": record.version, "digest": digest},
+    ))
+    session.commit()
+    return _rule_version_result(record)
+
+
+@app.post("/rules/versions/{version_id}/activate", response_model=RuleVersionResult)
+def activate_rule_version(
+    version_id: str,
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    record = session.get(RuleVersionRecord, version_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Rule version not found")
+    if record.status != "DRAFT":
+        raise HTTPException(status_code=409, detail="Only draft rule versions can be activated")
+    if record.created_by == admin.name:
+        raise HTTPException(status_code=403, detail="A different admin must activate this rule version")
+    previous = session.scalars(select(RuleVersionRecord).where(RuleVersionRecord.status == "ACTIVE")).all()
+    for version in previous:
+        version.status = "RETIRED"
+        session.add(RuleVersionEvent(
+            rule_version_id=version.id,
+            event_type="RULE_VERSION_RETIRED",
+            actor=admin.name,
+            details={"replaced_by": record.id, "version": record.version},
+        ))
+    session.flush()
+    record.status = "ACTIVE"
+    record.activated_by = admin.name
+    record.activated_at = datetime.now(timezone.utc)
+    session.add(RuleVersionEvent(
+        rule_version_id=record.id, event_type="RULE_VERSION_ACTIVATED", actor=admin.name,
+        details={"version": record.version, "digest": record.digest,
+                 "retired_versions": [version.version for version in previous]},
+    ))
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Another rule version became active concurrently") from exc
+    return _rule_version_result(record)
+
+
+@app.get("/rules/versions/{version_id}/audit", response_model=list[RuleVersionAuditEntry])
+def rule_version_audit(
+    version_id: str,
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    if session.get(RuleVersionRecord, version_id) is None:
+        raise HTTPException(status_code=404, detail="Rule version not found")
+    events = session.scalars(select(RuleVersionEvent).where(
+        RuleVersionEvent.rule_version_id == version_id
+    ).order_by(RuleVersionEvent.id.asc())).all()
+    return [RuleVersionAuditEntry(
+        id=event.id,
+        rule_version_id=event.rule_version_id,
+        event_type=event.event_type,
+        actor=event.actor,
+        details=event.details,
+        created_at=_timestamp(event.created_at),
+    ) for event in events]
 
 
 @app.get("/integrations/ap/outbox", response_model=list[APOutboxItem])

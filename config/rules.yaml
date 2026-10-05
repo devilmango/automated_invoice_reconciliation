@@ -39,7 +39,9 @@ rules:
         required_role: admin
         approvals_required: 2
         sla_hours: 24
+        escalation_role: admin
       - name: default
         required_role: approver
         approvals_required: 1
         sla_hours: 72
+        escalation_role: admin

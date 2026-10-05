@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +22,7 @@ class ApprovalPolicy(BaseModel):
     approvals_required: int = Field(default=1, ge=1, le=10)
     assigned_to: str | None = None
     sla_hours: int = Field(default=72, ge=1, le=8760)
+    escalation_role: Literal["approver", "admin"] = "admin"
 
     def matches(
         self,
@@ -99,12 +100,14 @@ def _ratio(value: object, key: str) -> Decimal:
     return result
 
 
-def load_rules(path: str | Path | None = None) -> ToleranceRules:
-    selected = Path(path or os.getenv("INVOICE_MATCH_RULES", "config/rules.yaml"))
-    if not selected.exists():
-        return ToleranceRules()
-    data = yaml.safe_load(selected.read_text(encoding="utf-8")) or {}
+def parse_rules_data(data: Any) -> ToleranceRules:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("rule document must be a YAML mapping")
     rules = data.get("rules", {})
+    if not isinstance(rules, dict):
+        raise ValueError("rules must be a YAML mapping")
     currencies = rules.get("currency", {})
     approval = rules.get("approval", {})
     rates = currencies.get("rates_to_base", {"USD": 1})
@@ -139,3 +142,18 @@ def load_rules(path: str | Path | None = None) -> ToleranceRules:
         auto_approve_matches=bool(approval.get("auto_approve_matches", False)),
         approval_policies=policies,
     )
+
+
+def parse_rules_yaml(content: str) -> ToleranceRules:
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid rule YAML: {exc}") from exc
+    return parse_rules_data(data)
+
+
+def load_rules(path: str | Path | None = None) -> ToleranceRules:
+    selected = Path(path or os.getenv("INVOICE_MATCH_RULES", "config/rules.yaml"))
+    if not selected.exists():
+        return ToleranceRules()
+    return parse_rules_data(yaml.safe_load(selected.read_text(encoding="utf-8")) or {})

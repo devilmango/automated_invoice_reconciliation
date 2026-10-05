@@ -119,6 +119,7 @@ class MatchResult(StrictModel):
     approval_status: Literal["NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED"] = "PENDING"
     approval_policy: str = "default"
     required_role: str = "approver"
+    escalation_role: str = "admin"
     approvals_required: int = 1
     approvals_received: int = 0
     assigned_to: str | None = None
@@ -127,6 +128,41 @@ class MatchResult(StrictModel):
 
 class ApprovalDecision(StrictModel):
     comment: str | None = None
+
+
+class BulkApprovalDecision(ApprovalDecision):
+    match_ids: list[str] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def unique_match_ids(self):
+        if len(set(self.match_ids)) != len(self.match_ids):
+            raise ValueError("match_ids must be unique")
+        return self
+
+
+class RuleVersionCreate(StrictModel):
+    content: str = Field(min_length=1, max_length=100_000)
+
+
+class RuleVersionResult(StrictModel):
+    id: str
+    version: int
+    digest: str
+    status: Literal["DRAFT", "ACTIVE", "RETIRED"]
+    created_by: str
+    created_at: str
+    activated_by: str | None = None
+    activated_at: str | None = None
+    snapshot: dict
+
+
+class RuleVersionAuditEntry(StrictModel):
+    id: int
+    rule_version_id: str
+    event_type: str
+    actor: str
+    details: dict
+    created_at: str
 
 
 class ExceptionQueueItem(StrictModel):
@@ -144,6 +180,8 @@ class ExceptionQueueItem(StrictModel):
     approvals_required: int
     assigned_to: str | None
     due_at: str | None
+    escalated: bool = False
+    escalated_to: str | None = None
 
 
 class AuditEntry(StrictModel):

@@ -13,6 +13,8 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 - **Currency precision:** Configure conversion rates and minor-unit precision for currencies such as JPY and KWD.
 - **Rule-driven approvals:** Select approval policies by amount, variance, supplier, or cost center, with role, assignment, approval count, and SLA.
 - **Exception queue:** List, approve, and reject discrepancies through the API.
+- **Reviewer queue controls:** Search and filter exceptions, page through results, make atomic bulk decisions, and escalate overdue items to an admin queue.
+- **Versioned rule controls:** Create validated rule drafts, activate them with a second admin, and inspect rule change history; every match retains its rule snapshot and digest.
 - **Authenticated integrations:** Protect matching, CSV intake, and AP export routes with service bearer tokens.
 - **Idempotency and duplicate detection:** Replay safe request retries and reject duplicate supplier invoices.
 - **AP export outbox:** Poll approved payables as structured JSON and acknowledge downstream delivery.
@@ -223,6 +225,42 @@ curl http://127.0.0.1:8000/matches/MATCH_ID/audit \
 
 Approvers and admins may decide exceptions; a `reviewer` role is read-only. A policy requiring `admin` rejects approver decisions, and assigned items can only be decided by the named reviewer or an admin. Multi-step policies require distinct reviewers; partial approval leaves the item pending and open. Audit identity comes from the token, never the request body. Repeated votes return HTTP `409`; unknown matches return `404`; missing or invalid credentials return `401`.
 
+The queue supports search and filters such as `q`, `vendor`, `po_number`, `invoice_number`, `reason`, `assigned_to`, `overdue_only`, and `escalated_only`, plus `limit` and `offset`. `q` searches supplier, PO number, and invoice number. Bulk operations accept up to 100 unique match IDs and are atomic: if one item cannot be decided, none of the batch is changed.
+
+```bash
+curl 'http://127.0.0.1:8000/exceptions?q=ABC&overdue_only=true&limit=50&offset=0' \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret'
+
+curl --request POST http://127.0.0.1:8000/exceptions/bulk-approve \
+  --header 'Authorization: Bearer replace-with-a-long-random-secret' \
+  --header 'Content-Type: application/json' \
+  --data '{"match_ids":["MATCH_ID_1","MATCH_ID_2"],"comment":"Reviewed as a batch."}'
+```
+
+Run `POST /exceptions/escalate-overdue` from a scheduler to flag open items past their SLA. Escalation is recorded in the match audit history, clears any named assignment, and changes the required decision role to the configured policy `escalation_role` (defaults to `admin`). The endpoint requires an approver or admin bearer token and returns the escalated match IDs. Add `escalation_role: approver` or `escalation_role: admin` to an approval policy in `config/rules.yaml` to control its escalation destination.
+
+### Manage rule versions
+
+Admins can submit a YAML rule set as a draft. The API validates it with the same parser used for matching, computes a SHA-256 digest, and assigns a monotonically increasing version. A different admin must activate it; a creator cannot activate their own draft. The currently active version replaces the previous one for new matches. Existing matches retain the exact normalized rule snapshot and digest used to evaluate them, including when an exception is approved later.
+
+```bash
+curl --request POST http://127.0.0.1:8000/rules/versions \
+  --header 'Authorization: Bearer replace-with-a-random-admin-token-at-least-32-chars' \
+  --header 'Content-Type: application/json' \
+  --data "$(python -c 'import json,pathlib; print(json.dumps({"content":pathlib.Path("config/rules.yaml").read_text()}))')"
+
+# Activate using a different admin's token.
+curl --request POST http://127.0.0.1:8000/rules/versions/RULE_VERSION_ID/activate \
+  --header 'Authorization: Bearer another-random-admin-token-at-least-32-chars'
+
+curl http://127.0.0.1:8000/rules/versions \
+  --header 'Authorization: Bearer replace-with-a-random-admin-token-at-least-32-chars'
+curl http://127.0.0.1:8000/rules/versions/RULE_VERSION_ID/audit \
+  --header 'Authorization: Bearer replace-with-a-random-admin-token-at-least-32-chars'
+```
+
+Rule version endpoints require an `admin` role. Rule drafts are immutable; submit a new version for each proposed change. For separation of duties, the match submitter also cannot approve or reject that match, and the person who captured an invoice cannot verify that capture.
+
 ### Deliver approved payables to an AP system
 
 Poll pending entries, persist each payload to the accounting system, then acknowledge the match ID after the downstream system confirms delivery:
@@ -256,6 +294,13 @@ Each payload contains invoice and PO identifiers, supplier, currency, cost cente
 | `GET` | `/exceptions?status=OPEN\|CLOSED\|ALL` | List exceptions; defaults to `OPEN` (reviewer bearer token required) |
 | `POST` | `/exceptions/{match_id}/approve` | Record an approval vote (approver/admin token required) |
 | `POST` | `/exceptions/{match_id}/reject` | Reject an exception (approver/admin token required) |
+| `POST` | `/exceptions/bulk-approve` | Atomically approve up to 100 exception IDs (approver/admin token required) |
+| `POST` | `/exceptions/bulk-reject` | Atomically reject up to 100 exception IDs (approver/admin token required) |
+| `POST` | `/exceptions/escalate-overdue` | Escalate open items past their SLA (approver/admin token required) |
+| `GET` | `/rules/versions` | List immutable rule versions (admin token required) |
+| `POST` | `/rules/versions` | Validate and create a draft rule version (admin token required) |
+| `POST` | `/rules/versions/{version_id}/activate` | Activate a draft with a different admin identity |
+| `GET` | `/rules/versions/{version_id}/audit` | Read the rule version change history (admin token required) |
 | `GET` | `/integrations/ap/outbox` | Poll pending AP exports (integration token required) |
 | `POST` | `/integrations/ap/outbox/{match_id}/ack` | Acknowledge delivery (integration token required) |
 

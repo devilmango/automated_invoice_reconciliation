@@ -26,6 +26,10 @@ os.environ["REVIEWER_TOKENS"] = json.dumps({
         "token": "test-reviewer-secret-token-for-unit-tests-0003",
         "roles": ["reviewer", "approver", "admin"],
     },
+    "controller": {
+        "token": "test-reviewer-secret-token-for-unit-tests-0004",
+        "roles": ["reviewer", "approver", "admin"],
+    },
 })
 os.environ["INTEGRATION_TOKENS"] = json.dumps({
     "ap-import": "test-integration-secret-token-for-unit-tests-0001",
@@ -48,6 +52,8 @@ def apply_database_migrations():
 def clear_database(apply_database_migrations):
     with engine.begin() as connection:
         connection.exec_driver_sql("DELETE FROM document_capture_events")
+        connection.exec_driver_sql("DELETE FROM rule_version_events")
+        connection.exec_driver_sql("DELETE FROM rule_versions")
         connection.exec_driver_sql("DELETE FROM captured_documents")
         connection.exec_driver_sql("DELETE FROM ap_outbox")
         connection.exec_driver_sql("DELETE FROM audit_events")
@@ -79,3 +85,8 @@ def admin_headers():
 @pytest.fixture
 def integration_headers():
     return {"Authorization": "Bearer test-integration-secret-token-for-unit-tests-0001"}
+
+
+@pytest.fixture
+def second_admin_headers():
+    return {"Authorization": "Bearer test-reviewer-secret-token-for-unit-tests-0004"}

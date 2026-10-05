@@ -94,3 +94,9 @@ def require_approver(principal: Principal = Depends(authenticate_reviewer)) -> P
     if not principal.roles.intersection({"approver", "admin"}):
         raise HTTPException(status_code=403, detail="An approver role is required")
     return principal
+
+
+def require_admin(principal: Principal = Depends(authenticate_reviewer)) -> Principal:
+    if "admin" not in principal.roles:
+        raise HTTPException(status_code=403, detail="An admin role is required")
+    return principal
