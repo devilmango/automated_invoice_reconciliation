@@ -21,6 +21,16 @@ rules:
       KWD: 3.25
   amount_variance:
     tolerance: 0.5%
+  quantity_units:
+    EA: {family: count, to_base: 1}
+    EACH: {family: count, to_base: 1}
+    DZ: {family: count, to_base: 12}
+    CASE: {family: count, to_base: 12}
+    KG: {family: mass, to_base: 1}
+    G: {family: mass, to_base: 0.001}
+    LB: {family: mass, to_base: 0.45359237}
+    L: {family: volume, to_base: 1}
+    ML: {family: volume, to_base: 0.001}
   approval:
     auto_approve_matches: false
     policies:

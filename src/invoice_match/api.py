@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -13,7 +13,16 @@ from sqlalchemy.orm import Session
 
 from .ap_export import build_ap_payload
 from .csv_import import parse_csv_documents
-from .database import APOutboxRecord, AuditEvent, ExceptionRecord, MatchRecord, SessionLocal
+from .database import (
+    APOutboxRecord,
+    AuditEvent,
+    CapturedDocumentRecord,
+    DocumentCaptureEvent,
+    ExceptionRecord,
+    MatchRecord,
+    SessionLocal,
+)
+from .document_capture import extract_document
 from .integration_auth import require_integration
 from .matcher import match_documents
 from .reviewer_auth import Principal, require_approver, require_reviewer
@@ -22,17 +31,22 @@ from .schemas import (
     APOutboxItem,
     ApprovalDecision,
     AuditEntry,
+    CapturedMatchRequest,
+    CapturedDocumentResult,
     CsvMatchRequest,
+    DocumentCaptureAuditEntry,
     ExceptionQueueItem,
     MatchRequest,
     MatchResult,
     MatchStatus,
+    SupplierInvoice,
+    VerifyCapturedInvoice,
 )
 
 app = FastAPI(
     title="invoice-match",
     description="A lightweight, self-hosted three-way invoice matching engine for SMB finance teams.",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
@@ -47,6 +61,11 @@ def _timestamp(value):
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.isoformat()
+
+
+def _safe_filename(value: str) -> str:
+    safe = "".join(character if character.isalnum() or character in ".-_ " else "_" for character in value)
+    return safe.strip(" .")[:255] or "invoice-document"
 
 
 def _normalized(value: str | None) -> str | None:
@@ -104,8 +123,28 @@ def _submit_match(
                 "existing_match_id": duplicate.id,
             })
 
+    po_records = session.scalars(select(MatchRecord).where(
+        MatchRecord.po_number == request.po.number,
+        MatchRecord.vendor_key == _normalized(request.po.vendor),
+    )).all()
+    latest_revision = max(
+        (int(record.input_data.get("po", {}).get("revision", 1)) for record in po_records),
+        default=0,
+    )
+    if request.po.revision < latest_revision:
+        raise HTTPException(status_code=409, detail={
+            "code": "STALE_PO_REVISION",
+            "current_revision": latest_revision,
+            "submitted_revision": request.po.revision,
+        })
+    previously_invoiced = [
+        MatchRequest.model_validate(record.input_data).invoice
+        for record in po_records
+        if record.approval_status != "REJECTED"
+    ]
+
     rules = load_rules()
-    result = match_documents(request, rules)
+    result = match_documents(request, rules, previously_invoiced=previously_invoiced)
     match_id = str(uuid4())
     result.match_id = match_id
     record = MatchRecord(
@@ -147,6 +186,9 @@ def _submit_match(
             "status": result.status.value,
             "reason": result.reason,
             "idempotency_key": idempotency_key,
+            "po_revision": request.po.revision,
+            "po_change_reason": request.po.change_reason,
+            "previous_invoice_count": len(previously_invoiced),
         },
     ))
     try:
@@ -174,6 +216,179 @@ def health():
     return {"status": "ok"}
 
 
+def _captured_result(record: CapturedDocumentRecord) -> CapturedDocumentResult:
+    return CapturedDocumentResult(
+        document_id=record.id,
+        filename=record.filename,
+        content_type=record.content_type,
+        source_sha256=record.source_sha256,
+        status=record.status,
+        extracted_fields=record.extracted_fields,
+        confidence=record.confidence,
+        extraction_notes=record.extraction_notes,
+        reviewed_invoice=record.reviewed_invoice,
+        created_by=record.created_by,
+        created_at=record.created_at,
+        reviewed_by=record.reviewed_by,
+        reviewed_at=record.reviewed_at,
+    )
+
+
+@app.post("/documents/extract", response_model=CapturedDocumentResult, status_code=201)
+async def capture_document(
+    request: Request,
+    session: Session = Depends(get_session),
+    actor: str = Depends(require_integration),
+    filename: str = Header(default="invoice-document", alias="X-Filename"),
+):
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from exc
+        if declared_size > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Documents are limited to 10 MiB")
+    document = bytearray()
+    async for chunk in request.stream():
+        document.extend(chunk)
+        if len(document) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Documents are limited to 10 MiB")
+    if not document:
+        raise HTTPException(status_code=400, detail="Document body cannot be empty")
+    content_type = request.headers.get("content-type", "application/octet-stream")
+    try:
+        fields, confidence, notes, source_hash, normalized_type = extract_document(
+            bytes(document), filename, content_type
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    existing = session.scalar(select(CapturedDocumentRecord).where(
+        CapturedDocumentRecord.source_sha256 == source_hash
+    ))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail={
+            "code": "DUPLICATE_CAPTURED_DOCUMENT",
+            "document_id": existing.id,
+        })
+    record = CapturedDocumentRecord(
+        id=str(uuid4()),
+        filename=_safe_filename(filename),
+        content_type=normalized_type,
+        source_sha256=source_hash,
+        source_data=bytes(document),
+        status="REVIEW_REQUIRED",
+        extracted_fields=fields,
+        confidence=confidence,
+        extraction_notes=notes,
+        created_by=actor,
+    )
+    session.add(record)
+    session.flush()
+    session.add(DocumentCaptureEvent(
+        document_id=record.id,
+        event_type="DOCUMENT_CAPTURED",
+        actor=actor,
+        details={"source_sha256": source_hash, "field_confidence": confidence},
+    ))
+    session.commit()
+    return _captured_result(record)
+
+
+@app.get("/documents", response_model=list[CapturedDocumentResult])
+def list_captured_documents(
+    status: str = Query(default="REVIEW_REQUIRED", pattern="^(REVIEW_REQUIRED|VERIFIED|ALL)$"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    query = select(CapturedDocumentRecord)
+    if status != "ALL":
+        query = query.where(CapturedDocumentRecord.status == status)
+    records = session.scalars(query.order_by(CapturedDocumentRecord.created_at.asc()).limit(limit)).all()
+    return [_captured_result(record) for record in records]
+
+
+@app.get("/documents/{document_id}", response_model=CapturedDocumentResult)
+def get_captured_document(
+    document_id: str,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    record = session.get(CapturedDocumentRecord, document_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Captured document not found")
+    return _captured_result(record)
+
+
+@app.get("/documents/{document_id}/source")
+def get_captured_source(
+    document_id: str,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    record = session.get(CapturedDocumentRecord, document_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Captured document not found")
+    return Response(
+        content=record.source_data,
+        media_type=record.content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{record.filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/documents/{document_id}/verify", response_model=CapturedDocumentResult)
+def verify_captured_document(
+    document_id: str,
+    body: VerifyCapturedInvoice,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_approver),
+):
+    record = session.get(CapturedDocumentRecord, document_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Captured document not found")
+    if record.status != "REVIEW_REQUIRED":
+        raise HTTPException(status_code=409, detail="Captured document has already been verified")
+    record.status = "VERIFIED"
+    record.reviewed_invoice = body.invoice.model_dump(mode="json")
+    record.reviewed_by = reviewer.name
+    record.reviewed_at = datetime.now(timezone.utc)
+    session.add(DocumentCaptureEvent(
+        document_id=document_id,
+        event_type="DOCUMENT_VERIFIED",
+        actor=reviewer.name,
+        details={"invoice_number": body.invoice.number, "document_type": body.invoice.document_type},
+    ))
+    session.commit()
+    return _captured_result(record)
+
+
+@app.get("/documents/{document_id}/audit", response_model=list[DocumentCaptureAuditEntry])
+def captured_document_audit(
+    document_id: str,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    if session.get(CapturedDocumentRecord, document_id) is None:
+        raise HTTPException(status_code=404, detail="Captured document not found")
+    events = session.scalars(select(DocumentCaptureEvent)
+        .where(DocumentCaptureEvent.document_id == document_id)
+        .order_by(DocumentCaptureEvent.id.asc())).all()
+    return [DocumentCaptureAuditEntry(
+        id=event.id,
+        document_id=event.document_id,
+        event_type=event.event_type,
+        actor=event.actor,
+        details=event.details,
+        created_at=event.created_at,
+    ) for event in events]
+
+
 @app.post("/matches", response_model=MatchResult, status_code=201)
 def create_match(
     request: MatchRequest,
@@ -195,6 +410,27 @@ def import_csv(
         request = parse_csv_documents(body.po_csv, body.receipt_csv, body.invoice_csv)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _submit_match(request, session=session, actor=actor, idempotency_key=idempotency_key)
+
+
+@app.post("/documents/{document_id}/match", response_model=MatchResult, status_code=201)
+def match_verified_capture(
+    document_id: str,
+    body: CapturedMatchRequest,
+    session: Session = Depends(get_session),
+    actor: str = Depends(require_integration),
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=8, max_length=128),
+):
+    document = session.get(CapturedDocumentRecord, document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Captured document not found")
+    if document.status != "VERIFIED" or not document.reviewed_invoice:
+        raise HTTPException(status_code=409, detail="Invoice capture must be verified before matching")
+    request = MatchRequest(
+        po=body.po,
+        receipt=body.receipt,
+        invoice=SupplierInvoice.model_validate(document.reviewed_invoice),
+    )
     return _submit_match(request, session=session, actor=actor, idempotency_key=idempotency_key)
 
 
@@ -339,6 +575,9 @@ def list_ap_outbox(
         created_at=_timestamp(item.created_at),
         acknowledged_at=_timestamp(item.acknowledged_at),
         payload=item.payload,
+        attempt_count=item.attempt_count,
+        last_error=item.last_error,
+        external_reference=item.external_reference,
     ) for item in items]
 
 
@@ -368,6 +607,9 @@ def acknowledge_ap_outbox(
         created_at=_timestamp(item.created_at),
         acknowledged_at=_timestamp(item.acknowledged_at),
         payload=item.payload,
+        attempt_count=item.attempt_count,
+        last_error=item.last_error,
+        external_reference=item.external_reference,
     )
 
 

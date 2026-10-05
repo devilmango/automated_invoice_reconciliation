@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, create_engine
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -83,5 +83,38 @@ class APOutboxRecord(Base):
     match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), primary_key=True)
     payload: Mapped[dict] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    external_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CapturedDocumentRecord(Base):
+    __tablename__ = "captured_documents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(100))
+    source_sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    source_data: Mapped[bytes] = mapped_column(LargeBinary)
+    status: Mapped[str] = mapped_column(String(24), default="REVIEW_REQUIRED", index=True)
+    extracted_fields: Mapped[dict] = mapped_column(JSON)
+    confidence: Mapped[dict] = mapped_column(JSON)
+    extraction_notes: Mapped[list] = mapped_column(JSON)
+    reviewed_invoice: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DocumentCaptureEvent(Base):
+    __tablename__ = "document_capture_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("captured_documents.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    actor: Mapped[str] = mapped_column(String(255))
+    details: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

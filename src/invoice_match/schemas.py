@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -15,6 +15,7 @@ class StrictModel(BaseModel):
 class LineItem(StrictModel):
     sku: str = Field(min_length=1)
     qty: Decimal = Field(gt=0)
+    unit: str = Field(default="EA", min_length=1, max_length=24)
     price: Decimal | None = Field(default=None, ge=0)
     discount_rate: Decimal = Field(default=Decimal(0), ge=0, le=1)
     tax_code: str | None = None
@@ -25,6 +26,8 @@ class LineItem(StrictModel):
 
 class PurchaseOrder(StrictModel):
     number: str = Field(min_length=1)
+    revision: int = Field(default=1, ge=1)
+    change_reason: str | None = None
     vendor: str = Field(min_length=1)
     currency: str = Field(default="USD", min_length=3, max_length=3)
     items: list[LineItem] = Field(min_length=1)
@@ -33,21 +36,50 @@ class PurchaseOrder(StrictModel):
     freight_amount: Decimal = Field(default=Decimal(0), ge=0)
     discount_amount: Decimal = Field(default=Decimal(0), ge=0)
 
+    @model_validator(mode="after")
+    def validate_revision(self):
+        if self.revision > 1 and not self.change_reason:
+            raise ValueError("change_reason is required for PO revisions after revision 1")
+        return self
+
+
+class ReceiptDocument(StrictModel):
+    number: str | None = None
+    items: list[LineItem] = Field(min_length=1)
+
 
 class GoodsReceipt(StrictModel):
     number: str | None = None
-    items: list[LineItem] = Field(min_length=1)
+    items: list[LineItem] = Field(default_factory=list)
+    receipts: list[ReceiptDocument] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_receipt_lines(self):
+        if not self.items and not self.receipts:
+            raise ValueError("receipt requires items or one or more receipts")
+        return self
+
+    def all_items(self) -> list[LineItem]:
+        return [*self.items, *(line for receipt in self.receipts for line in receipt.items)]
 
 
 class SupplierInvoice(StrictModel):
     number: str | None = None
     vendor: str | None = None
+    document_type: Literal["INVOICE", "CREDIT_NOTE"] = "INVOICE"
+    credit_note_for: str | None = None
     currency: str = Field(default="USD", min_length=3, max_length=3)
     items: list[LineItem] = Field(min_length=1)
     tax_amount: Decimal | None = Field(default=None, ge=0)
     freight_amount: Decimal = Field(default=Decimal(0), ge=0)
     discount_amount: Decimal = Field(default=Decimal(0), ge=0)
     total_amount: Decimal | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_credit_note(self):
+        if self.document_type == "CREDIT_NOTE" and not self.credit_note_for:
+            raise ValueError("credit_note_for is required for a credit note")
+        return self
 
 
 class MatchRequest(StrictModel):
@@ -78,6 +110,7 @@ class MatchResult(StrictModel):
     invoiced: Decimal | str | None = None
     variance: Decimal | str | None = None
     po_number: str
+    po_revision: int = 1
     invoice_number: str | None = None
     vendor: str
     base_currency: str
@@ -143,7 +176,10 @@ class APExportLine(StrictModel):
 class APExportPayload(StrictModel):
     match_id: str
     purchase_order_number: str
+    purchase_order_revision: int = 1
     supplier_invoice_number: str
+    document_type: Literal["INVOICE", "CREDIT_NOTE"] = "INVOICE"
+    credit_note_for: str | None = None
     supplier: str
     currency: str
     cost_center: str | None
@@ -162,3 +198,40 @@ class APOutboxItem(StrictModel):
     created_at: str
     acknowledged_at: str | None = None
     payload: APExportPayload
+    attempt_count: int = 0
+    last_error: str | None = None
+    external_reference: str | None = None
+
+
+class VerifyCapturedInvoice(StrictModel):
+    invoice: SupplierInvoice
+
+
+class CapturedMatchRequest(StrictModel):
+    po: PurchaseOrder
+    receipt: GoodsReceipt
+
+
+class CapturedDocumentResult(StrictModel):
+    document_id: str
+    filename: str
+    content_type: str
+    source_sha256: str
+    status: Literal["REVIEW_REQUIRED", "VERIFIED"]
+    extracted_fields: dict
+    confidence: dict[str, float]
+    extraction_notes: list[str]
+    reviewed_invoice: SupplierInvoice | None = None
+    created_by: str
+    created_at: datetime
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
+
+
+class DocumentCaptureAuditEntry(StrictModel):
+    id: int
+    document_id: str
+    event_type: str
+    actor: str
+    details: dict
+    created_at: datetime

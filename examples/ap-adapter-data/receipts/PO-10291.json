@@ -1,0 +1,10 @@
+{
+  "receipts": [
+    {
+      "number": "GR-2044",
+      "items": [
+        {"sku": "A100", "qty": 95, "unit": "EA"}
+      ]
+    }
+  ]
+}

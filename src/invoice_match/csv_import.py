@@ -50,13 +50,12 @@ def parse_csv_documents(po_csv: str, receipt_csv: str, invoice_csv: str) -> Matc
     )
     po_meta = _consistent(
         po_rows,
-        ("number", "vendor", "currency", "cost_center", "tax_rate", "freight_amount", "discount_amount"),
+        ("number", "vendor", "currency", "cost_center", "tax_rate", "freight_amount", "discount_amount", "revision", "change_reason"),
         "PO",
     )
-    receipt_meta = _consistent(receipt_rows, ("number",), "receipt")
     invoice_meta = _consistent(
         invoice_rows,
-        ("number", "vendor", "currency", "tax_amount", "freight_amount", "discount_amount", "total_amount"),
+        ("number", "vendor", "currency", "tax_amount", "freight_amount", "discount_amount", "total_amount", "document_type", "credit_note_for"),
         "invoice",
     )
     def lines(rows: list[dict[str, str]], fields: tuple[str, ...]) -> list[dict]:
@@ -72,23 +71,38 @@ def parse_csv_documents(po_csv: str, receipt_csv: str, invoice_csv: str) -> Matc
     po: dict = {
         "number": po_meta["number"], "vendor": po_meta["vendor"],
         "currency": po_meta["currency"] or "USD",
-        "items": lines(po_rows, ("sku", "qty", "price", "discount_rate", "tax_code", "tax_rate", "tax_amount", "description")),
+        "items": lines(po_rows, ("sku", "qty", "unit", "price", "discount_rate", "tax_code", "tax_rate", "tax_amount", "description")),
     }
-    receipt: dict = {
-        "items": lines(receipt_rows, ("sku", "qty", "description")),
-    }
+    receipt_groups: dict[str, list[dict]] = {}
+    for row in receipt_rows:
+        receipt_groups.setdefault(row.get("number", ""), []).append(row)
+    receipt = {"receipts": [
+        {
+            **({"number": number} if number else {}),
+            "items": lines(group, ("sku", "qty", "unit", "description")),
+        }
+        for number, group in receipt_groups.items()
+    ]}
     invoice: dict = {
         "currency": invoice_meta["currency"] or po_meta["currency"] or "USD",
-        "items": lines(invoice_rows, ("sku", "qty", "price", "discount_rate", "tax_code", "tax_rate", "tax_amount", "description")),
+        "items": lines(invoice_rows, ("sku", "qty", "unit", "price", "discount_rate", "tax_code", "tax_rate", "tax_amount", "description")),
     }
     if po_meta["cost_center"]:
         po["cost_center"] = po_meta["cost_center"]
     for field in ("tax_rate", "freight_amount", "discount_amount"):
         if po_meta[field]:
             po[field] = _decimal(po_meta[field], field)
-    if receipt_meta["number"]:
-        receipt["number"] = receipt_meta["number"]
+    if po_meta["revision"]:
+        try:
+            po["revision"] = int(po_meta["revision"])
+        except ValueError as exc:
+            raise ValueError("CSV field 'revision' must be an integer") from exc
+    if po_meta["change_reason"]:
+        po["change_reason"] = po_meta["change_reason"]
     for field in ("number", "vendor"):
+        if invoice_meta[field]:
+            invoice[field] = invoice_meta[field]
+    for field in ("document_type", "credit_note_for"):
         if invoice_meta[field]:
             invoice[field] = invoice_meta[field]
     for field in ("tax_amount", "freight_amount", "discount_amount", "total_amount"):

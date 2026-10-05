@@ -6,10 +6,17 @@ from decimal import Decimal
 
 from .financials import invoice_summary, item_tax_rate, round_currency, to_base_currency
 from .rules import ToleranceRules, select_approval_policy
-from .schemas import Discrepancy, MatchRequest, MatchResult, MatchStatus
+from .schemas import Discrepancy, MatchRequest, MatchResult, MatchStatus, SupplierInvoice
 
 
-def _totals(items: list, default_tax_rate: Decimal | None = None) -> dict[str, dict]:
+def _unit(item, rules: ToleranceRules) -> tuple[str, Decimal]:
+    configured = rules.quantity_units.get(item.unit.strip().upper())
+    if configured is None:
+        return item.unit.strip().casefold(), Decimal(1)
+    return configured.family.casefold(), configured.to_base
+
+
+def _totals(items: list, rules: ToleranceRules, default_tax_rate: Decimal | None = None) -> dict[str, dict]:
     grouped: dict[str, dict] = defaultdict(lambda: {
         "qty": Decimal(0),
         "priced_qty": Decimal(0),
@@ -17,16 +24,19 @@ def _totals(items: list, default_tax_rate: Decimal | None = None) -> dict[str, d
         "tax_amount_basis": Decimal(0),
         "tax_amount_weight": Decimal(0),
         "tax_codes": set(),
+        "unit_families": set(),
     })
     for item in items:
         values = grouped[item.sku]
-        values["qty"] += item.qty
+        family, factor = _unit(item, rules)
+        values["qty"] += item.qty * factor
+        values["unit_families"].add(family)
         if item.tax_code:
             values["tax_codes"].add(item.tax_code.strip().casefold())
         if item.price is not None:
             net_unit_price = item.price * (Decimal(1) - item.discount_rate)
             net_amount = item.qty * net_unit_price
-            values["priced_qty"] += item.qty
+            values["priced_qty"] += item.qty * factor
             values["net_amount"] += net_amount
             rate = item.tax_rate if item.tax_rate is not None else default_tax_rate
             if rate is not None:
@@ -41,6 +51,7 @@ def _totals(items: list, default_tax_rate: Decimal | None = None) -> dict[str, d
                 if values["tax_amount_weight"] else None
             ),
             "tax_codes": values["tax_codes"],
+            "unit_families": values["unit_families"],
         }
         for sku, values in grouped.items()
     }
@@ -69,7 +80,13 @@ def _discrepancy(
     )
 
 
-def match_documents(request: MatchRequest, rules: ToleranceRules) -> MatchResult:
+def match_documents(
+    request: MatchRequest,
+    rules: ToleranceRules,
+    *,
+    previously_invoiced: list[SupplierInvoice] | None = None,
+) -> MatchResult:
+    previously_invoiced = previously_invoiced or []
     po, receipt, invoice = request.po, request.receipt, request.invoice
     discrepancies: list[Discrepancy] = []
     po_currency, invoice_currency = po.currency.upper(), invoice.currency.upper()
@@ -91,9 +108,31 @@ def match_documents(request: MatchRequest, rules: ToleranceRules) -> MatchResult
             invoice.vendor,
         ))
 
-    po_items = _totals(po.items, po.tax_rate)
-    receipt_items = _totals(receipt.items)
-    invoice_items = _totals(invoice.items)
+    po_items = _totals(po.items, rules, po.tax_rate)
+    receipt_items = _totals(receipt.all_items(), rules)
+    invoice_items = _totals(invoice.items, rules)
+    prior_invoiced: dict[str, Decimal] = defaultdict(Decimal)
+    prior_unit_families: dict[str, set[str]] = defaultdict(set)
+    creditable_by_invoice: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    prior_invoice_numbers: set[str] = set()
+    for prior in previously_invoiced:
+        prior_totals = _totals(prior.items, rules)
+        direction = Decimal(-1) if prior.document_type == "CREDIT_NOTE" else Decimal(1)
+        for sku, values in prior_totals.items():
+            prior_invoiced[sku] += values["qty"] * direction
+            prior_unit_families[sku].update(values["unit_families"])
+            if prior.document_type == "INVOICE" and prior.number:
+                prior_invoice_numbers.add(prior.number)
+                creditable_by_invoice[prior.number][sku] += values["qty"]
+            elif prior.document_type == "CREDIT_NOTE" and prior.credit_note_for:
+                creditable_by_invoice[prior.credit_note_for][sku] -= values["qty"]
+    if invoice.document_type == "CREDIT_NOTE" and invoice.credit_note_for not in prior_invoice_numbers:
+        discrepancies.append(_discrepancy(
+            "CREDIT_NOTE_REFERENCE_NOT_FOUND",
+            "Credit note must reference a previously submitted invoice that is not rejected.",
+            invoice.credit_note_for or "MISSING",
+            invoice.number or "UNKNOWN",
+        ))
     for sku in sorted(set(po_items) | set(receipt_items) | set(invoice_items)):
         ordered, received, billed = po_items.get(sku), receipt_items.get(sku), invoice_items.get(sku)
         if ordered is None:
@@ -113,6 +152,38 @@ def match_documents(request: MatchRequest, rules: ToleranceRules) -> MatchResult
         if billed is None:
             continue
 
+        all_families = (
+            ordered["unit_families"]
+            | received["unit_families"]
+            | billed["unit_families"]
+            | prior_unit_families[sku]
+        )
+        if len(all_families) > 1:
+            discrepancies.append(_discrepancy(
+                "UOM_MISMATCH",
+                f"Units of measure for {sku} do not share a configured quantity unit family.",
+                ",".join(sorted(ordered["unit_families"] | received["unit_families"] | prior_unit_families[sku])),
+                ",".join(sorted(billed["unit_families"])),
+                sku=sku,
+            ))
+            continue
+
+        prior_qty = prior_invoiced[sku]
+        if invoice.document_type == "CREDIT_NOTE":
+            creditable_qty = creditable_by_invoice[invoice.credit_note_for or ""][sku]
+            if creditable_qty < billed["qty"]:
+                discrepancies.append(_discrepancy(
+                    "CREDIT_NOTE_EXCEEDS_INVOICED",
+                    f"Credit note quantity for {sku} exceeds the referenced invoice's remaining quantity.",
+                    creditable_qty,
+                    billed["qty"],
+                    sku=sku,
+                ))
+            creditable_by_invoice[invoice.credit_note_for or ""][sku] -= billed["qty"]
+            cumulative_billed = prior_qty - billed["qty"]
+        else:
+            cumulative_billed = prior_qty + billed["qty"]
+
         if received["qty"] > ordered["qty"] and _outside_tolerance(
             ordered["qty"], received["qty"], rules.quantity_variance
         ):
@@ -120,19 +191,19 @@ def match_documents(request: MatchRequest, rules: ToleranceRules) -> MatchResult
                 "RECEIPT_EXCEEDS_PO", f"Received quantity for {sku} exceeds the ordered quantity beyond tolerance.",
                 ordered["qty"], received["qty"], sku=sku,
             ))
-        elif billed["qty"] > received["qty"] and _outside_tolerance(
-            received["qty"], billed["qty"], rules.quantity_variance
+        elif invoice.document_type == "INVOICE" and cumulative_billed > received["qty"] and _outside_tolerance(
+            received["qty"], cumulative_billed, rules.quantity_variance
         ):
             discrepancies.append(_discrepancy(
-                "RECEIPT_QUANTITY_MISMATCH", f"Invoiced quantity for {sku} differs from the received quantity beyond tolerance.",
-                received["qty"], billed["qty"], sku=sku,
+                "RECEIPT_QUANTITY_MISMATCH", f"Cumulative invoiced quantity for {sku} exceeds the received quantity beyond tolerance.",
+                received["qty"], cumulative_billed, sku=sku,
             ))
-        elif billed["qty"] > ordered["qty"] and _outside_tolerance(
-            ordered["qty"], billed["qty"], rules.quantity_variance
+        elif invoice.document_type == "INVOICE" and cumulative_billed > ordered["qty"] and _outside_tolerance(
+            ordered["qty"], cumulative_billed, rules.quantity_variance
         ):
             discrepancies.append(_discrepancy(
-                "PO_INVOICE_QUANTITY_MISMATCH", f"Invoiced quantity for {sku} differs from the ordered quantity beyond tolerance.",
-                ordered["qty"], billed["qty"], sku=sku,
+                "PO_INVOICE_QUANTITY_MISMATCH", f"Cumulative invoiced quantity for {sku} exceeds the ordered quantity beyond tolerance.",
+                ordered["qty"], cumulative_billed, sku=sku,
             ))
 
         po_price, invoice_price = ordered["net_price"], billed["net_price"]
@@ -246,7 +317,7 @@ def match_documents(request: MatchRequest, rules: ToleranceRules) -> MatchResult
         rules,
         vendor=po.vendor,
         cost_center=po.cost_center,
-        invoice_total=invoice_total_base,
+        invoice_total=abs(invoice_total_base),
         variance_amount=variance_amount,
     )
     status = MatchStatus.EXCEPTION if discrepancies else MatchStatus.MATCHED
@@ -263,6 +334,7 @@ def match_documents(request: MatchRequest, rules: ToleranceRules) -> MatchResult
         invoiced=primary.invoiced if primary else None,
         variance=primary.variance if primary else None,
         po_number=po.number,
+        po_revision=po.revision,
         invoice_number=invoice.number,
         vendor=po.vendor,
         base_currency=rules.base_currency,

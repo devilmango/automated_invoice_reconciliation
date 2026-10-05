@@ -4,7 +4,7 @@
 
 `invoice-match` compares a purchase order (PO), goods receipt, and supplier invoice. It identifies quantity, price, vendor, currency, and tax discrepancies, places exceptions in a review queue, and records approval decisions in an audit trail.
 
-Documents enter as validated JSON. Connect an ERP, document management system, or OCR service upstream and map its output to the schemas in this project.
+Documents enter as validated JSON or CSV, can be fetched through an AP adapter, or captured from PDF/email for field extraction and review. Scanned PDFs without a text layer are marked as needing OCR; an OCR engine is not bundled.
 
 ## Features
 
@@ -16,6 +16,9 @@ Documents enter as validated JSON. Connect an ERP, document management system, o
 - **Authenticated integrations:** Protect matching, CSV intake, and AP export routes with service bearer tokens.
 - **Idempotency and duplicate detection:** Replay safe request retries and reject duplicate supplier invoices.
 - **AP export outbox:** Poll approved payables as structured JSON and acknowledge downstream delivery.
+- **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
+- **PDF/email capture:** Extract candidate invoice fields with confidence and require human verification before matching.
+- **Procurement edge cases:** Support cumulative partial invoices, multiple receipts, revisioned POs, credit notes, and configured unit conversions.
 - **CSV intake:** Submit line-oriented PO, receipt, and invoice CSVs through the same matching pipeline.
 - **Reviewer roles:** Separate read-only reviewers, approvers, and admins; support distinct reviewers for multi-step approval.
 - **Audit history:** Record integration and reviewer identities, approval votes, decisions, and AP acknowledgements.
@@ -36,6 +39,7 @@ When a document contains the same SKU on multiple rows, quantities are combined 
 
 - Python 3.11 or newer for local use
 - Docker and Docker Compose for the containerized PostgreSQL setup
+- pypdf dependency for PDF text extraction (included in the standard install)
 
 ## Quick start: CLI
 
@@ -76,7 +80,34 @@ See available commands and options:
 ```bash
 invoice-match --help
 invoice-match match --help
+invoice-match match-ap --help
+invoice-match deliver --help
 ```
+
+### Connect to an AP provider
+
+The provider-neutral adapter contract exposes `fetch_purchase_order`, `fetch_receipts`, and `submit_invoice`. `match-ap` fetches source documents and matches a local invoice JSON file. `deliver` sends approved outbox payloads and records successes and failures; failed entries remain pending for retry, and deliveries use the match ID as their idempotency key.
+
+The local filesystem adapter expects `purchase_orders/<PO_NUMBER>.json` and `receipts/<PO_NUMBER>.json` under its directory and writes payables to `invoices/<MATCH_ID>.json`:
+
+```bash
+cp -R examples/ap-adapter-data /tmp/ap-adapter-demo
+invoice-match match-ap --adapter filesystem --directory /tmp/ap-adapter-demo \
+  --po-number PO-10291 --invoice examples/invoice.json
+invoice-match deliver --adapter filesystem --directory /tmp/ap-adapter-demo
+```
+
+The fixture intentionally has a short receipt, so the match command exits with status `2` and reports an exception. The delivery command operates on the persistent API outbox; run it after starting the API and approving an exception.
+
+The generic HTTP adapter uses this REST contract relative to `AP_ADAPTER_URL`:
+
+| Method | Path | Contract |
+| --- | --- | --- |
+| `GET` | `/purchase-orders/{po_number}` | PO JSON object or `{ "purchase_order": ... }` |
+| `GET` | `/purchase-orders/{po_number}/receipts` | Receipt JSON array or `{ "receipts": [...] }` |
+| `POST` | `/invoices` | AP export JSON with `Authorization` and `Idempotency-Key` headers |
+
+Set `AP_ADAPTER_URL` and `AP_ADAPTER_TOKEN`, then pass `--adapter http`. This is a generic contract; vendor-specific adapters should translate provider APIs to these methods.
 
 ## Run the API locally
 
@@ -116,9 +147,40 @@ The integration identity is recorded in the audit log; the client cannot supply 
 
 ### Import CSV documents
 
-`POST /imports/csv` accepts three CSV strings in JSON and uses the same integration bearer token and idempotency header. Each CSV has one document per request and one row per line item. Required columns are `number,vendor,sku,qty` for PO; `sku,qty` for receipt; and `number,sku,qty` for invoice. Unit `price` is optional, as it is in the JSON schema. Optional columns map to the input schema: `currency`, `cost_center`, `tax_rate`, `tax_code`, `tax_amount`, `discount_rate`, `freight_amount`, `discount_amount`, `total_amount`, and `description`. Document-level values may appear on the first row or repeat consistently on every row. Invalid data returns HTTP `422`.
+`POST /imports/csv` accepts three CSV strings in JSON and uses the same integration bearer token and idempotency header. Each CSV has one document per request and one row per line item. Required columns are `number,vendor,sku,qty` for PO; `sku,qty` for receipt; and `number,sku,qty` for invoice. Unit `price` is optional, as it is in the JSON schema. Optional columns map to the input schema: `currency`, `cost_center`, `tax_rate`, `tax_code`, `tax_amount`, `discount_rate`, `freight_amount`, `discount_amount`, `total_amount`, `description`, and `unit`. Document-level values may appear on the first row or repeat consistently on every row. Invalid data returns HTTP `422`.
 
 The JSON body has string fields `po_csv`, `receipt_csv`, and `invoice_csv`. Start with [examples/csv-import.json](examples/csv-import.json), or see the `CsvMatchRequest` schema in `/docs`.
+
+### Capture and verify PDF/email invoices
+
+Send raw PDF, RFC 822 `.eml`, or UTF-8 text bytes to `POST /documents/extract` with an integration token and `X-Filename`. Uploads are limited to 10 MiB. The service stores the source document, SHA-256, extracted candidates, per-field confidence, and notes. Identical uploads are rejected. Every capture remains `REVIEW_REQUIRED`, even when extraction confidence is high.
+
+```bash
+curl --request POST http://127.0.0.1:8000/documents/extract \
+  --header 'Authorization: Bearer replace-with-a-random-integration-token-at-least-32-chars' \
+  --header 'X-Filename: supplier-invoice.pdf' \
+  --header 'Content-Type: application/pdf' \
+  --data-binary @supplier-invoice.pdf
+```
+
+Reviewers can list pending captures with `GET /documents`, then inspect candidate fields, audit history, and original bytes with `GET /documents/{document_id}`, `/audit`, and `/source`. An approver verifies corrected fields with `POST /documents/{document_id}/verify`. Only after verification can an integration submit the related PO and receipts to `POST /documents/{document_id}/match`; the saved invoice is then sent through matching.
+
+Verification supplies the corrected invoice schema. Matching then supplies the PO and receipt documents, plus an idempotency key:
+
+```bash
+curl --request POST http://127.0.0.1:8000/documents/DOCUMENT_ID/verify \
+  --header 'Authorization: Bearer replace-with-a-random-approver-token-at-least-32-chars' \
+  --header 'Content-Type: application/json' \
+  --data '{"invoice":{"number":"INV-2044","vendor":"ABC Supplies","currency":"USD","items":[{"sku":"A100","qty":100,"price":10}]}}'
+
+curl --request POST http://127.0.0.1:8000/documents/DOCUMENT_ID/match \
+  --header 'Authorization: Bearer replace-with-a-random-integration-token-at-least-32-chars' \
+  --header 'Idempotency-Key: captured-invoice-INV-2044-v1' \
+  --header 'Content-Type: application/json' \
+  --data '{"po":{"number":"PO-10291","vendor":"ABC Supplies","items":[{"sku":"A100","qty":100,"price":10}]},"receipt":{"receipts":[{"number":"GR-2044-A","items":[{"sku":"A100","qty":60}]},{"number":"GR-2044-B","items":[{"sku":"A100","qty":40}]}]}}'
+```
+
+PDF extraction reads text layers. A scanned PDF without selectable text is stored with `NO_TEXT_LAYER_OCR_REQUIRED` so OCR or human entry can be added; OCR itself is not bundled. PDF extraction is included in the standard install. Email text bodies and PDF attachments are supported.
 
 ### Review and decide an exception
 
@@ -182,6 +244,13 @@ Each payload contains invoice and PO identifiers, supplier, currency, cost cente
 | `GET` | `/health` | Service health check |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
+| `POST` | `/documents/extract` | Capture a raw PDF, email, or text invoice for extraction |
+| `GET` | `/documents?status=REVIEW_REQUIRED\|VERIFIED\|ALL` | List captured documents (reviewer token required) |
+| `GET` | `/documents/{document_id}` | Retrieve captured fields and confidence (reviewer token required) |
+| `GET` | `/documents/{document_id}/source` | Retrieve captured source bytes (reviewer token required) |
+| `GET` | `/documents/{document_id}/audit` | Retrieve capture and verification history (reviewer token required) |
+| `POST` | `/documents/{document_id}/verify` | Save human-verified invoice fields (approver/admin token required) |
+| `POST` | `/documents/{document_id}/match` | Match a verified capture with PO and receipt documents |
 | `GET` | `/matches/{match_id}` | Retrieve a stored match result (reviewer bearer token required) |
 | `GET` | `/matches/{match_id}/audit` | Retrieve audit events (reviewer bearer token required) |
 | `GET` | `/exceptions?status=OPEN\|CLOSED\|ALL` | List exceptions; defaults to `OPEN` (reviewer bearer token required) |
@@ -225,6 +294,10 @@ Document fields:
 - PO and invoice `currency` default to `USD` and use three-letter currency codes.
 - Optional `po.tax_rate` is a fraction: `0.08` means 8%.
 - Optional `invoice.tax_amount` is the tax amount stated on the invoice.
+- `po.revision` identifies the current approved revision. Revisions above `1` require `change_reason`; the API rejects stale revisions.
+- A receipt can use `number` and `items` or a `receipts` list containing multiple receipt documents.
+- Invoice `document_type` may be `INVOICE` or `CREDIT_NOTE`. Credit notes require `credit_note_for`, use positive entered amounts/quantities, and export as negative AP values.
+- Each line's `unit` defaults to `EA`; configured unit families convert quantities to a shared base before comparison.
 
 Pydantic validates the input and rejects unknown fields. Decimal arithmetic is used for quantities and prices.
 
@@ -242,6 +315,11 @@ rules:
     tolerance: 0.5%
   amount_variance:
     tolerance: 0.5%
+  quantity_units:
+    EA: {family: count, to_base: 1}
+    CASE: {family: count, to_base: 12}
+    KG: {family: mass, to_base: 1}
+    G: {family: mass, to_base: 0.001}
   currency:
     base_currency: USD
     minor_units:
@@ -265,6 +343,8 @@ rules:
 ```
 
 Tolerance is relative to the expected value: `2%` accepts variance up to 2% of expected. A numeric ratio such as `0.02` is also accepted. Currency rates convert one unit of the named currency into units of the base currency; set the base currency rate to `1`. Both document currencies must have rates. `minor_units` controls rounding per currency (defaults to 2). Policies are checked in order and the first matching policy wins; selectors include invoice total, accumulated monetary variance, supplier, and cost center. Monetary selectors use the base currency. `sla_hours` sets an exception's due timestamp.
+
+Quantity unit definitions map each unit to a family and multiplier into that family's base unit. For example, one `CASE` is twelve count units. Different or unconfigured unit families return `UOM_MISMATCH` instead of comparing unlike quantities. Configure families carefully; definitions are shared across the rules file.
 
 Rates are static configuration values supplied by the operator. This application does not fetch exchange rates. Set `INVOICE_MATCH_RULES` to load another YAML file for the API or CLI default; the CLI `--rules` option overrides it.
 
@@ -290,6 +370,9 @@ The Compose file uses development credentials. Change credentials and manage the
 | `INVOICE_MATCH_RULES` | `config/rules.yaml` | YAML rules path |
 | `REVIEWER_TOKENS` | unset | JSON map of reviewer names to `{token, roles}`; roles: reviewer, approver, admin |
 | `INTEGRATION_TOKENS` | unset | JSON map of integration names to unique bearer tokens |
+| `AP_ADAPTER_URL` | unset | Base URL for the generic REST adapter |
+| `AP_ADAPTER_TOKEN` | unset | Bearer token for the generic REST adapter |
+| `AP_ADAPTER_DIRECTORY` | `./ap-adapter-data` | Filesystem adapter input and export directory |
 
 Example PostgreSQL URL:
 
@@ -310,7 +393,9 @@ config/rules.yaml             Matching tolerances and currency rates
 examples/                     Sample PO, receipt, and invoice JSON
 src/invoice_match/api.py      Authenticated API, intake, review, and outbox routes
 src/invoice_match/ap_export.py AP payload builder for approved matches
+src/invoice_match/adapters/    Provider-neutral AP adapter and implementations
 src/invoice_match/csv_import.py Provider-neutral CSV document parser
+src/invoice_match/document_capture.py PDF/email extraction and confidence scoring
 src/invoice_match/cli.py      Typer CLI
 src/invoice_match/database.py SQLAlchemy models and database setup
 src/invoice_match/matcher.py  Three-way matching rules
@@ -331,13 +416,13 @@ pytest
 invoice-match --help
 ```
 
-The automated suite covers matching and financial calculations, idempotent/duplicate submission behavior, CSV validation, role-based approval workflows, the AP outbox, migrations, and audit identity.
+The automated suite covers matching and financial calculations, cumulative partial invoices, PO revisions, units and credit notes, adapter retries, PDF/email capture and verification, idempotent submissions, CSV validation, approval workflows, and audit history.
 
 ## Security and scope
 
 Reviewer read, audit, and queue routes require reviewer tokens; approve and reject routes additionally require the `approver` or `admin` role. Integration submission and AP outbox routes require tokens from `INTEGRATION_TOKENS`; `/health` is public. Store tokens in a secret manager in deployed environments and rotate them when access changes. The example PostgreSQL credentials in Docker Compose are for local development only.
 
-This project validates and matches structured JSON and CSV, and offers a provider-neutral AP outbox. It does not perform OCR, include vendor-specific ERP/AP connectors, initiate payments, or fetch live exchange rates. Build an adapter for your accounting system using the outbox contract. Review tolerances, tax assumptions, and rates against your accounting policy before processing live invoices.
+Captured source documents are stored in the application database; apply access controls, encryption, backups, and retention policies appropriate for financial records. PDF extraction reads text layers and does not perform OCR. The HTTP adapter defines a generic REST shape rather than a vendor-certified connector. The project does not initiate payments or fetch live exchange rates. Review tolerances, tax assumptions, unit families, and rates against your accounting policy before processing live invoices.
 
 ## Inspiration
 

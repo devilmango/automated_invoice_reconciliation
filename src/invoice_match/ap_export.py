@@ -9,6 +9,7 @@ from .schemas import APExportLine, APExportPayload, MatchRequest
 
 def build_ap_payload(match_id: str, request: MatchRequest, rules: ToleranceRules) -> dict:
     invoice = request.invoice
+    sign = Decimal(-1) if invoice.document_type == "CREDIT_NOTE" else Decimal(1)
     summary = invoice_summary(request, rules)
     invoice_lines = []
     for line in invoice.items:
@@ -31,13 +32,16 @@ def build_ap_payload(match_id: str, request: MatchRequest, rules: ToleranceRules
             discount_rate=line.discount_rate,
             tax_code=line.tax_code,
             tax_rate=rate,
-            line_net=round_currency(line_net_amount(line), invoice.currency, rules),
-            line_tax=round_currency(line_tax, invoice.currency, rules),
+            line_net=round_currency(line_net_amount(line) * sign, invoice.currency, rules),
+            line_tax=round_currency(line_tax * sign, invoice.currency, rules),
         ))
     return APExportPayload(
         match_id=match_id,
         purchase_order_number=request.po.number,
+        purchase_order_revision=request.po.revision,
         supplier_invoice_number=invoice.number or "",
+        document_type=invoice.document_type,
+        credit_note_for=invoice.credit_note_for,
         supplier=invoice.vendor or request.po.vendor,
         currency=invoice.currency.upper(),
         cost_center=request.po.cost_center,

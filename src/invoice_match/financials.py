@@ -44,6 +44,7 @@ def invoice_summary(request: MatchRequest, rules: ToleranceRules) -> dict[str, D
         for sku, rates in po_rates.items()
     }
 
+    sign = Decimal(-1) if invoice.document_type == "CREDIT_NOTE" else Decimal(1)
     subtotal = round_currency(sum((line_net_amount(item) for item in invoice.items), Decimal(0)), invoice.currency, rules)
     if invoice.tax_amount is not None:
         tax = round_currency(invoice.tax_amount, invoice.currency, rules)
@@ -68,8 +69,15 @@ def invoice_summary(request: MatchRequest, rules: ToleranceRules) -> dict[str, D
         )
     freight = round_currency(invoice.freight_amount, invoice.currency, rules)
     discount = round_currency(invoice.discount_amount, invoice.currency, rules)
+    subtotal *= sign
+    tax *= sign
+    freight *= sign
+    discount *= -sign
     calculated_total = round_currency(subtotal + freight + tax - discount, invoice.currency, rules)
-    total = round_currency(invoice.total_amount, invoice.currency, rules) if invoice.total_amount is not None else calculated_total
+    total = (
+        round_currency(invoice.total_amount, invoice.currency, rules) * sign
+        if invoice.total_amount is not None else calculated_total
+    )
     return {
         "subtotal": subtotal,
         "tax": tax,

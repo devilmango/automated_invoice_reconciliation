@@ -47,6 +47,8 @@ def apply_database_migrations():
 @pytest.fixture(autouse=True)
 def clear_database(apply_database_migrations):
     with engine.begin() as connection:
+        connection.exec_driver_sql("DELETE FROM document_capture_events")
+        connection.exec_driver_sql("DELETE FROM captured_documents")
         connection.exec_driver_sql("DELETE FROM ap_outbox")
         connection.exec_driver_sql("DELETE FROM audit_events")
         connection.exec_driver_sql("DELETE FROM exceptions")

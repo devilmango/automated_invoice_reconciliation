@@ -44,6 +44,12 @@ class ApprovalPolicy(BaseModel):
         ))
 
 
+class QuantityUnit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    family: str
+    to_base: Decimal = Field(gt=0)
+
+
 class ToleranceRules(BaseModel):
     model_config = ConfigDict(extra="forbid")
     quantity_variance: Decimal = Decimal("0.02")
@@ -53,6 +59,9 @@ class ToleranceRules(BaseModel):
     base_currency: str = "USD"
     rates_to_base: dict[str, Decimal] = Field(default_factory=lambda: {"USD": Decimal(1)})
     minor_units: dict[str, int] = Field(default_factory=lambda: {"USD": 2})
+    quantity_units: dict[str, QuantityUnit] = Field(default_factory=lambda: {
+        "EA": QuantityUnit(family="count", to_base=Decimal(1)),
+    })
     auto_approve_matches: bool = False
     approval_policies: list[ApprovalPolicy] = Field(default_factory=list)
 
@@ -111,6 +120,12 @@ def load_rules(path: str | Path | None = None) -> ToleranceRules:
         raise ValueError("currency minor-unit precision must be between 0 and 6")
     minor_units.setdefault(base, 2)
 
+    quantity_units = {
+        str(code).upper(): QuantityUnit.model_validate(definition)
+        for code, definition in rules.get("quantity_units", {}).items()
+    }
+    quantity_units.setdefault("EA", QuantityUnit(family="count", to_base=Decimal(1)))
+
     policies = [ApprovalPolicy.model_validate(policy) for policy in approval.get("policies", [])]
     return ToleranceRules(
         quantity_variance=_ratio(rules.get("quantity_variance", {}).get("tolerance", "2%"), "quantity_variance"),
@@ -120,6 +135,7 @@ def load_rules(path: str | Path | None = None) -> ToleranceRules:
         base_currency=base,
         rates_to_base=parsed_rates,
         minor_units=minor_units,
+        quantity_units=quantity_units,
         auto_approve_matches=bool(approval.get("auto_approve_matches", False)),
         approval_policies=policies,
     )
