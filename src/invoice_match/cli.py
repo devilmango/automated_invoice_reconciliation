@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import typer
@@ -47,7 +48,7 @@ def serve(
 def match_from_ap(
     po_number: str = typer.Option(..., help="Purchase order identifier in the AP provider."),
     invoice: Path = typer.Option(..., exists=True, readable=True, help="Supplier invoice JSON file."),
-    adapter: str = typer.Option("filesystem", help="AP adapter: filesystem or http."),
+    adapter: str = typer.Option("filesystem", help="Source adapter: filesystem or http (QuickBooks is export-only)."),
     directory: Path | None = typer.Option(None, help="Filesystem adapter fixture/export directory."),
     endpoint: str | None = typer.Option(None, help="Generic HTTP adapter base URL."),
     token: str | None = typer.Option(None, help="Generic HTTP adapter bearer token."),
@@ -59,6 +60,10 @@ def match_from_ap(
     try:
         provider = create_adapter(adapter, directory=str(directory) if directory else None,
                                   endpoint=endpoint, token=token)
+        if not callable(getattr(provider, "fetch_purchase_order", None)) or not callable(
+            getattr(provider, "fetch_receipts", None)
+        ):
+            raise ValueError(f"The {adapter!r} adapter exports payables but cannot fetch PO/receipt documents")
         po_data = provider.fetch_purchase_order(po_number)
         receipt_data = provider.fetch_receipts(po_number)
         if not receipt_data:
@@ -77,7 +82,7 @@ def match_from_ap(
 
 @app.command()
 def deliver(
-    adapter: str = typer.Option("filesystem", help="AP adapter: filesystem or http."),
+    adapter: str = typer.Option("filesystem", help="AP adapter: filesystem, http, or quickbooks."),
     directory: Path | None = typer.Option(None, help="Filesystem adapter fixture/export directory."),
     endpoint: str | None = typer.Option(None, help="Generic HTTP adapter base URL."),
     token: str | None = typer.Option(None, help="Generic HTTP adapter bearer token."),
@@ -97,6 +102,52 @@ def deliver(
     with SessionLocal() as session:
         summary = deliver_pending(session, provider, limit=limit)
     typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("notifications-run")
+def notifications_run(
+    window_hours: int = typer.Option(24, min=1, max=720,
+                                     help="Notify reviewers this long before due time."),
+    limit: int = typer.Option(100, min=1, max=1000,
+                              help="Maximum notification outbox records to deliver."),
+):
+    """Escalate overdue items, enqueue due reminders, and deliver webhook notifications."""
+    from .database import SessionLocal
+    from .notification_delivery import (
+        WebhookNotificationAdapter,
+        deliver_pending_notifications,
+        escalate_overdue,
+        queue_due_reminders,
+    )
+
+    endpoint = os.getenv("NOTIFICATION_WEBHOOK_URL")
+    if not endpoint:
+        typer.echo("NOTIFICATION_WEBHOOK_URL is required", err=True)
+        raise typer.Exit(code=1)
+    try:
+        adapter = WebhookNotificationAdapter(
+            endpoint,
+            token=os.getenv("NOTIFICATION_WEBHOOK_TOKEN"),
+            secret=os.getenv("NOTIFICATION_WEBHOOK_SECRET"),
+        )
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    with SessionLocal() as session:
+        escalated = escalate_overdue(
+            session, actor=os.getenv("NOTIFICATION_WORKER_NAME", "scheduler")
+        )
+        reminders = queue_due_reminders(session, window_hours=window_hours)
+        session.commit()
+        delivery = deliver_pending_notifications(session, adapter, limit=limit)
+    typer.echo(json.dumps({
+        "escalated_match_ids": escalated,
+        "reminders_queued": len(reminders),
+        "delivery": delivery,
+    }, indent=2))
+    if delivery["failed"] or delivery["dead_lettered"]:
+        raise typer.Exit(code=1)
 
 
 def parse_purchase_order_data(data: dict):

@@ -19,6 +19,8 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 - **Idempotency and duplicate detection:** Replay safe request retries and reject duplicate supplier invoices.
 - **AP export outbox:** Poll approved payables as structured JSON and acknowledge downstream delivery.
 - **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
+- **QuickBooks Online export:** Create mapped QuickBooks Bills with encrypted OAuth token storage, token refresh, provider-side duplicate checks, and retry-safe request IDs.
+- **Reviewer notifications:** Persist exception, reminder, and escalation events in an outbox and deliver them to an HTTPS webhook with backoff and dead-letter handling.
 - **PDF/email capture:** Extract candidate invoice fields with confidence and require human verification before matching.
 - **Procurement edge cases:** Support cumulative partial invoices, multiple receipts, revisioned POs, credit notes, and configured unit conversions.
 - **CSV intake:** Submit line-oriented PO, receipt, and invoice CSVs through the same matching pipeline.
@@ -239,6 +241,22 @@ curl --request POST http://127.0.0.1:8000/exceptions/bulk-approve \
 
 Run `POST /exceptions/escalate-overdue` from a scheduler to flag open items past their SLA. Escalation is recorded in the match audit history, clears any named assignment, and changes the required decision role to the configured policy `escalation_role` (defaults to `admin`). The endpoint requires an approver or admin bearer token and returns the escalated match IDs. Add `escalation_role: approver` or `escalation_role: admin` to an approval policy in `config/rules.yaml` to control its escalation destination.
 
+Exception creation queues a webhook notification immediately. A scheduled worker also queues one due-soon reminder inside the configured window, daily overdue reminders, and escalation notices. Run the worker every 15 minutes with cron, a Kubernetes CronJob, or an equivalent scheduler:
+
+```bash
+invoice-match notifications-run --window-hours 24 --limit 100
+# With Docker Compose, run it against the service's configured database and secrets:
+docker compose exec api invoice-match notifications-run --window-hours 24
+```
+
+Example host crontab (adjust paths and log handling for your deployment):
+
+```cron
+*/15 * * * * cd /srv/automated-invoice-reconciliation && docker compose exec -T api invoice-match notifications-run --window-hours 24 >> /var/log/invoice-match-notifications.log 2>&1
+```
+
+Set `NOTIFICATION_WEBHOOK_URL` to an HTTPS endpoint. Optional `NOTIFICATION_WEBHOOK_TOKEN` sends a bearer credential; `NOTIFICATION_WEBHOOK_SECRET` adds an HMAC-SHA256 signature in `X-Invoice-Match-Signature` over the exact JSON request body. Every delivery includes an `Idempotency-Key` header. Failures retry with exponential backoff up to eight attempts, then enter the `DEAD` state. Inspect `GET /notifications/outbox`; an admin can requeue a dead letter with `POST /notifications/outbox/{notification_id}/retry`. The receiver should deduplicate by idempotency key because webhook delivery is at-least-once.
+
 ### Manage rule versions
 
 Admins can submit a YAML rule set as a draft. The API validates it with the same parser used for matching, computes a SHA-256 digest, and assigns a monotonically increasing version. A different admin must activate it; a creator cannot activate their own draft. The currently active version replaces the previous one for new matches. Existing matches retain the exact normalized rule snapshot and digest used to evaluate them, including when an exception is approved later.
@@ -275,6 +293,42 @@ curl --request POST http://127.0.0.1:8000/integrations/ap/outbox/MATCH_ID/ack \
 
 Each payload contains invoice and PO identifiers, supplier, currency, cost center, lines, subtotal, tax, freight, discounts, total, and approval status. Delivery is at-least-once; consumers should deduplicate by `match_id` and acknowledge only after a successful AP write.
 
+### Export approved invoices to QuickBooks Online
+
+The `quickbooks` adapter creates QuickBooks Online **Bills** from approved invoice payloads. Start in sandbox. Complete Intuit OAuth consent with the QuickBooks Accounting scope and supply the initial refresh token, client credentials, company realm ID, and a Fernet encryption key. The adapter refreshes and rotates OAuth tokens automatically, storing them encrypted in `quickbooks_credentials`; keep the encryption key in the same secret manager as the client secret and never store it in the database or repository.
+
+See Intuit's [OAuth 2.0 guide](https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0), [Bill API reference](https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/bill), and [billing implementation guide](https://developer.intuit.com/app/developer/qbo/docs/develop/basic-implementations/basic-billing-implementation) for application setup and provider fields. The connector expects OAuth consent to have been completed before delivery; it stores and refreshes the resulting tokens but does not host the interactive connect/callback flow.
+
+Generate a key with:
+
+```bash
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Map supplier names and invoice SKUs in `.env` to existing QuickBooks Vendor and Product/Service IDs. Tax codes must also map when exported lines carry tax. Freight and document discounts require the corresponding QuickBooks expense account IDs. QuickBooks transactions reference existing vendor, item, tax-code, and account records; the adapter fails clearly when mappings are missing instead of guessing. Configure `QBO_AP_ACCOUNT_ID` when the company has multiple AP accounts.
+
+```dotenv
+QBO_ENVIRONMENT=sandbox
+QBO_CLIENT_ID=...
+QBO_CLIENT_SECRET=...
+QBO_REALM_ID=...
+QBO_REFRESH_TOKEN=...
+QBO_TOKEN_ENCRYPTION_KEY=...
+QBO_VENDOR_ID_MAP={"ABC Supplies":"37"}
+QBO_ITEM_ID_MAP={"A100":"12"}
+QBO_TAX_CODE_MAP={"STANDARD":"TAX"}
+QBO_AP_ACCOUNT_ID=33
+```
+
+After applying migrations, deliver the normal AP outbox through QuickBooks:
+
+```bash
+alembic upgrade head
+invoice-match deliver --adapter quickbooks --limit 100
+```
+
+The connector queries by supplier invoice number before creating a Bill and stores the invoice-match ID in the QuickBooks private note. A retry for the same match returns the existing Bill instead of creating a duplicate; a Bill with that invoice number belonging to another match is rejected. A stable QBO `requestid` is also sent. Current connector scope is Bill export only: `match-ap` still needs an inbound-capable adapter for PO and receipt retrieval, and QuickBooks credit notes, PO-line linking, and account-specific tax behavior need explicit provider support before use. Test mappings and tax treatment in the QBO sandbox before enabling production delivery.
+
 ## API reference
 
 | Method | Path | Description |
@@ -297,6 +351,8 @@ Each payload contains invoice and PO identifiers, supplier, currency, cost cente
 | `POST` | `/exceptions/bulk-approve` | Atomically approve up to 100 exception IDs (approver/admin token required) |
 | `POST` | `/exceptions/bulk-reject` | Atomically reject up to 100 exception IDs (approver/admin token required) |
 | `POST` | `/exceptions/escalate-overdue` | Escalate open items past their SLA (approver/admin token required) |
+| `GET` | `/notifications/outbox?state=PENDING\|DELIVERED\|DEAD\|ALL` | Inspect webhook delivery state (reviewer token required) |
+| `POST` | `/notifications/outbox/{notification_id}/retry` | Requeue a dead-lettered notification (admin token required) |
 | `GET` | `/rules/versions` | List immutable rule versions (admin token required) |
 | `POST` | `/rules/versions` | Validate and create a draft rule version (admin token required) |
 | `POST` | `/rules/versions/{version_id}/activate` | Activate a draft with a different admin identity |
@@ -418,6 +474,19 @@ The Compose file uses development credentials. Change credentials and manage the
 | `AP_ADAPTER_URL` | unset | Base URL for the generic REST adapter |
 | `AP_ADAPTER_TOKEN` | unset | Bearer token for the generic REST adapter |
 | `AP_ADAPTER_DIRECTORY` | `./ap-adapter-data` | Filesystem adapter input and export directory |
+| `NOTIFICATION_WEBHOOK_URL` | unset | HTTPS destination for scheduled reviewer notification delivery |
+| `NOTIFICATION_WEBHOOK_TOKEN` | unset | Optional bearer credential sent to the notification endpoint |
+| `NOTIFICATION_WEBHOOK_SECRET` | unset | Optional HMAC-SHA256 signing secret for webhook requests |
+| `QBO_CLIENT_ID` / `QBO_CLIENT_SECRET` | unset | Intuit OAuth application credentials |
+| `QBO_REALM_ID` / `QBO_REFRESH_TOKEN` | unset | QuickBooks company ID and initial OAuth refresh token |
+| `QBO_TOKEN_ENCRYPTION_KEY` | unset | Fernet key used to encrypt rotated OAuth tokens at rest |
+| `QBO_ENVIRONMENT` | `sandbox` | QuickBooks target environment: `sandbox` or `production` |
+| `QBO_VENDOR_ID_MAP` | `{}` | JSON supplier-name to QuickBooks Vendor ID mapping |
+| `QBO_ITEM_ID_MAP` | `{}` | JSON SKU to QuickBooks Item ID mapping |
+| `QBO_TAX_CODE_MAP` | `{}` | JSON invoice tax-code to QuickBooks TaxCode ID mapping |
+| `QBO_AP_ACCOUNT_ID` | unset | Explicit accounts-payable account ID for companies with multiple AP accounts |
+| `QBO_FREIGHT_ACCOUNT_ID` / `QBO_DISCOUNT_ACCOUNT_ID` | unset | Existing expense account IDs for invoices carrying those amounts |
+| `QBO_TIMEOUT_SECONDS` / `QBO_MINOR_VERSION` | `20` / provider default | QuickBooks request timeout and optional API minor version |
 
 Example PostgreSQL URL:
 
@@ -429,7 +498,7 @@ alembic upgrade head
 invoice-match serve
 ```
 
-Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, and downstream delivery state in `ap_outbox`.
+Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, notification delivery state in `notification_outbox`, and encrypted QuickBooks OAuth tokens in `quickbooks_credentials`.
 
 ## Project layout
 
@@ -439,6 +508,8 @@ examples/                     Sample PO, receipt, and invoice JSON
 src/invoice_match/api.py      Authenticated API, intake, review, and outbox routes
 src/invoice_match/ap_export.py AP payload builder for approved matches
 src/invoice_match/adapters/    Provider-neutral AP adapter and implementations
+src/invoice_match/adapters/quickbooks.py QuickBooks Bill mapping, OAuth refresh, and idempotent export
+src/invoice_match/notification_delivery.py Durable reviewer notification outbox and webhook worker
 src/invoice_match/csv_import.py Provider-neutral CSV document parser
 src/invoice_match/document_capture.py PDF/email extraction and confidence scoring
 src/invoice_match/cli.py      Typer CLI

@@ -165,6 +165,22 @@ class RuleVersionAuditEntry(StrictModel):
     created_at: str
 
 
+class NotificationOutboxItem(StrictModel):
+    id: str
+    match_id: str
+    dedupe_key: str
+    event_type: str
+    channel: str
+    state: Literal["PENDING", "DELIVERED", "DEAD"]
+    attempt_count: int
+    next_attempt_at: datetime | None
+    last_error: str | None
+    provider_reference: str | None
+    payload: dict
+    created_at: datetime
+    delivered_at: datetime | None
+
+
 class ExceptionQueueItem(StrictModel):
     match_id: str
     status: MatchStatus

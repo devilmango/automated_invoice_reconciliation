@@ -22,6 +22,7 @@ from .database import (
     DocumentCaptureEvent,
     ExceptionRecord,
     MatchRecord,
+    NotificationOutboxRecord,
     RuleVersionEvent,
     RuleVersionRecord,
     SessionLocal,
@@ -29,6 +30,7 @@ from .database import (
 from .document_capture import extract_document
 from .integration_auth import require_integration
 from .matcher import match_documents
+from .notification_delivery import escalate_overdue, queue_notification
 from .reviewer_auth import Principal, require_admin, require_approver, require_reviewer
 from .rules import ToleranceRules, load_rules, parse_rules_yaml
 from .schemas import (
@@ -44,6 +46,7 @@ from .schemas import (
     MatchRequest,
     MatchResult,
     MatchStatus,
+    NotificationOutboxItem,
     RuleVersionCreate,
     RuleVersionAuditEntry,
     RuleVersionResult,
@@ -209,11 +212,13 @@ def _submit_match(
     )
     session.add(record)
     if result.status == MatchStatus.EXCEPTION:
-        session.add(ExceptionRecord(
+        exception = ExceptionRecord(
             match_id=match_id,
             queue_status="OPEN",
             discrepancies=[issue.model_dump(mode="json") for issue in result.discrepancies],
-        ))
+        )
+        session.add(exception)
+        queue_notification(session, record, "EXCEPTION_CREATED")
     elif result.approval_status in {"APPROVED", "NOT_REQUIRED"}:
         _add_outbox(session, match_id, request, rules)
     session.add(AuditEvent(
@@ -698,33 +703,41 @@ def escalate_overdue_exceptions(
     session: Session = Depends(get_session),
     actor: Principal = Depends(require_approver),
 ):
-    rows = session.execute(select(ExceptionRecord, MatchRecord).join(
-        MatchRecord, ExceptionRecord.match_id == MatchRecord.id
-    ).where(
-        ExceptionRecord.queue_status == "OPEN",
-        ExceptionRecord.escalated.is_(False),
-        MatchRecord.due_at.is_not(None),
-    )).all()
-    now = datetime.now(timezone.utc)
-    escalated = []
-    for exception, match in rows:
-        due_at = match.due_at.replace(tzinfo=timezone.utc) if match.due_at.tzinfo is None else match.due_at
-        if due_at > now:
-            continue
-        match.required_role = match.escalation_role
-        match.assigned_to = None
-        exception.escalated = True
-        exception.escalated_to = match.escalation_role
-        exception.escalated_at = now
-        session.add(AuditEvent(
-            match_id=match.id,
-            event_type="EXCEPTION_ESCALATED",
-            actor=actor.name,
-            details={"escalated_to": match.escalation_role, "due_at": _timestamp(match.due_at)},
-        ))
-        escalated.append(match.id)
+    escalated = escalate_overdue(session, actor=actor.name)
     session.commit()
     return {"escalated_count": len(escalated), "match_ids": escalated}
+
+
+@app.get("/notifications/outbox", response_model=list[NotificationOutboxItem])
+def list_notification_outbox(
+    state: str = Query(default="PENDING", pattern="^(PENDING|DELIVERED|DEAD|ALL)$"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    query = select(NotificationOutboxRecord)
+    if state != "ALL":
+        query = query.where(NotificationOutboxRecord.state == state)
+    return session.scalars(query.order_by(NotificationOutboxRecord.created_at.asc()).limit(limit)).all()
+
+
+@app.post("/notifications/outbox/{notification_id}/retry", response_model=NotificationOutboxItem)
+def retry_notification(
+    notification_id: str,
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    record = session.get(NotificationOutboxRecord, notification_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    if record.state != "DEAD":
+        raise HTTPException(status_code=409, detail="Only dead-lettered notifications can be retried")
+    record.state = "PENDING"
+    record.next_attempt_at = None
+    record.attempt_count = 0
+    record.last_error = None
+    session.commit()
+    return record
 
 
 @app.get("/rules/versions", response_model=list[RuleVersionResult])

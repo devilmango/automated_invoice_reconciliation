@@ -5,11 +5,11 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .adapters.base import APAdapter
+from .adapters.base import PayablesDeliveryAdapter
 from .database import APOutboxRecord, AuditEvent
 
 
-def deliver_pending(session: Session, adapter: APAdapter, *, limit: int = 100) -> dict:
+def deliver_pending(session: Session, adapter: PayablesDeliveryAdapter, *, limit: int = 100) -> dict:
     """Send pending outbox payloads and persist success/failure for each item."""
     match_ids = session.scalars(
         select(APOutboxRecord.match_id)

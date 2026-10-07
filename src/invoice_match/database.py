@@ -160,3 +160,31 @@ class RuleVersionEvent(Base):
     actor: Mapped[str] = mapped_column(String(255))
     details: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class NotificationOutboxRecord(Base):
+    __tablename__ = "notification_outbox"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    channel: Mapped[str] = mapped_column(String(24), default="webhook")
+    payload: Mapped[dict] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class QuickBooksCredentialRecord(Base):
+    __tablename__ = "quickbooks_credentials"
+
+    realm_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    encrypted_access_token: Mapped[str] = mapped_column(String)
+    encrypted_refresh_token: Mapped[str] = mapped_column(String)
+    access_token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

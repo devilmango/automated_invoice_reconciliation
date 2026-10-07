@@ -52,6 +52,8 @@ def apply_database_migrations():
 def clear_database(apply_database_migrations):
     with engine.begin() as connection:
         connection.exec_driver_sql("DELETE FROM document_capture_events")
+        connection.exec_driver_sql("DELETE FROM notification_outbox")
+        connection.exec_driver_sql("DELETE FROM quickbooks_credentials")
         connection.exec_driver_sql("DELETE FROM rule_version_events")
         connection.exec_driver_sql("DELETE FROM rule_versions")
         connection.exec_driver_sql("DELETE FROM captured_documents")
