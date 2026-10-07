@@ -27,6 +27,23 @@ def test_exception_queue_requires_reviewer_authentication(client, integration_he
     assert response.headers["www-authenticate"] == "Bearer"
 
 
+def test_reviewer_dashboard_and_match_documents_require_reviewer_auth(client, reviewer_headers, integration_headers):
+    match_id = submit_exception(client, integration_headers)
+
+    page = client.get("/reviewer")
+    unauthenticated = client.get(f"/matches/{match_id}/documents")
+    documents = client.get(f"/matches/{match_id}/documents", headers=reviewer_headers)
+    match = client.get(f"/matches/{match_id}", headers=reviewer_headers)
+
+    assert page.status_code == 200 and "Reviewer queue" in page.text
+    assert unauthenticated.status_code == 401
+    assert documents.status_code == 200
+    assert documents.json()["po"]["number"] == "PO-10291"
+    assert documents.json()["receipt"]
+    assert documents.json()["invoice"]["number"]
+    assert match.json()["rule_digest"]
+
+
 def test_reviewer_can_approve_exception_and_audit_identity(client, reviewer_headers, integration_headers):
     match_id = submit_exception(client, integration_headers)
 

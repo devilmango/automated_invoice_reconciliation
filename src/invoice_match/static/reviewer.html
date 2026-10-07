@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Invoice Match · Reviewer queue</title>
+  <style>
+    :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17231f;background:#f3f6f4;font-synthesis:none;text-rendering:optimizeLegibility;--ink:#17231f;--muted:#63716b;--line:#dce5df;--green:#13795b;--green-dark:#0c5e45;--amber:#8a4b0a;--red:#a63232;--paper:#fff;--soft:#eaf2ed}
+    *{box-sizing:border-box}body{margin:0;min-width:320px}button,input,select,textarea{font:inherit}button{min-height:44px;border:0;border-radius:9px;padding:0 16px;font-weight:650;cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #5cae8c;outline-offset:2px}
+    .topbar{background:#102b22;color:white;padding:18px clamp(18px,4vw,48px);display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{display:flex;align-items:center;gap:12px}.mark{width:34px;height:34px;border:1px solid #6b9c86;border-radius:10px;display:grid;place-items:center;color:#a9dec5;font-weight:800}.brand strong{display:block;font-size:15px;letter-spacing:.02em}.brand span{display:block;color:#b8cbc1;font-size:12px;margin-top:3px}.connection{display:flex;align-items:center;gap:9px;color:#d3e3da;font-size:13px}.dot{width:8px;height:8px;border-radius:50%;background:#d1a04b}.dot.on{background:#64d09c}
+    main{max-width:1440px;margin:auto;padding:30px clamp(18px,4vw,48px) 48px}.intro{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;margin-bottom:22px}.eyebrow{color:var(--green);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.11em}h1{font-size:clamp(26px,3vw,36px);line-height:1.1;margin:8px 0;color:#102b22;letter-spacing:-.035em}.intro p{margin:0;color:var(--muted);max-width:630px;font-size:14px;line-height:1.5}.auth{display:flex;gap:8px;min-width:min(410px,100%)}.auth input{flex:1;min-width:130px}.control,input,select,textarea{border:1px solid #cbd8d0;border-radius:8px;background:#fff;padding:11px 12px;color:var(--ink);min-height:44px}.auth button,.primary{background:var(--green);color:white}.auth button:hover,.primary:hover{background:var(--green-dark)}
+    .notice{display:none;padding:12px 14px;border-radius:9px;margin:0 0 18px;background:#fff2e8;color:#7b3913;border:1px solid #f0d2bd;font-size:13px}.notice.show{display:block}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}.metric{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:15px 17px}.metric span{display:block;color:var(--muted);font-size:12px}.metric strong{display:block;font-size:25px;margin-top:7px;letter-spacing:-.03em}.metric .warn{color:var(--amber)}
+    .workspace{display:grid;grid-template-columns:minmax(330px,.9fr) minmax(0,1.55fr);gap:16px;align-items:start}.panel{background:var(--paper);border:1px solid var(--line);border-radius:13px;overflow:hidden;box-shadow:0 3px 12px #0000000a}.panel-head{padding:16px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px}.panel-head h2{font-size:15px;margin:0}.count{font-size:12px;color:var(--muted)}.filters{display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:12px;border-bottom:1px solid var(--line)}.filters input{min-width:0}.filter-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:#43534a;white-space:nowrap}.filter-toggle input{accent-color:var(--green);min-height:0;width:16px;height:16px}.queue{max-height:690px;overflow:auto}.queue-row{width:100%;text-align:left;display:block;height:auto;border-radius:0;background:white;border-bottom:1px solid #edf1ee;padding:14px 16px;color:var(--ink)}.queue-row:hover{background:#f7faf8}.queue-row.selected{background:#eff7f2;box-shadow:inset 3px 0 var(--green)}.row-top{display:flex;justify-content:space-between;gap:12px;align-items:center}.vendor{font-size:14px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-meta{font-size:12px;color:var(--muted);margin-top:6px;display:flex;gap:8px;flex-wrap:wrap}.pill{display:inline-flex;align-items:center;border-radius:99px;padding:4px 8px;font-size:10px;font-weight:800;letter-spacing:.04em;background:#edf0ee;color:#53625a}.pill.open{background:#fff0da;color:#80500d}.pill.escalated{background:#fde9e7;color:#a63232}.pill.pending{background:#e8eef9;color:#33558d}.empty{padding:34px 20px;text-align:center;color:var(--muted);font-size:13px}
+    .detail{min-height:450px}.detail-body{padding:18px}.detail-title{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.detail-title h2{margin:0;font-size:21px;letter-spacing:-.02em}.detail-title p{margin:6px 0;color:var(--muted);font-size:13px}.actions-top{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.subtle{background:#edf2ef;color:#264238}.subtle:hover{background:#dfeae3}.summary-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:18px 0}.summary-cell{background:#f6f8f6;border-radius:8px;padding:10px}.summary-cell span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em}.summary-cell strong{display:block;font-size:12px;margin-top:5px;overflow-wrap:anywhere}.section{margin-top:19px}.section h3{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#52635a;margin:0 0 9px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:9px}.diff{width:100%;border-collapse:collapse;font-size:12px;min-width:470px}.diff th,.diff td{text-align:left;padding:10px 12px;border-bottom:1px solid #edf1ee;vertical-align:top}.diff th{background:#f7f9f8;color:#627169;font-size:10px;text-transform:uppercase;letter-spacing:.05em}.diff tr:last-child td{border-bottom:0}.ok{color:var(--green);font-weight:700}.audit{display:grid;gap:8px}.event{border-left:2px solid #a9d2be;padding:1px 0 4px 12px;font-size:12px}.event strong{font-size:12px}.event span{display:block;color:var(--muted);margin-top:3px}.code{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f8f6;border:1px solid var(--line);border-radius:8px;padding:12px;font:11px/1.5 ui-monospace,SFMono-Regular,monospace;max-height:220px;overflow:auto}.decision{border-top:1px solid var(--line);margin:18px -18px -18px;padding:16px 18px;background:#fbfcfb}.decision label{display:block;font-size:12px;font-weight:700;margin-bottom:7px}.decision textarea{width:100%;min-height:74px;resize:vertical}.decision-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:9px}.reject{background:#f8e8e7;color:#982d2d}.reject:hover{background:#f2d7d5}.small{font-size:11px;color:var(--muted)}
+    @media(max-width:1000px){.workspace{grid-template-columns:1fr}.queue{max-height:390px}.intro{align-items:flex-start;flex-direction:column}.auth{width:min(500px,100%)}}
+    @media(max-width:650px){main{padding-top:22px}.topbar{padding:14px 18px}.metrics{grid-template-columns:repeat(2,1fr)}.filters{grid-template-columns:1fr 1fr}.filters input{grid-column:1/-1}.summary-grid{grid-template-columns:repeat(2,1fr)}.detail-title{display:block}.actions-top{justify-content:flex-start;margin-top:12px}.panel-head{padding:14px}.detail-body{padding:14px}.decision{margin:18px -14px -14px;padding:14px}}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><div class="mark" aria-hidden="true">IM</div><div><strong>INVOICE MATCH</strong><span>Finance operations</span></div></div>
+    <div class="connection"><span class="dot" id="statusDot"></span><span id="connectionText">Connect with a reviewer token</span></div>
+  </header>
+  <main>
+    <section class="intro">
+      <div><div class="eyebrow">Accounts payable · Control desk</div><h1>Reviewer queue</h1><p>Investigate three-way match exceptions, compare the submitted documents, and record an auditable decision.</p></div>
+      <form class="auth" id="authForm"><label class="small" for="token" style="position:absolute;clip:rect(0,0,0,0)">Reviewer bearer token</label><input id="token" class="control" type="password" autocomplete="off" placeholder="Reviewer bearer token" required><button type="submit">Connect</button></form>
+    </section>
+    <div class="notice" id="notice" role="status" aria-live="polite"></div>
+    <section class="metrics" aria-label="Queue summary">
+      <div class="metric"><span>Open exceptions</span><strong id="openCount">—</strong></div><div class="metric"><span>Needs approval</span><strong id="approvalCount">—</strong></div><div class="metric"><span>Past due</span><strong class="warn" id="overdueCount">—</strong></div><div class="metric"><span>Escalated</span><strong id="escalatedCount">—</strong></div>
+    </section>
+    <section class="workspace">
+      <div class="panel">
+        <div class="panel-head"><h2>Exceptions</h2><span class="count" id="queueCount">Connect to load</span></div>
+        <div class="filters"><input class="control" id="search" type="search" placeholder="Search vendor, PO, invoice" aria-label="Search exceptions"><label class="filter-toggle"><input id="overdue" type="checkbox"> Past due</label><label class="filter-toggle"><input id="escalated" type="checkbox"> Escalated</label></div>
+        <div class="queue" id="queue" aria-live="polite"><div class="empty">Enter a reviewer token to see the queue.</div></div>
+      </div>
+      <div class="panel detail" id="detail"><div class="panel-head"><h2>Exception details</h2><span class="count">Select a queue item</span></div><div class="empty">The selected exception’s documents, rule context, SLA, and audit history will appear here.</div></div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let token = sessionStorage.getItem('invoiceMatchReviewerToken') || '';
+    let items = [];
+    let selected = '';
+    let searchTimer;
+    if (token) { $('token').value = token; connect(); }
+    $('authForm').addEventListener('submit', async (event) => { event.preventDefault(); token = $('token').value.trim(); if (!token) return; sessionStorage.setItem('invoiceMatchReviewerToken', token); await connect(); });
+    $('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadQueue, 250); });
+    $('overdue').addEventListener('change', loadQueue);
+    $('escalated').addEventListener('change', loadQueue);
+    function showNotice(message) { const n = $('notice'); n.textContent = message; n.classList.toggle('show', Boolean(message)); }
+    async function api(path, options = {}) {
+      const response = await fetch(path, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers } });
+      let payload; try { payload = await response.json(); } catch { payload = null; }
+      if (!response.ok) { if (response.status === 401) { token = ''; $('token').value = ''; sessionStorage.removeItem('invoiceMatchReviewerToken'); $('statusDot').classList.remove('on'); $('connectionText').textContent = 'Token rejected'; } throw new Error(payload?.detail?.message || payload?.detail || `Request failed (${response.status})`); }
+      return payload;
+    }
+    async function connect() {
+      try { await loadQueue(); $('statusDot').classList.add('on'); $('connectionText').textContent = 'Reviewer session connected'; showNotice(''); }
+      catch (error) { showNotice(error.message); }
+    }
+    async function loadQueue() {
+      if (!token) return;
+      const params = new URLSearchParams({status:'OPEN', limit:'500'});
+      const query = $('search').value.trim(); if (query) params.set('q', query);
+      if ($('overdue').checked) params.set('overdue_only','true');
+      if ($('escalated').checked) params.set('escalated_only','true');
+      try {
+        const [filtered, summary] = await Promise.all([api(`/exceptions?${params}`), api('/exceptions?status=OPEN&limit=1000')]);
+        items = filtered; $('queueCount').textContent = `${items.length} shown`;
+        $('openCount').textContent = summary.length;
+        $('approvalCount').textContent = summary.filter(item => item.approval_status === 'PENDING').length;
+        const now = Date.now(); $('overdueCount').textContent = summary.filter(item => item.due_at && Date.parse(item.due_at) < now).length;
+        $('escalatedCount').textContent = summary.filter(item => item.escalated).length;
+        renderQueue();
+        if (selected && items.some(item => item.match_id === selected)) await loadDetail(selected);
+      } catch (error) { showNotice(error.message); $('queue').innerHTML = '<div class="empty">Unable to load exceptions.</div>'; throw error; }
+    }
+    function renderQueue() {
+      const queue = $('queue'); queue.replaceChildren();
+      if (!items.length) { queue.innerHTML = '<div class="empty">No exceptions match these filters.</div>'; return; }
+      for (const item of items) {
+        const button = document.createElement('button'); button.className = `queue-row${selected === item.match_id ? ' selected' : ''}`; button.type = 'button';
+        const top = document.createElement('div'); top.className = 'row-top';
+        const vendor = document.createElement('span'); vendor.className = 'vendor'; vendor.textContent = item.vendor;
+        const pill = document.createElement('span'); pill.className = `pill ${item.escalated ? 'escalated' : 'open'}`; pill.textContent = item.escalated ? 'ESCALATED' : item.reason.replaceAll('_',' ');
+        top.append(vendor, pill);
+        const meta = document.createElement('div'); meta.className = 'row-meta'; meta.textContent = `${item.po_number} · ${item.invoice_number || 'No invoice #'} · ${item.approvals_received}/${item.approvals_required} approvals`;
+        button.append(top, meta); button.addEventListener('click', () => { selected = item.match_id; renderQueue(); loadDetail(item.match_id); }); queue.append(button);
+      }
+    }
+    function esc(value) { return String(value ?? '—').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char])); }
+    function date(value) { if (!value) return 'Not set'; const d = new Date(value); return Number.isNaN(d.valueOf()) ? value : d.toLocaleString(); }
+    async function loadDetail(id) {
+      showNotice('');
+      try {
+        const [match, docs, audit] = await Promise.all([api(`/matches/${id}`), api(`/matches/${id}/documents`), api(`/matches/${id}/audit`)]);
+        const item = items.find(row => row.match_id === id);
+        const discrepancies = (match.discrepancies || []).map(row => `<tr><td>${esc(row.reason)}</td><td>${esc(row.sku)}</td><td>${esc(row.expected)}</td><td>${esc(row.invoiced)}</td><td>${esc(row.variance)}</td><td>${esc(row.message)}</td></tr>`).join('');
+        const auditMarkup = audit.map(event => `<div class="event"><strong>${esc(event.event_type.replaceAll('_',' '))}</strong><span>${esc(event.actor)} · ${esc(date(event.created_at))}</span>${event.details?.comment ? `<span>“${esc(event.details.comment)}”</span>` : ''}</div>`).join('');
+        const overdue = item?.due_at && Date.parse(item.due_at) < Date.now();
+        const rows = discrepancies || '<tr><td class="ok" colspan="6">No line-level discrepancies returned.</td></tr>';
+        $('detail').innerHTML = `<div class="panel-head"><h2>Exception details</h2><span class="pill ${overdue ? 'escalated' : 'pending'}">${overdue ? 'PAST DUE' : esc(match.approval_status)}</span></div><div class="detail-body">
+          <div class="detail-title"><div><h2>${esc(match.vendor)}</h2><p>PO ${esc(match.po_number)} · Invoice ${esc(match.invoice_number)}</p></div><div class="actions-top"><button class="subtle" id="refreshButton" type="button">Refresh</button></div></div>
+          <div class="summary-grid"><div class="summary-cell"><span>Match reason</span><strong>${esc(match.reason || item?.reason)}</strong></div><div class="summary-cell"><span>Approvals</span><strong>${esc(match.approvals_received)} / ${esc(match.approvals_required)}</strong></div><div class="summary-cell"><span>Assigned reviewer</span><strong>${esc(item?.assigned_to || 'Unassigned')}</strong></div><div class="summary-cell"><span>SLA due</span><strong>${esc(date(item?.due_at))}${item?.escalated ? ' · escalated to ' + esc(item.escalated_to) : ''}</strong></div></div>
+          <div class="section"><h3>Three-way comparison</h3><div class="table-wrap"><table class="diff"><thead><tr><th>Issue</th><th>SKU</th><th>Expected</th><th>Invoiced</th><th>Variance</th><th>Details</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+          <div class="section"><h3>Rule snapshot</h3><div class="small">Version: ${esc(match.rule_version_id || 'Default configuration')} · Digest: ${esc(match.rule_digest || 'Not recorded')}</div></div>
+          <div class="section"><h3>Source documents · PO / Receipt / Invoice</h3><pre class="code">${esc(JSON.stringify(docs, null, 2))}</pre></div>
+          <div class="section"><h3>Audit history</h3><div class="audit">${auditMarkup || '<span class="small">No audit events found.</span>'}</div></div>
+          ${match.approval_status === 'PENDING' ? `<div class="decision"><label for="decisionComment">Decision note <span class="small">(optional)</span></label><textarea id="decisionComment" maxlength="2000" placeholder="Add context for the audit record"></textarea><div class="decision-actions"><button class="reject" id="rejectButton" type="button">Reject exception</button><button class="primary" id="approveButton" type="button">Approve exception</button></div></div>` : '<p class="small">This exception has been decided. The decision remains in the audit history.</p>'}</div>`;
+        $('refreshButton').addEventListener('click', () => loadDetail(id));
+        $('approveButton')?.addEventListener('click', () => decide(id, 'approve'));
+        $('rejectButton')?.addEventListener('click', () => decide(id, 'reject'));
+      } catch (error) { showNotice(error.message); }
+    }
+    async function decide(id, outcome) {
+      const button = $(`${outcome}Button`); if (button) button.disabled = true;
+      try {
+        await api(`/exceptions/${id}/${outcome}`, {method:'POST', body:JSON.stringify({comment:$('decisionComment')?.value.trim() || null})});
+        showNotice(`Decision recorded: ${outcome}.`); await loadQueue(); await loadDetail(id);
+      } catch (error) { showNotice(error.message); if (button) button.disabled = false; }
+    }
+  </script>
+</body>
+</html>

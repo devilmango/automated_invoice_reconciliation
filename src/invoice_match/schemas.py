@@ -124,6 +124,8 @@ class MatchResult(StrictModel):
     approvals_received: int = 0
     assigned_to: str | None = None
     due_at: datetime | None = None
+    rule_version_id: str | None = None
+    rule_digest: str | None = None
 
 
 class ApprovalDecision(StrictModel):

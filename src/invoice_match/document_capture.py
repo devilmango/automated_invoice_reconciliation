@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from email import message_from_bytes
 from email.policy import default
 from io import BytesIO
+from pathlib import Path
 
 _LABELS = {
     "number": re.compile(r"^(?:supplier\s+)?invoice\s*(?:number|no\.?|#)\s*[:#-]?\s*(.+)$", re.I),
@@ -21,7 +26,45 @@ _ITEM = re.compile(
 _TABLE_ITEM = re.compile(r"^\s*([A-Z][A-Z0-9._-]{1,30})\s+([\d.]+)\s+([\d,]+\.\d{2})\s*$", re.I)
 
 
-def _pdf_text(data: bytes) -> str:
+def _ocr_pdf(data: bytes, page_count: int) -> str:
+    """Run optional local OCR on a bounded number of pages; never invoke a shell."""
+    renderer = shutil.which(os.getenv("INVOICE_MATCH_PDF_RENDERER", "pdftoppm"))
+    ocr = shutil.which(os.getenv("INVOICE_MATCH_OCR_ENGINE", "tesseract"))
+    if not renderer or not ocr:
+        return ""
+    try:
+        max_pages = max(1, min(int(os.getenv("INVOICE_MATCH_OCR_MAX_PAGES", "20")), 20))
+    except ValueError:
+        max_pages = 20
+    if page_count > max_pages:
+        return ""
+    with tempfile.TemporaryDirectory(prefix="invoice-match-ocr-") as temp_dir:
+        root = Path(temp_dir)
+        pdf_path = root / "source.pdf"
+        prefix = root / "page"
+        pdf_path.write_bytes(data)
+        try:
+            subprocess.run(
+                [
+                    renderer, "-f", "1", "-l", str(page_count), "-r", "200", "-png",
+                    str(pdf_path), str(prefix),
+                ],
+                check=True, capture_output=True, timeout=45,
+            )
+            pages = sorted(root.glob("page-*.png"))
+            results = []
+            for image in pages:
+                result = subprocess.run(
+                    [ocr, str(image), "stdout", "-l", os.getenv("INVOICE_MATCH_OCR_LANGUAGE", "eng")],
+                    check=True, capture_output=True, timeout=30,
+                )
+                results.append(result.stdout.decode("utf-8", errors="replace"))
+            return "\n".join(results)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return ""
+
+
+def _pdf_text(data: bytes) -> tuple[str, bool, str]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -32,7 +75,15 @@ def _pdf_text(data: bytes) -> str:
             raise ValueError("Encrypted PDFs cannot be extracted")
         if len(reader.pages) > 100:
             raise ValueError("PDF exceeds the 100-page extraction limit")
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        if len(text.strip()) >= 30:
+            return text, False, ""
+        if os.getenv("INVOICE_MATCH_OCR_ENABLED", "true").casefold() in {"0", "false", "no", "off"}:
+            return text, False, "OCR_DISABLED"
+        ocr_text = _ocr_pdf(data, len(reader.pages))
+        if ocr_text.strip():
+            return ocr_text, True, "OCR_USED_REVIEW_REQUIRED"
+        return text, False, "OCR_UNAVAILABLE_OR_NO_TEXT_RECOGNIZED"
     except ValueError:
         raise
     except Exception as exc:
@@ -103,6 +154,7 @@ def extract_document(data: bytes, filename: str, content_type: str) -> tuple[dic
     """Extract candidate invoice fields from a PDF, email message, or plain text file."""
     normalized_type = content_type.split(";", 1)[0].strip().casefold()
     email_vendor = None
+    extraction_notes: list[str] = []
     if normalized_type == "message/rfc822" or filename.casefold().endswith(".eml"):
         message = message_from_bytes(data, policy=default)
         email_vendor = message.get("From")
@@ -114,7 +166,12 @@ def extract_document(data: bytes, filename: str, content_type: str) -> tuple[dic
                     if isinstance(payload, str):
                         text_parts.append(payload)
                 elif part.get_content_type() == "application/pdf":
-                    text_parts.append(_pdf_text(part.get_payload(decode=True) or b""))
+                    pdf_text, ocr_used, ocr_note = _pdf_text(part.get_payload(decode=True) or b"")
+                    text_parts.append(pdf_text)
+                    if ocr_used:
+                        extraction_notes.append(ocr_note)
+                    elif ocr_note:
+                        extraction_notes.append(ocr_note)
         elif message.get_content_type() == "text/plain":
             payload = message.get_content()
             text_parts.append(payload if isinstance(payload, str) else "")
@@ -123,7 +180,9 @@ def extract_document(data: bytes, filename: str, content_type: str) -> tuple[dic
         text = "\n".join(text_parts)
         normalized_type = "message/rfc822"
     elif normalized_type == "application/pdf" or filename.casefold().endswith(".pdf"):
-        text = _pdf_text(data)
+        text, ocr_used, ocr_note = _pdf_text(data)
+        if ocr_used or ocr_note:
+            extraction_notes.append(ocr_note)
         normalized_type = "application/pdf"
     elif normalized_type in {"text/plain", "application/octet-stream"}:
         try:
@@ -135,6 +194,7 @@ def extract_document(data: bytes, filename: str, content_type: str) -> tuple[dic
         raise ValueError("Supported document types are PDF, RFC 822 email (.eml), and UTF-8 text")
 
     fields, confidence, notes = _extract_fields(text, email_vendor)
+    notes.extend(extraction_notes)
     digest = hashlib.sha256(data).hexdigest()
     safe_filename = filename.replace("/", "_").replace("\\", "_")[:255] or "invoice-document"
     return fields, confidence, notes, digest, normalized_type

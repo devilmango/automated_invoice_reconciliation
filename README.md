@@ -184,7 +184,23 @@ curl --request POST http://127.0.0.1:8000/documents/DOCUMENT_ID/match \
   --data '{"po":{"number":"PO-10291","vendor":"ABC Supplies","items":[{"sku":"A100","qty":100,"price":10}]},"receipt":{"receipts":[{"number":"GR-2044-A","items":[{"sku":"A100","qty":60}]},{"number":"GR-2044-B","items":[{"sku":"A100","qty":40}]}]}}'
 ```
 
-PDF extraction reads text layers. A scanned PDF without selectable text is stored with `NO_TEXT_LAYER_OCR_REQUIRED` so OCR or human entry can be added; OCR itself is not bundled. PDF extraction is included in the standard install. Email text bodies and PDF attachments are supported.
+PDF extraction reads text layers first. If a PDF has no usable text layer, the service attempts local OCR with Poppler (`pdftoppm`) and Tesseract when both are installed. Every captured invoice remains `REVIEW_REQUIRED`; OCR output is a candidate and must be checked by an approver before matching. If either executable is missing, OCR is disabled, a document exceeds the OCR page limit, or recognition fails, the capture is retained with an extraction note for manual entry. Email PDF attachments use the same OCR path.
+
+The Docker image installs `poppler-utils` and `tesseract-ocr`. For non-Docker deployments, install those system packages separately. OCR uses English by default and is limited to 20 pages, rendered at 200 DPI. Configure it with:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `INVOICE_MATCH_OCR_ENABLED` | `true` | Set to `false` to disable OCR attempts. |
+| `INVOICE_MATCH_OCR_ENGINE` | `tesseract` | Tesseract executable name or path. |
+| `INVOICE_MATCH_PDF_RENDERER` | `pdftoppm` | Poppler PDF renderer executable name or path. |
+| `INVOICE_MATCH_OCR_LANGUAGE` | `eng` | Tesseract language code. |
+| `INVOICE_MATCH_OCR_MAX_PAGES` | `20` | Maximum scanned PDF pages processed (hard cap: 20). |
+
+### Reviewer dashboard
+
+Open [http://127.0.0.1:8000/reviewer](http://127.0.0.1:8000/reviewer) for the browser-based exception queue. Connect with a reviewer bearer token configured in `REVIEWER_TOKENS`. The dashboard searches and filters open exceptions, shows SLA and escalation state, displays the PO/receipt/invoice input and mismatch details, identifies the applied rule snapshot, and presents audit history. Approvers can record an optional note and approve or reject from the detail panel. The token is held in the browser tab's session storage and sent only in the Authorization header; it is cleared when the tab session ends or the API rejects it. API authorization still enforces reviewer roles, assignments, separation of duties, and approval policy.
+
+The dashboard uses the same authenticated API routes documented below. `GET /matches/{match_id}/documents` returns the stored PO, receipt, and invoice inputs to reviewers for comparison. The dashboard route itself serves only the static UI; queue and document data remain protected by reviewer authentication.
 
 ### Review and decide an exception
 
@@ -334,6 +350,7 @@ The connector queries by supplier invoice number before creating a Bill and stor
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/health` | Service health check |
+| `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
 | `POST` | `/documents/extract` | Capture a raw PDF, email, or text invoice for extraction |
@@ -344,6 +361,7 @@ The connector queries by supplier invoice number before creating a Bill and stor
 | `POST` | `/documents/{document_id}/verify` | Save human-verified invoice fields (approver/admin token required) |
 | `POST` | `/documents/{document_id}/match` | Match a verified capture with PO and receipt documents |
 | `GET` | `/matches/{match_id}` | Retrieve a stored match result (reviewer bearer token required) |
+| `GET` | `/matches/{match_id}/documents` | Retrieve PO, receipt, and invoice inputs for reviewer comparison (reviewer bearer token required) |
 | `GET` | `/matches/{match_id}/audit` | Retrieve audit events (reviewer bearer token required) |
 | `GET` | `/exceptions?status=OPEN\|CLOSED\|ALL` | List exceptions; defaults to `OPEN` (reviewer bearer token required) |
 | `POST` | `/exceptions/{match_id}/approve` | Record an approval vote (approver/admin token required) |

@@ -296,3 +296,34 @@ def test_pdf_capture_extracts_text_from_pypdf_backend(client, integration_header
     assert response.status_code == 201
     assert response.json()["extracted_fields"]["number"] == "INV-PDF-1"
     assert response.json()["confidence"]["number"] == 0.98
+
+
+def test_pdf_capture_uses_optional_ocr_for_scanned_pdf(monkeypatch):
+    from invoice_match import document_capture
+
+    class Page:
+        def extract_text(self):
+            return ""
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page()]
+
+        def __init__(self, _stream, strict=False):
+            pass
+
+    monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=Reader))
+    monkeypatch.setattr(document_capture, "_ocr_pdf", lambda _data, _pages: (
+        "Invoice Number: INV-OCR-1\nVendor: ABC Supplies\nCurrency: USD\n"
+        "ITEM: A100 | 2 | 5.00\nTotal: 10.00"
+    ))
+
+    fields, confidence, notes, _digest, content_type = document_capture.extract_document(
+        b"scanned-pdf", "scan.pdf", "application/pdf"
+    )
+
+    assert content_type == "application/pdf"
+    assert fields["number"] == "INV-OCR-1"
+    assert fields["items"][0]["sku"] == "A100"
+    assert confidence["number"] == 0.98
+    assert "OCR_USED_REVIEW_REQUIRED" in notes

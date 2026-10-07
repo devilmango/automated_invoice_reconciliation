@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -94,6 +94,8 @@ def _result(record: MatchRecord) -> dict:
         "approval_status": record.approval_status,
         "approvals_received": record.approvals_received,
         "approvals_required": record.approvals_required,
+        "rule_version_id": record.rule_version_id,
+        "rule_digest": record.rule_digest,
     })
     return data
 
@@ -259,6 +261,11 @@ def _submit_match(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/reviewer", include_in_schema=False)
+def reviewer_dashboard():
+    return FileResponse(Path(__file__).parent / "static" / "reviewer.html")
 
 
 def _captured_result(record: CapturedDocumentRecord) -> CapturedDocumentResult:
@@ -491,6 +498,18 @@ def get_match(
     if record is None:
         raise HTTPException(status_code=404, detail="Match not found")
     return _result(record)
+
+
+@app.get("/matches/{match_id}/documents")
+def get_match_documents(
+    match_id: str,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    record = session.get(MatchRecord, match_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Match not found")
+    return record.input_data
 
 
 @app.get("/exceptions", response_model=list[ExceptionQueueItem])

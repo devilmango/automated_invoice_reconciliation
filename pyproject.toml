@@ -34,6 +34,9 @@ invoice-match = "invoice_match.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+invoice_match = ["static/*.html"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
