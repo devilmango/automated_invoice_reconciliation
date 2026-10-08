@@ -6,6 +6,7 @@ WORKDIR /app
 COPY pyproject.toml README.md alembic.ini ./
 COPY src ./src
 COPY migrations ./migrations
+COPY config ./config
 RUN apt-get update \
     && apt-get install -y --no-install-recommends poppler-utils tesseract-ocr \
     && rm -rf /var/lib/apt/lists/* \

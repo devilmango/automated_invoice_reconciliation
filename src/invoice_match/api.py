@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,6 +33,7 @@ from .document_capture import extract_document
 from .integration_auth import require_integration
 from .matcher import match_documents
 from .notification_delivery import escalate_overdue, queue_notification
+from .vendor_profiles import canonical_vendor, load_vendor_profiles, normalize_name, vendor_aliases
 from .reviewer_auth import Principal, require_admin, require_approver, require_reviewer
 from .rules import ToleranceRules, load_rules, parse_rules_yaml
 from .schemas import (
@@ -81,6 +84,101 @@ def _safe_filename(value: str) -> str:
 
 def _normalized(value: str | None) -> str | None:
     return " ".join(value.casefold().split()) if value else None
+
+
+def _invoice_amount(invoice: dict) -> Decimal | None:
+    try:
+        if invoice.get("total_amount") is not None:
+            return Decimal(str(invoice["total_amount"]))
+        subtotal = sum(
+            Decimal(str(item["qty"])) * Decimal(str(item["price"]))
+            for item in invoice.get("items", []) if item.get("price") is not None
+        )
+        if not invoice.get("items") or any(item.get("price") is None for item in invoice["items"]):
+            return None
+        return subtotal + Decimal(str(invoice.get("tax_amount") or 0)) \
+            + Decimal(str(invoice.get("freight_amount") or 0)) \
+            - Decimal(str(invoice.get("discount_amount") or 0))
+    except (InvalidOperation, KeyError, TypeError):
+        return None
+
+
+def _invoice_date(value: str | None) -> date | None:
+    try:
+        return date.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def _check_duplicate_invoice(session: Session, request: MatchRequest, profiles: list[dict]) -> None:
+    supplier = request.invoice.vendor or request.po.vendor
+    canonical = canonical_vendor(supplier, profiles)
+    vendor_keys = {
+        _normalized(alias) for alias in vendor_aliases(supplier, profiles)
+        if _normalized(alias)
+    }
+    if canonical:
+        vendor_keys.add(_normalized(canonical))
+    if not vendor_keys:
+        return
+    records = session.scalars(select(MatchRecord).where(MatchRecord.vendor_key.in_(vendor_keys))).all()
+    incoming_number = normalize_name(request.invoice.number)
+    incoming_amount = _invoice_amount(request.invoice.model_dump(mode="json"))
+    incoming_date = request.invoice.invoice_date
+    risks = []
+    for record in records:
+        old = record.input_data
+        old_invoice = old.get("invoice", {})
+        old_vendor = old_invoice.get("vendor") or old.get("po", {}).get("vendor")
+        if normalize_name(canonical_vendor(old_vendor, profiles)) != normalize_name(canonical):
+            continue
+        if old_invoice.get("document_type", "INVOICE") != request.invoice.document_type:
+            continue
+        if (old_invoice.get("currency") or "USD").upper() != request.invoice.currency.upper():
+            continue
+        old_number = normalize_name(old_invoice.get("number"))
+        if incoming_number and incoming_number == old_number:
+            raise HTTPException(status_code=409, detail={
+                "code": "DUPLICATE_SUPPLIER_INVOICE",
+                "existing_match_id": record.id,
+            })
+        old_amount = _invoice_amount(old_invoice)
+        amount_close = False
+        if incoming_amount is not None and old_amount is not None:
+            allowed_variance = max(Decimal("0.01"), max(abs(incoming_amount), abs(old_amount)) * Decimal("0.005"))
+            amount_close = abs(incoming_amount - old_amount) <= allowed_variance
+        old_date = _invoice_date(old_invoice.get("invoice_date"))
+        dates_close = bool(
+            incoming_date and old_date and abs((incoming_date - old_date).days) <= 3
+        )
+        if incoming_number and old_number:
+            number_similarity = SequenceMatcher(None, incoming_number, old_number).ratio()
+        else:
+            number_similarity = 0
+        date_conflict = bool(
+            incoming_date and old_date and abs((incoming_date - old_date).days) > 7
+        )
+        number_close = number_similarity >= 0.92 and not date_conflict
+        if amount_close and (number_close or dates_close):
+            evidence = ["SAME_CANONICAL_VENDOR", "INVOICE_AMOUNT_WITHIN_0.5_PERCENT"]
+            if number_close:
+                evidence.append(f"INVOICE_NUMBER_SIMILARITY:{number_similarity:.2f}")
+            if dates_close:
+                evidence.append("INVOICE_DATE_WITHIN_3_DAYS")
+            risks.append({
+                "match_id": record.id,
+                "invoice_number": old_invoice.get("number"),
+                "invoice_date": old_invoice.get("invoice_date"),
+                "invoice_amount": str(old_amount) if old_amount is not None else None,
+                "number_similarity": round(number_similarity, 2),
+                "evidence": evidence,
+            })
+    if risks:
+        raise HTTPException(status_code=409, detail={
+            "code": "DUPLICATE_INVOICE_RISK",
+            "message": "A similar invoice already exists; review the candidate matches before resubmitting.",
+            "candidates": risks[:5],
+        })
 
 
 def _request_hash(request: MatchRequest) -> str:
@@ -146,22 +244,19 @@ def _submit_match(
             raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_KEY_REUSED"})
         return JSONResponse(status_code=200, content=_result(existing))
 
-    vendor_key = _normalized(request.invoice.vendor or request.po.vendor) or ""
+    profiles = load_vendor_profiles()
+    vendor_key = _normalized(canonical_vendor(request.invoice.vendor or request.po.vendor, profiles)) or ""
     invoice_key = _normalized(request.invoice.number)
-    if invoice_key is not None:
-        duplicate = session.scalar(select(MatchRecord).where(
-            MatchRecord.vendor_key == vendor_key,
-            MatchRecord.invoice_number_key == invoice_key,
-        ))
-        if duplicate is not None:
-            raise HTTPException(status_code=409, detail={
-                "code": "DUPLICATE_SUPPLIER_INVOICE",
-                "existing_match_id": duplicate.id,
-            })
+    _check_duplicate_invoice(session, request, profiles)
 
+    po_vendor_keys = {
+        _normalized(alias) for alias in vendor_aliases(request.po.vendor, profiles)
+        if _normalized(alias)
+    }
+    po_vendor_keys.add(_normalized(canonical_vendor(request.po.vendor, profiles)))
     po_records = session.scalars(select(MatchRecord).where(
         MatchRecord.po_number == request.po.number,
-        MatchRecord.vendor_key == _normalized(request.po.vendor),
+        MatchRecord.vendor_key.in_(po_vendor_keys),
     )).all()
     latest_revision = max(
         (int(record.input_data.get("po", {}).get("revision", 1)) for record in po_records),
@@ -266,6 +361,11 @@ def health():
 @app.get("/reviewer", include_in_schema=False)
 def reviewer_dashboard():
     return FileResponse(Path(__file__).parent / "static" / "reviewer.html")
+
+
+@app.get("/reviewer/captures", include_in_schema=False)
+def reviewer_capture_inbox():
+    return FileResponse(Path(__file__).parent / "static" / "reviewer-captures.html")
 
 
 def _captured_result(record: CapturedDocumentRecord) -> CapturedDocumentResult:

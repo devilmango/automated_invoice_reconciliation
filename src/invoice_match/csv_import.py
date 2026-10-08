@@ -55,7 +55,7 @@ def parse_csv_documents(po_csv: str, receipt_csv: str, invoice_csv: str) -> Matc
     )
     invoice_meta = _consistent(
         invoice_rows,
-        ("number", "vendor", "currency", "tax_amount", "freight_amount", "discount_amount", "total_amount", "document_type", "credit_note_for"),
+        ("number", "vendor", "invoice_date", "currency", "tax_amount", "freight_amount", "discount_amount", "total_amount", "document_type", "credit_note_for"),
         "invoice",
     )
     def lines(rows: list[dict[str, str]], fields: tuple[str, ...]) -> list[dict]:
@@ -99,7 +99,7 @@ def parse_csv_documents(po_csv: str, receipt_csv: str, invoice_csv: str) -> Matc
             raise ValueError("CSV field 'revision' must be an integer") from exc
     if po_meta["change_reason"]:
         po["change_reason"] = po_meta["change_reason"]
-    for field in ("number", "vendor"):
+    for field in ("number", "vendor", "invoice_date"):
         if invoice_meta[field]:
             invoice[field] = invoice_meta[field]
     for field in ("document_type", "credit_note_for"):

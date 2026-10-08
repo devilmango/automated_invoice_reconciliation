@@ -1,0 +1,21 @@
+vendors:
+  - name: ABC Supplies
+    aliases:
+      - ABC Supply Ltd.
+      - ABC Supplies Incorporated
+    labels:
+      vendor:
+        - Supplier name
+      number:
+        - Invoice Ref
+        - Invoice ID
+      invoice_date:
+        - Billing date
+      total_amount:
+        - Balance payable
+      tax_amount:
+        - GST total
+    date_format: "%d/%m/%Y"
+    default_currency: USD
+    sku_aliases:
+      A-100: A100

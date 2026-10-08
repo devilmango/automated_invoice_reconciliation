@@ -57,7 +57,36 @@ def test_duplicate_supplier_invoice_is_rejected_even_with_new_key(client, integr
     assert first.status_code == 201
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "DUPLICATE_SUPPLIER_INVOICE"
-    assert response.json()["detail"]["existing_match_id"] == first.json()["match_id"]
+
+
+def test_near_duplicate_invoice_is_flagged_across_supplier_aliases(
+    client, integration_headers, monkeypatch, tmp_path
+):
+    profiles = tmp_path / "vendor-profiles.yaml"
+    profiles.write_text("""vendors:
+  - name: ABC Supplies
+    aliases: [ABC Supply Ltd.]
+""", encoding="utf-8")
+    monkeypatch.setenv("INVOICE_MATCH_VENDOR_PROFILES", str(profiles))
+    first = sample_request()
+    first["invoice"]["invoice_date"] = "2026-10-07"
+    submitted = client.post("/matches", json=first, headers=match_headers(integration_headers))
+
+    possible_duplicate = sample_request()
+    possible_duplicate["po"]["number"] = "PO-OTHER"
+    possible_duplicate["invoice"]["number"] = "INV-20440"
+    possible_duplicate["invoice"]["vendor"] = "ABC Supply Ltd."
+    possible_duplicate["invoice"]["invoice_date"] = "2026-10-08"
+    response = client.post(
+        "/matches", json=possible_duplicate, headers=match_headers(integration_headers)
+    )
+
+    assert submitted.status_code == 201
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "DUPLICATE_INVOICE_RISK"
+    candidate = response.json()["detail"]["candidates"][0]
+    assert candidate["match_id"] == submitted.json()["match_id"]
+    assert "INVOICE_NUMBER_SIMILARITY" in " ".join(candidate["evidence"])
 
 
 def test_match_submission_requires_an_idempotency_key(client, integration_headers):

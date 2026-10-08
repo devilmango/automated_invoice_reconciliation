@@ -1,0 +1,3 @@
+# Add supplier-specific extraction hints here. Profiles are matched by exact
+# normalized vendor name or alias; an empty list disables profile behavior.
+vendors: []

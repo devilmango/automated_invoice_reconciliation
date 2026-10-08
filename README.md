@@ -4,7 +4,7 @@
 
 `invoice-match` compares a purchase order (PO), goods receipt, and supplier invoice. It identifies quantity, price, vendor, currency, and tax discrepancies, places exceptions in a review queue, and records approval decisions in an audit trail.
 
-Documents enter as validated JSON or CSV, can be fetched through an AP adapter, or captured from PDF/email for field extraction and review. Scanned PDFs without a text layer are marked as needing OCR; an OCR engine is not bundled.
+Documents enter as validated JSON or CSV, can be fetched through an AP adapter, or captured from PDF/email for OCR-assisted field extraction and human review. Reviewer pages provide an exception queue and a separate capture inbox for previewing source documents and correcting extracted invoice fields.
 
 ## Features
 
@@ -16,12 +16,14 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 - **Reviewer queue controls:** Search and filter exceptions, page through results, make atomic bulk decisions, and escalate overdue items to an admin queue.
 - **Versioned rule controls:** Create validated rule drafts, activate them with a second admin, and inspect rule change history; every match retains its rule snapshot and digest.
 - **Authenticated integrations:** Protect matching, CSV intake, and AP export routes with service bearer tokens.
-- **Idempotency and duplicate detection:** Replay safe request retries and reject duplicate supplier invoices.
+- **Idempotency and duplicate detection:** Replay safe request retries, reject exact duplicate supplier invoices, and flag amount/date/number near-matches for review across configured supplier aliases.
 - **AP export outbox:** Poll approved payables as structured JSON and acknowledge downstream delivery.
 - **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
 - **QuickBooks Online export:** Create mapped QuickBooks Bills with encrypted OAuth token storage, token refresh, provider-side duplicate checks, and retry-safe request IDs.
 - **Reviewer notifications:** Persist exception, reminder, and escalation events in an outbox and deliver them to an HTTPS webhook with backoff and dead-letter handling.
 - **PDF/email capture:** Extract candidate invoice fields with confidence and require human verification before matching.
+- **Capture review inbox:** Preview source documents, inspect field confidence and extraction notes, correct invoice fields, and verify with a distinct approver.
+- **Vendor extraction profiles:** Configure supplier aliases, custom invoice labels, date formats, default currencies, and SKU aliases in YAML.
 - **Procurement edge cases:** Support cumulative partial invoices, multiple receipts, revisioned POs, credit notes, and configured unit conversions.
 - **CSV intake:** Submit line-oriented PO, receipt, and invoice CSVs through the same matching pipeline.
 - **Reviewer roles:** Separate read-only reviewers, approvers, and admins; support distinct reviewers for multi-step approval.
@@ -147,11 +149,11 @@ curl --request POST http://127.0.0.1:8000/matches \
   --data-binary @examples/match-request.json
 ```
 
-The integration identity is recorded in the audit log; the client cannot supply an actor name. Idempotency keys are required (8–128 characters). Repeating the same key and request returns the original match with HTTP `200`; reusing the key with different content returns `409`. A repeated supplier/invoice number returns `409 DUPLICATE_SUPPLIER_INVOICE`, even with a new key. Exceptions enter the review queue automatically.
+The integration identity is recorded in the audit log; the client cannot supply an actor name. Idempotency keys are required (8–128 characters). Repeating the same key and request returns the original match with HTTP `200`; reusing the key with different content returns `409`. An exact repeat returns `409 DUPLICATE_SUPPLIER_INVOICE`; a likely near-match returns `409 DUPLICATE_INVOICE_RISK` with candidate match IDs and evidence such as invoice-number similarity, close totals, and invoice dates. Review the candidate before resubmitting. Exceptions enter the review queue automatically.
 
 ### Import CSV documents
 
-`POST /imports/csv` accepts three CSV strings in JSON and uses the same integration bearer token and idempotency header. Each CSV has one document per request and one row per line item. Required columns are `number,vendor,sku,qty` for PO; `sku,qty` for receipt; and `number,sku,qty` for invoice. Unit `price` is optional, as it is in the JSON schema. Optional columns map to the input schema: `currency`, `cost_center`, `tax_rate`, `tax_code`, `tax_amount`, `discount_rate`, `freight_amount`, `discount_amount`, `total_amount`, `description`, and `unit`. Document-level values may appear on the first row or repeat consistently on every row. Invalid data returns HTTP `422`.
+`POST /imports/csv` accepts three CSV strings in JSON and uses the same integration bearer token and idempotency header. Each CSV has one document per request and one row per line item. Required columns are `number,vendor,sku,qty` for PO; `sku,qty` for receipt; and `number,sku,qty` for invoice. Unit `price` is optional, as it is in the JSON schema. Optional columns map to the input schema: `invoice_date`, `currency`, `cost_center`, `tax_rate`, `tax_code`, `tax_amount`, `discount_rate`, `freight_amount`, `discount_amount`, `total_amount`, `description`, and `unit`. Document-level values may appear on the first row or repeat consistently on every row. Invalid data returns HTTP `422`.
 
 The JSON body has string fields `po_csv`, `receipt_csv`, and `invoice_csv`. Start with [examples/csv-import.json](examples/csv-import.json), or see the `CsvMatchRequest` schema in `/docs`.
 
@@ -167,7 +169,7 @@ curl --request POST http://127.0.0.1:8000/documents/extract \
   --data-binary @supplier-invoice.pdf
 ```
 
-Reviewers can list pending captures with `GET /documents`, then inspect candidate fields, audit history, and original bytes with `GET /documents/{document_id}`, `/audit`, and `/source`. An approver verifies corrected fields with `POST /documents/{document_id}/verify`. Only after verification can an integration submit the related PO and receipts to `POST /documents/{document_id}/match`; the saved invoice is then sent through matching.
+Reviewers can open [http://127.0.0.1:8000/reviewer/captures](http://127.0.0.1:8000/reviewer/captures) to search pending captures, preview the original file, inspect extracted field confidence and notes, edit invoice fields and line items, and submit verification. The same operations are available through `GET /documents`, `GET /documents/{document_id}`, `GET /documents/{document_id}/audit`, `GET /documents/{document_id}/source`, and `POST /documents/{document_id}/verify`. An approver verifies corrected fields; the person who uploaded the capture cannot verify it. Only after verification can an integration submit the related PO and receipts to `POST /documents/{document_id}/match`.
 
 Verification supplies the corrected invoice schema. Matching then supplies the PO and receipt documents, plus an idempotency key:
 
@@ -186,6 +188,26 @@ curl --request POST http://127.0.0.1:8000/documents/DOCUMENT_ID/match \
 
 PDF extraction reads text layers first. If a PDF has no usable text layer, the service attempts local OCR with Poppler (`pdftoppm`) and Tesseract when both are installed. Every captured invoice remains `REVIEW_REQUIRED`; OCR output is a candidate and must be checked by an approver before matching. If either executable is missing, OCR is disabled, a document exceeds the OCR page limit, or recognition fails, the capture is retained with an extraction note for manual entry. Email PDF attachments use the same OCR path.
 
+#### Supplier-specific extraction profiles
+
+Set `INVOICE_MATCH_VENDOR_PROFILES` to a YAML file. The default is `config/vendor_profiles.yaml` (empty profiles); copy [config/vendor_profiles.example.yaml](config/vendor_profiles.example.yaml) and tailor it to your suppliers. Profiles map supplier aliases to one canonical name, add supplier-specific field labels, specify a date format or default currency, and map supplier SKUs to internal SKU values. Matching also treats configured supplier aliases as the same vendor. Profile application is recorded in capture extraction notes.
+
+```yaml
+vendors:
+  - name: ABC Supplies
+    aliases: [ABC Supply Ltd.]
+    labels:
+      number: [Invoice Ref]
+      invoice_date: [Billing date]
+      total_amount: [Balance payable]
+    date_format: "%d/%m/%Y"
+    default_currency: USD
+    sku_aliases:
+      A-100: A100
+```
+
+Near-duplicate checks compare records for the same canonical vendor and currency. An exact normalized invoice number is blocked. A possible duplicate is flagged when the total is within 0.5% and either the normalized invoice numbers are at least 92% similar (unless dates differ by more than seven days), or invoice dates are within three days. The response includes up to five candidate match IDs, prior invoice number/date/amount, similarity, and matching evidence; review these candidates before retrying.
+
 The Docker image installs `poppler-utils` and `tesseract-ocr`. For non-Docker deployments, install those system packages separately. OCR uses English by default and is limited to 20 pages, rendered at 200 DPI. Configure it with:
 
 | Variable | Default | Purpose |
@@ -199,6 +221,8 @@ The Docker image installs `poppler-utils` and `tesseract-ocr`. For non-Docker de
 ### Reviewer dashboard
 
 Open [http://127.0.0.1:8000/reviewer](http://127.0.0.1:8000/reviewer) for the browser-based exception queue. Connect with a reviewer bearer token configured in `REVIEWER_TOKENS`. The dashboard searches and filters open exceptions, shows SLA and escalation state, displays the PO/receipt/invoice input and mismatch details, identifies the applied rule snapshot, and presents audit history. Approvers can record an optional note and approve or reject from the detail panel. The token is held in the browser tab's session storage and sent only in the Authorization header; it is cleared when the tab session ends or the API rejects it. API authorization still enforces reviewer roles, assignments, separation of duties, and approval policy.
+
+Open [http://127.0.0.1:8000/reviewer/captures](http://127.0.0.1:8000/reviewer/captures) to access the capture review inbox. It uses the same tab-scoped bearer session, previews PDF and text/email sources, displays per-field extraction confidence and notes, and submits corrected invoice details to the existing verification endpoint.
 
 The dashboard uses the same authenticated API routes documented below. `GET /matches/{match_id}/documents` returns the stored PO, receipt, and invoice inputs to reviewers for comparison. The dashboard route itself serves only the static UI; queue and document data remain protected by reviewer authentication.
 
@@ -351,6 +375,8 @@ The connector queries by supplier invoice number before creating a Bill and stor
 | --- | --- | --- |
 | `GET` | `/health` | Service health check |
 | `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
+| `GET` | `/reviewer/captures` | Browser-based capture review inbox |
+| `GET` | `/reviewer/captures` | Browser-based captured invoice review inbox |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
 | `POST` | `/documents/extract` | Capture a raw PDF, email, or text invoice for extraction |
@@ -487,6 +513,7 @@ The Compose file uses development credentials. Change credentials and manage the
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite:///./invoice_match.db` | SQLAlchemy database URL |
 | `INVOICE_MATCH_RULES` | `config/rules.yaml` | YAML rules path |
+| `INVOICE_MATCH_VENDOR_PROFILES` | `config/vendor_profiles.yaml` | Supplier aliases and extraction profile YAML path |
 | `REVIEWER_TOKENS` | unset | JSON map of reviewer names to `{token, roles}`; roles: reviewer, approver, admin |
 | `INTEGRATION_TOKENS` | unset | JSON map of integration names to unique bearer tokens |
 | `AP_ADAPTER_URL` | unset | Base URL for the generic REST adapter |
@@ -556,7 +583,7 @@ The automated suite covers matching and financial calculations, cumulative parti
 
 Reviewer read, audit, and queue routes require reviewer tokens; approve and reject routes additionally require the `approver` or `admin` role. Integration submission and AP outbox routes require tokens from `INTEGRATION_TOKENS`; `/health` is public. Store tokens in a secret manager in deployed environments and rotate them when access changes. The example PostgreSQL credentials in Docker Compose are for local development only.
 
-Captured source documents are stored in the application database; apply access controls, encryption, backups, and retention policies appropriate for financial records. PDF extraction reads text layers and does not perform OCR. The HTTP adapter defines a generic REST shape rather than a vendor-certified connector. The project does not initiate payments or fetch live exchange rates. Review tolerances, tax assumptions, unit families, and rates against your accounting policy before processing live invoices.
+Captured source documents are stored in the application database; apply access controls, encryption, backups, and retention policies appropriate for financial records. OCR depends on local Poppler and Tesseract binaries and remains subject to human review. Vendor profiles are operator-maintained extraction hints, not a general-purpose OCR model. The HTTP adapter defines a generic REST shape rather than a vendor-certified connector. The project does not initiate payments or fetch live exchange rates. Review tolerances, tax assumptions, unit families, and rates against your accounting policy before processing live invoices.
 
 ## Inspiration
 

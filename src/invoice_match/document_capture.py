@@ -6,14 +6,19 @@ import re
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime
 from email import message_from_bytes
 from email.policy import default
+from email.utils import parseaddr
 from io import BytesIO
 from pathlib import Path
+
+from .vendor_profiles import load_vendor_profiles, profile_for_vendor
 
 _LABELS = {
     "number": re.compile(r"^(?:supplier\s+)?invoice\s*(?:number|no\.?|#)\s*[:#-]?\s*(.+)$", re.I),
     "vendor": re.compile(r"^(?:supplier|vendor|sold\s+by)\s*[:#-]\s*(.+)$", re.I),
+    "invoice_date": re.compile(r"^(?:invoice\s+date|date\s+of\s+invoice)\s*[:#-]\s*(.+)$", re.I),
     "currency": re.compile(r"^(?:currency)\s*[:#-]\s*([A-Z]{3})\b", re.I),
     "tax_amount": re.compile(r"^(?:tax|vat|gst)(?:\s+amount)?\s*[:#-]\s*[^\d-]*([\d,]+(?:\.\d+)?)\s*$", re.I),
     "total_amount": re.compile(r"^(?:(?:grand\s+)?total|amount\s+due|balance\s+due)\s*[:#-]\s*[^\d-]*([\d,]+(?:\.\d+)?)\s*$", re.I),
@@ -90,8 +95,14 @@ def _pdf_text(data: bytes) -> tuple[str, bool, str]:
         raise ValueError(f"Could not read PDF document: {exc}") from exc
 
 
-def _extract_fields(text: str, email_vendor: str | None = None) -> tuple[dict, dict[str, float], list[str]]:
-    fields: dict = {"number": None, "vendor": email_vendor, "currency": None, "items": []}
+def _extract_fields(
+    text: str,
+    email_vendor: str | None = None,
+    profiles: list[dict] | None = None,
+) -> tuple[dict, dict[str, float], list[str]]:
+    profiles = profiles if profiles is not None else load_vendor_profiles()
+    email_vendor = parseaddr(email_vendor or "")[0] or email_vendor
+    fields: dict = {"number": None, "vendor": email_vendor, "invoice_date": None, "currency": None, "items": []}
     confidence: dict[str, float] = {}
     notes: list[str] = []
     for line in text.splitlines():
@@ -104,6 +115,8 @@ def _extract_fields(text: str, email_vendor: str | None = None) -> tuple[dict, d
                     fields[key] = value.replace(",", "")
                 elif key == "currency":
                     fields[key] = value.upper()
+                elif key == "invoice_date":
+                    fields[key] = value
                 else:
                     fields[key] = value
                 confidence[key] = 0.98
@@ -118,6 +131,51 @@ def _extract_fields(text: str, email_vendor: str | None = None) -> tuple[dict, d
             sku, quantity, price = table_match.groups()
             fields["items"].append({"sku": sku, "qty": quantity, "price": price.replace(",", "")})
 
+    profile = profile_for_vendor(fields["vendor"], profiles)
+    if profile is None:
+        for candidate_profile in profiles:
+            for line in text.splitlines():
+                candidate = line.strip()
+                for label in candidate_profile["labels"].get("vendor", []):
+                    if candidate.casefold().startswith(label.casefold()):
+                        fields["vendor"] = candidate[len(label):].lstrip(" :#-").strip()
+                        profile = candidate_profile
+                        break
+                if profile:
+                    break
+            if profile:
+                break
+    if profile:
+        fields["vendor"] = profile["name"]
+        for field_name, labels in profile["labels"].items():
+            if field_name == "vendor":
+                continue
+            for line in text.splitlines():
+                candidate = line.strip()
+                for label in labels:
+                    if candidate.casefold().startswith(label.casefold()):
+                        raw = candidate[len(label):].lstrip(" :#-").strip()
+                        if field_name == "invoice_date":
+                            raw = _normalize_date(raw, profile.get("date_format"))
+                            fields[field_name] = raw
+                        elif field_name.endswith("amount"):
+                            fields[field_name] = re.sub(r"[^\d.,-]", "", raw).replace(",", "")
+                        elif field_name == "currency":
+                            fields[field_name] = raw.upper()
+                        else:
+                            fields[field_name] = raw
+                        confidence[field_name] = 0.94
+                        break
+                if field_name in confidence:
+                    break
+        if not fields["currency"] and profile.get("default_currency"):
+            fields["currency"] = profile["default_currency"]
+            confidence["currency"] = 0.90
+        sku_aliases = profile["sku_aliases"]
+        for item in fields["items"]:
+            item["sku"] = sku_aliases.get(item["sku"].casefold(), item["sku"])
+    elif fields["invoice_date"]:
+        fields["invoice_date"] = _normalize_date(fields["invoice_date"])
     if fields["vendor"]:
         confidence.setdefault("vendor", 0.82 if email_vendor else 0.96)
     if fields["items"]:
@@ -147,7 +205,22 @@ def _extract_fields(text: str, email_vendor: str | None = None) -> tuple[dict, d
     if not text.strip():
         notes.append("NO_TEXT_LAYER_OCR_REQUIRED")
     fields["document_type"] = "INVOICE"
+    if profile:
+        notes.append("VENDOR_PROFILE_APPLIED:" + profile["name"])
     return fields, confidence, notes
+
+
+def _normalize_date(value: str, date_format: str | None = None) -> str:
+    formats = [date_format] if date_format else []
+    formats.extend(["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y"])
+    for candidate_format in formats:
+        if not candidate_format:
+            continue
+        try:
+            return datetime.strptime(value, candidate_format).date().isoformat()
+        except ValueError:
+            continue
+    return value
 
 
 def extract_document(data: bytes, filename: str, content_type: str) -> tuple[dict, dict[str, float], list[str], str, str]:

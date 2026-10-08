@@ -7,6 +7,7 @@ from decimal import Decimal
 from .financials import invoice_summary, item_tax_rate, round_currency, to_base_currency
 from .rules import ToleranceRules, select_approval_policy
 from .schemas import Discrepancy, MatchRequest, MatchResult, MatchStatus, SupplierInvoice
+from .vendor_profiles import vendors_equivalent
 
 
 def _unit(item, rules: ToleranceRules) -> tuple[str, Decimal]:
@@ -100,7 +101,7 @@ def match_documents(
             po_currency,
             invoice_currency,
         ))
-    if invoice.vendor and invoice.vendor.casefold() != po.vendor.casefold():
+    if invoice.vendor and not vendors_equivalent(invoice.vendor, po.vendor):
         discrepancies.append(_discrepancy(
             "VENDOR_MISMATCH",
             "Invoice vendor does not match the purchase order vendor.",

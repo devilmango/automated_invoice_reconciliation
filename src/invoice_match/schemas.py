@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
@@ -66,6 +66,7 @@ class GoodsReceipt(StrictModel):
 class SupplierInvoice(StrictModel):
     number: str | None = None
     vendor: str | None = None
+    invoice_date: date | None = None
     document_type: Literal["INVOICE", "CREDIT_NOTE"] = "INVOICE"
     credit_note_for: str | None = None
     currency: str = Field(default="USD", min_length=3, max_length=3)
