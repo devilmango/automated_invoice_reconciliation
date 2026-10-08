@@ -333,6 +333,14 @@ curl --request POST http://127.0.0.1:8000/integrations/ap/outbox/MATCH_ID/ack \
 
 Each payload contains invoice and PO identifiers, supplier, currency, cost center, lines, subtotal, tax, freight, discounts, total, and approval status. Delivery is at-least-once; consumers should deduplicate by `match_id` and acknowledge only after a successful AP write.
 
+### AP delivery recovery and operations reporting
+
+Open [http://127.0.0.1:8000/reviewer/operations](http://127.0.0.1:8000/reviewer/operations) to review match rate, vendor outcomes, exception reasons, approval turnaround, overdue work, and export backlog for a date range. The export table shows attempts, most recent failure, acknowledgement state, and external accounting reference. Pending entries older than one hour are marked stalled; failed entries show their last delivery error.
+
+An admin can retry a pending export from this page. Set `AP_DELIVERY_ADAPTER` to the same adapter used by the worker (`filesystem`, `http`, or `quickbooks`); retries use the match ID as an idempotency key and record request, success, and failure events in the match audit trail. Acknowledged exports can be reconciled by saving the external AP/ERP reference. Integration clients can also include `{"external_reference":"AP-BILL-123"}` in the acknowledgement request so the provider reference is stored as part of the initial delivery audit.
+
+The report endpoint accepts optional UTC date filters, for example `GET /reviewer/reports/operations?start_date=2026-10-01&end_date=2026-10-31`. Ranges are limited to 366 days. Reviewer tokens can read reports and export state; admin tokens are required to retry deliveries or change a reconciled reference.
+
 ### Export approved invoices to QuickBooks Online
 
 The `quickbooks` adapter creates QuickBooks Online **Bills** from approved invoice payloads. Start in sandbox. Complete Intuit OAuth consent with the QuickBooks Accounting scope and supply the initial refresh token, client credentials, company realm ID, and a Fernet encryption key. The adapter refreshes and rotates OAuth tokens automatically, storing them encrypted in `quickbooks_credentials`; keep the encryption key in the same secret manager as the client secret and never store it in the database or repository.
@@ -376,7 +384,7 @@ The connector queries by supplier invoice number before creating a Bill and stor
 | `GET` | `/health` | Service health check |
 | `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
 | `GET` | `/reviewer/captures` | Browser-based capture review inbox |
-| `GET` | `/reviewer/captures` | Browser-based captured invoice review inbox |
+| `GET` | `/reviewer/operations` | Operations reporting and AP export reconciliation dashboard |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
 | `POST` | `/documents/extract` | Capture a raw PDF, email, or text invoice for extraction |
@@ -402,7 +410,11 @@ The connector queries by supplier invoice number before creating a Bill and stor
 | `POST` | `/rules/versions/{version_id}/activate` | Activate a draft with a different admin identity |
 | `GET` | `/rules/versions/{version_id}/audit` | Read the rule version change history (admin token required) |
 | `GET` | `/integrations/ap/outbox` | Poll pending AP exports (integration token required) |
-| `POST` | `/integrations/ap/outbox/{match_id}/ack` | Acknowledge delivery (integration token required) |
+| `POST` | `/integrations/ap/outbox/{match_id}/ack` | Acknowledge delivery and optionally record an external reference (integration token required) |
+| `GET` | `/reviewer/ap-outbox?state=PENDING\|ACKNOWLEDGED\|ALL` | Inspect AP delivery attempts and references (reviewer token required) |
+| `POST` | `/reviewer/ap-outbox/{match_id}/retry` | Retry one pending export through `AP_DELIVERY_ADAPTER` (admin token required) |
+| `POST` | `/reviewer/ap-outbox/{match_id}/reconcile` | Save an external reference for an acknowledged export (admin token required) |
+| `GET` | `/reviewer/reports/operations` | Match, approval, exception, vendor, and export metrics (reviewer token required) |
 
 Interactive API documentation is available at `/docs` and `/redoc` while the service is running.
 
@@ -519,6 +531,7 @@ The Compose file uses development credentials. Change credentials and manage the
 | `AP_ADAPTER_URL` | unset | Base URL for the generic REST adapter |
 | `AP_ADAPTER_TOKEN` | unset | Bearer token for the generic REST adapter |
 | `AP_ADAPTER_DIRECTORY` | `./ap-adapter-data` | Filesystem adapter input and export directory |
+| `AP_DELIVERY_ADAPTER` | `filesystem` | Adapter used for operations-dashboard retries: `filesystem`, `http`, or `quickbooks` |
 | `NOTIFICATION_WEBHOOK_URL` | unset | HTTPS destination for scheduled reviewer notification delivery |
 | `NOTIFICATION_WEBHOOK_TOKEN` | unset | Optional bearer credential sent to the notification endpoint |
 | `NOTIFICATION_WEBHOOK_SECRET` | unset | Optional HMAC-SHA256 signing secret for webhook requests |

@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from statistics import mean, median
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -16,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .ap_export import build_ap_payload
+from .adapters import create_adapter
 from .csv_import import parse_csv_documents
 from .database import (
     APOutboxRecord,
@@ -33,11 +35,14 @@ from .document_capture import extract_document
 from .integration_auth import require_integration
 from .matcher import match_documents
 from .notification_delivery import escalate_overdue, queue_notification
+from .delivery import deliver_match
 from .vendor_profiles import canonical_vendor, load_vendor_profiles, normalize_name, vendor_aliases
 from .reviewer_auth import Principal, require_admin, require_approver, require_reviewer
 from .rules import ToleranceRules, load_rules, parse_rules_yaml
 from .schemas import (
     APOutboxItem,
+    APExportAcknowledgement,
+    APReferenceReconciliation,
     ApprovalDecision,
     BulkApprovalDecision,
     AuditEntry,
@@ -53,6 +58,7 @@ from .schemas import (
     RuleVersionCreate,
     RuleVersionAuditEntry,
     RuleVersionResult,
+    ReviewerAPOutboxItem,
     SupplierInvoice,
     VerifyCapturedInvoice,
 )
@@ -366,6 +372,11 @@ def reviewer_dashboard():
 @app.get("/reviewer/captures", include_in_schema=False)
 def reviewer_capture_inbox():
     return FileResponse(Path(__file__).parent / "static" / "reviewer-captures.html")
+
+
+@app.get("/reviewer/operations", include_in_schema=False)
+def reviewer_operations_dashboard():
+    return FileResponse(Path(__file__).parent / "static" / "reviewer-operations.html")
 
 
 def _captured_result(record: CapturedDocumentRecord) -> CapturedDocumentResult:
@@ -982,6 +993,7 @@ def list_ap_outbox(
 @app.post("/integrations/ap/outbox/{match_id}/ack", response_model=APOutboxItem)
 def acknowledge_ap_outbox(
     match_id: str,
+    body: APExportAcknowledgement | None = None,
     session: Session = Depends(get_session),
     integration: str = Depends(require_integration),
 ):
@@ -992,11 +1004,13 @@ def acknowledge_ap_outbox(
         raise HTTPException(status_code=409, detail="AP outbox item has already been acknowledged")
     item.state = "ACKNOWLEDGED"
     item.acknowledged_at = datetime.now(timezone.utc)
+    if body and body.external_reference:
+        item.external_reference = body.external_reference
     session.add(AuditEvent(
         match_id=match_id,
         event_type="AP_EXPORT_ACKNOWLEDGED",
         actor=integration,
-        details={},
+        details={"external_reference": item.external_reference},
     ))
     session.commit()
     return APOutboxItem(
@@ -1009,6 +1023,223 @@ def acknowledge_ap_outbox(
         last_error=item.last_error,
         external_reference=item.external_reference,
     )
+
+
+@app.get("/reviewer/ap-outbox", response_model=list[ReviewerAPOutboxItem])
+def reviewer_ap_outbox(
+    state: str = Query(default="ALL", pattern="^(PENDING|ACKNOWLEDGED|ALL)$"),
+    limit: int = Query(default=500, ge=1, le=1000),
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    query = select(APOutboxRecord, MatchRecord).join(
+        MatchRecord, MatchRecord.id == APOutboxRecord.match_id
+    )
+    if state != "ALL":
+        query = query.where(APOutboxRecord.state == state)
+    rows = session.execute(query.order_by(APOutboxRecord.created_at.desc()).limit(limit)).all()
+    return [ReviewerAPOutboxItem(
+        match_id=item.match_id,
+        state=item.state,
+        vendor=match.vendor,
+        invoice_number=match.invoice_number,
+        currency=str(item.payload.get("currency") or "USD"),
+        total_amount=item.payload.get("total_amount", 0),
+        created_at=_timestamp(item.created_at),
+        acknowledged_at=_timestamp(item.acknowledged_at),
+        attempt_count=item.attempt_count,
+        last_error=item.last_error,
+        external_reference=item.external_reference,
+    ) for item, match in rows]
+
+
+@app.post("/reviewer/ap-outbox/{match_id}/retry", response_model=ReviewerAPOutboxItem)
+def retry_ap_outbox(
+    match_id: str,
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    item = session.get(APOutboxRecord, match_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="AP outbox item not found")
+    if item.state != "PENDING":
+        raise HTTPException(status_code=409, detail="Only pending AP exports can be retried")
+    adapter_name = os.getenv("AP_DELIVERY_ADAPTER", "filesystem")
+    try:
+        adapter = create_adapter(adapter_name)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=f"AP delivery adapter is unavailable: {exc}") from exc
+    session.add(AuditEvent(
+        match_id=match_id,
+        event_type="AP_EXPORT_RETRY_REQUESTED",
+        actor=admin.name,
+        details={"adapter": adapter_name},
+    ))
+    session.commit()
+    try:
+        result = deliver_match(session, adapter, match_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    match = session.get(MatchRecord, match_id)
+    return ReviewerAPOutboxItem(
+        match_id=result["match_id"],
+        state=result["state"],
+        vendor=match.vendor,
+        invoice_number=match.invoice_number,
+        currency=str(result["payload"].get("currency") or "USD"),
+        total_amount=result["payload"].get("total_amount", 0),
+        created_at=result["created_at"],
+        acknowledged_at=result["acknowledged_at"],
+        attempt_count=result["attempt_count"],
+        last_error=result["last_error"],
+        external_reference=result["external_reference"],
+    )
+
+
+@app.post("/reviewer/ap-outbox/{match_id}/reconcile", response_model=ReviewerAPOutboxItem)
+def reconcile_ap_reference(
+    match_id: str,
+    body: APReferenceReconciliation,
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    item = session.get(APOutboxRecord, match_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="AP outbox item not found")
+    if item.state != "ACKNOWLEDGED":
+        raise HTTPException(status_code=409, detail="A delivery must be acknowledged before reconciliation")
+    previous_reference = item.external_reference
+    item.external_reference = body.external_reference
+    session.add(AuditEvent(
+        match_id=match_id,
+        event_type="AP_EXPORT_REFERENCE_RECONCILED",
+        actor=admin.name,
+        details={
+            "previous_reference": previous_reference,
+            "external_reference": body.external_reference,
+            "note": body.note,
+        },
+    ))
+    session.commit()
+    match = session.get(MatchRecord, match_id)
+    return ReviewerAPOutboxItem(
+        match_id=item.match_id,
+        state=item.state,
+        vendor=match.vendor,
+        invoice_number=match.invoice_number,
+        currency=str(item.payload.get("currency") or "USD"),
+        total_amount=item.payload.get("total_amount", 0),
+        created_at=_timestamp(item.created_at),
+        acknowledged_at=_timestamp(item.acknowledged_at),
+        attempt_count=item.attempt_count,
+        last_error=item.last_error,
+        external_reference=item.external_reference,
+    )
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+@app.get("/reviewer/reports/operations")
+def operations_report(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    today = datetime.now(timezone.utc).date()
+    end_date = end_date or today
+    start_date = start_date or end_date - timedelta(days=29)
+    if start_date > end_date:
+        raise HTTPException(status_code=422, detail="start_date must be on or before end_date")
+    if (end_date - start_date).days > 365:
+        raise HTTPException(status_code=422, detail="Report ranges cannot exceed 366 days")
+    start_at = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+    end_at = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    match_filter = (MatchRecord.created_at >= start_at, MatchRecord.created_at < end_at)
+    status_counts = dict(session.execute(
+        select(MatchRecord.status, func.count(MatchRecord.id))
+        .where(*match_filter).group_by(MatchRecord.status)
+    ).all())
+    total = sum(status_counts.values())
+    matched = status_counts.get("MATCHED", 0)
+    exceptions_total = status_counts.get("EXCEPTION", 0)
+    reasons = session.execute(
+        select(MatchRecord.reason, func.count(MatchRecord.id))
+        .where(*match_filter, MatchRecord.status == "EXCEPTION")
+        .group_by(MatchRecord.reason).order_by(func.count(MatchRecord.id).desc())
+    ).all()
+    vendor_rows = session.execute(
+        select(MatchRecord.vendor, MatchRecord.status, MatchRecord.approval_status, func.count(MatchRecord.id))
+        .where(*match_filter)
+        .group_by(MatchRecord.vendor, MatchRecord.status, MatchRecord.approval_status)
+    ).all()
+    vendor_summary: dict[str, dict] = {}
+    for vendor, status, approval_status, count in vendor_rows:
+        entry = vendor_summary.setdefault(vendor, {
+            "vendor": vendor, "matches": 0, "matched": 0, "exceptions": 0, "approved": 0,
+        })
+        entry["matches"] += count
+        entry["matched"] += count if status == "MATCHED" else 0
+        entry["exceptions"] += count if status == "EXCEPTION" else 0
+        entry["approved"] += count if approval_status == "APPROVED" else 0
+    final_decisions = session.execute(
+        select(MatchRecord.created_at, AuditEvent.created_at)
+        .join(AuditEvent, AuditEvent.match_id == MatchRecord.id)
+            .where(*match_filter, AuditEvent.event_type.in_(["EXCEPTION_APPROVED", "EXCEPTION_REJECTED"]))
+    ).all()
+    turnaround_hours = [
+        max(0.0, ((_utc(decided) - _utc(created)).total_seconds() / 3600))
+        for created, decided in final_decisions
+    ]
+    open_rows = session.execute(
+        select(ExceptionRecord, MatchRecord).join(
+            MatchRecord, MatchRecord.id == ExceptionRecord.match_id
+        ).where(*match_filter, ExceptionRecord.queue_status == "OPEN")
+    ).all()
+    now = datetime.now(timezone.utc)
+    overdue = sum(1 for _, match in open_rows if _utc(match.due_at) and _utc(match.due_at) < now)
+    escalated = sum(1 for exception, _ in open_rows if exception.escalated)
+    outbox_rows = session.execute(
+        select(APOutboxRecord).join(MatchRecord, MatchRecord.id == APOutboxRecord.match_id)
+        .where(*match_filter)
+    ).scalars().all()
+    pending = [item for item in outbox_rows if item.state == "PENDING"]
+    acknowledged = [item for item in outbox_rows if item.state == "ACKNOWLEDGED"]
+    stalled_before = now - timedelta(hours=1)
+    return {
+        "period": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        "matches": {
+            "total": total,
+            "matched": matched,
+            "exceptions": exceptions_total,
+            "match_rate_percent": round((matched / total * 100), 1) if total else 0.0,
+        },
+        "approvals": {
+            "decisions": len(turnaround_hours),
+            "average_turnaround_hours": round(mean(turnaround_hours), 2) if turnaround_hours else None,
+            "median_turnaround_hours": round(median(turnaround_hours), 2) if turnaround_hours else None,
+        },
+        "exceptions": {
+            "open": len(open_rows),
+            "overdue": overdue,
+            "escalated": escalated,
+            "by_reason": [{"reason": reason or "UNKNOWN", "count": count} for reason, count in reasons],
+        },
+        "ap_exports": {
+            "pending": len(pending),
+            "stalled": sum(1 for item in pending if _utc(item.created_at) < stalled_before),
+            "failed": sum(1 for item in pending if bool(item.last_error)),
+            "acknowledged": len(acknowledged),
+            "attempts": sum(item.attempt_count for item in outbox_rows),
+        },
+        "by_vendor": sorted(vendor_summary.values(), key=lambda item: (-item["matches"], item["vendor"].casefold())),
+    }
 
 
 @app.get("/matches/{match_id}/audit", response_model=list[AuditEntry])

@@ -260,6 +260,52 @@ class APOutboxItem(StrictModel):
     external_reference: str | None = None
 
 
+class ReviewerAPOutboxItem(StrictModel):
+    match_id: str
+    state: Literal["PENDING", "ACKNOWLEDGED"]
+    vendor: str
+    invoice_number: str | None = None
+    currency: str
+    total_amount: Decimal
+    created_at: str
+    acknowledged_at: str | None = None
+    attempt_count: int
+    last_error: str | None = None
+    external_reference: str | None = None
+
+
+class APExportAcknowledgement(StrictModel):
+    external_reference: str | None = Field(default=None, max_length=255)
+
+
+class APReferenceReconciliation(StrictModel):
+    external_reference: str = Field(min_length=1, max_length=255)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ReviewerAPOutboxItem(StrictModel):
+    match_id: str
+    state: Literal["PENDING", "ACKNOWLEDGED"]
+    vendor: str
+    invoice_number: str | None = None
+    currency: str
+    total_amount: Decimal
+    created_at: str
+    acknowledged_at: str | None = None
+    attempt_count: int
+    last_error: str | None = None
+    external_reference: str | None = None
+
+
+class APExportAcknowledgement(StrictModel):
+    external_reference: str | None = Field(default=None, max_length=255)
+
+
+class APReferenceReconciliation(StrictModel):
+    external_reference: str = Field(min_length=1, max_length=255)
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class VerifyCapturedInvoice(StrictModel):
     invoice: SupplierInvoice
 
