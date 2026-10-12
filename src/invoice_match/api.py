@@ -18,14 +18,19 @@ from sqlalchemy.orm import Session
 
 from .ap_export import build_ap_payload
 from .adapters import create_adapter
+from .adapters.factory import create_adapter_for_company
 from .csv_import import parse_csv_documents
 from .database import (
+    AccountingConnectionEventRecord,
+    AccountingConnectionRecord,
     APOutboxRecord,
     AuditEvent,
     CapturedDocumentRecord,
     DocumentCaptureEvent,
     ExceptionRecord,
     MatchRecord,
+    PaymentReconciliationEventRecord,
+    RemittancePaymentRecord,
     NotificationOutboxRecord,
     ProcurementRecord,
     RuleVersionEvent,
@@ -64,7 +69,13 @@ from .schemas import (
     ReviewerAPOutboxItem,
     SupplierInvoice,
     VerifyCapturedInvoice,
+    AccountingConnectionUpsert,
+    RemittancePaymentCreate,
+    ManualPaymentAllocationRequest,
 )
+from .accounting_connections import encrypt_configuration, public_connection, validate_configuration
+from .payment_reconciliation import manually_allocate, payment_result, reconcile_payment
+from .accounting_status import refresh_accounting_status
 
 app = FastAPI(
     title="invoice-match",
@@ -1066,6 +1077,9 @@ def list_ap_outbox(
         next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
+        accounting_status=item.accounting_status,
+        accounting_status_detail=item.accounting_status_detail,
+        accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
     ) for item in items]
 
 
@@ -1103,6 +1117,9 @@ def acknowledge_ap_outbox(
         next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
+        accounting_status=item.accounting_status,
+        accounting_status_detail=item.accounting_status_detail,
+        accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
     )
 
 
@@ -1132,6 +1149,9 @@ def reviewer_ap_outbox(
         next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
+        accounting_status=item.accounting_status,
+        accounting_status_detail=item.accounting_status_detail,
+        accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
     ) for item, match in rows]
 
 
@@ -1148,7 +1168,8 @@ def retry_ap_outbox(
         raise HTTPException(status_code=409, detail="Only pending or dead-lettered AP exports can be retried")
     adapter_name = os.getenv("AP_DELIVERY_ADAPTER", "filesystem")
     try:
-        adapter = create_adapter(adapter_name, company_id=session.info.get("company_id", "default"))
+        adapter = create_adapter_for_company(session.info.get("company_id", "default"))
+        adapter_name = adapter.name
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=f"AP delivery adapter is unavailable: {exc}") from exc
     session.add(AuditEvent(
@@ -1177,6 +1198,9 @@ def retry_ap_outbox(
         attempt_count=result["attempt_count"],
         last_error=result["last_error"],
         external_reference=result["external_reference"],
+        accounting_status=item.accounting_status,
+        accounting_status_detail=item.accounting_status_detail,
+        accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
     )
 
 
@@ -1219,6 +1243,9 @@ def reconcile_ap_reference(
         next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
+        accounting_status=item.accounting_status,
+        accounting_status_detail=item.accounting_status_detail,
+        accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
     )
 
 
@@ -1226,6 +1253,176 @@ def _utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+@app.get("/admin/accounting-connections")
+def list_accounting_connections(
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    rows = session.scalars(select(AccountingConnectionRecord).order_by(AccountingConnectionRecord.provider)).all()
+    return [public_connection(row) for row in rows]
+
+
+@app.put("/admin/accounting-connections/{provider}")
+def upsert_accounting_connection(
+    provider: str, body: AccountingConnectionUpsert,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    try:
+        configuration = validate_configuration(provider, body.configuration)
+        encrypted = encrypt_configuration(configuration)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    record = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider
+    ))
+    now = datetime.now(timezone.utc)
+    if record is None:
+        record = AccountingConnectionRecord(id=str(uuid4()), provider=provider,
+                                            encrypted_config=encrypted, enabled=body.enabled,
+                                            updated_by=admin.name)
+        session.add(record)
+        event_type = "ACCOUNTING_CONNECTION_CREATED"
+    else:
+        record.encrypted_config = encrypted
+        record.enabled = body.enabled
+        record.updated_by = admin.name
+        record.updated_at = now
+        event_type = "ACCOUNTING_CONNECTION_UPDATED"
+    session.add(AccountingConnectionEventRecord(provider=provider, event_type=event_type,
+                                                actor=admin.name,
+                                                details={"enabled": body.enabled}))
+    session.commit()
+    session.refresh(record)
+    return public_connection(record)
+
+
+@app.delete("/admin/accounting-connections/{provider}")
+def disable_accounting_connection(
+    provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    record = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    record.enabled = False
+    record.updated_by = admin.name
+    record.updated_at = datetime.now(timezone.utc)
+    session.add(AccountingConnectionEventRecord(provider=provider,
+        event_type="ACCOUNTING_CONNECTION_DISABLED", actor=admin.name, details={}))
+    session.commit()
+    return {"provider": provider, "enabled": False}
+
+
+@app.get("/admin/accounting-connections/events")
+def accounting_connection_events(
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    events = session.scalars(select(AccountingConnectionEventRecord).order_by(
+        AccountingConnectionEventRecord.created_at.desc()).limit(limit)).all()
+    return [{"id": event.id, "provider": event.provider, "event_type": event.event_type,
+             "actor": event.actor, "details": event.details, "created_at": _timestamp(event.created_at)}
+            for event in events]
+
+
+@app.post("/reviewer/ap-outbox/{match_id}/sync-status", response_model=ReviewerAPOutboxItem)
+def sync_accounting_status(
+    match_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    item = session.get(APOutboxRecord, match_id)
+    match = session.get(MatchRecord, match_id)
+    if item is None or match is None:
+        raise HTTPException(status_code=404, detail="AP outbox item not found")
+    if item.state != "ACKNOWLEDGED" or not item.external_reference:
+        raise HTTPException(status_code=409, detail="Invoice must be acknowledged and have an external reference")
+    try:
+        adapter = create_adapter_for_company(session.info.get("company_id", "default"))
+        refresh_accounting_status(session, adapter, item, actor=admin.name)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=502, detail=f"Accounting status lookup failed: {exc}") from exc
+    session.commit()
+    return ReviewerAPOutboxItem(
+        match_id=item.match_id, state=item.state, vendor=match.vendor, invoice_number=match.invoice_number,
+        currency=str(item.payload.get("currency") or "USD"), total_amount=item.payload.get("total_amount", 0),
+        created_at=_timestamp(item.created_at), acknowledged_at=_timestamp(item.acknowledged_at),
+        attempt_count=item.attempt_count, next_attempt_at=_timestamp(item.next_attempt_at),
+        last_error=item.last_error, external_reference=item.external_reference,
+        accounting_status=item.accounting_status, accounting_status_detail=item.accounting_status_detail,
+        accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
+    )
+
+
+@app.post("/integrations/payments/remittances", status_code=201)
+def ingest_remittance_payment(
+    body: RemittancePaymentCreate, session: Session = Depends(get_session),
+    integration: str = Depends(require_integration),
+):
+    existing = session.scalar(select(RemittancePaymentRecord).where(
+        RemittancePaymentRecord.external_id == body.external_id
+    ))
+    if existing is not None:
+        if (existing.vendor.casefold() != body.vendor.casefold()
+                or existing.currency != body.currency
+                or existing.amount != body.amount):
+            raise HTTPException(status_code=409, detail={"code": "PAYMENT_EXTERNAL_ID_REUSED"})
+        return payment_result(session, existing)
+    payment = RemittancePaymentRecord(
+        id=str(uuid4()), external_id=body.external_id, vendor=body.vendor, currency=body.currency,
+        amount=body.amount, reference=body.reference, payment_date=body.payment_date,
+        status="NEEDS_REVIEW", input_data=body.model_dump(mode="json"), allocated_amount=Decimal(0),
+    )
+    session.add(payment)
+    session.flush()
+    reconcile_payment(session, payment, actor=integration)
+    session.commit()
+    session.refresh(payment)
+    return payment_result(session, payment)
+
+
+@app.get("/reviewer/payments")
+def reviewer_payments(
+    status: str = Query(default="ALL", pattern="^(NEEDS_REVIEW|MATCHED|PARTIALLY_MATCHED|ALL)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    query = select(RemittancePaymentRecord).order_by(RemittancePaymentRecord.created_at.desc()).limit(limit)
+    if status != "ALL":
+        query = query.where(RemittancePaymentRecord.status == status)
+    return [payment_result(session, payment) for payment in session.scalars(query).all()]
+
+
+@app.post("/reviewer/payments/{payment_id}/allocate")
+def allocate_payment(
+    payment_id: str, body: ManualPaymentAllocationRequest,
+    session: Session = Depends(get_session), reviewer: Principal = Depends(require_approver),
+):
+    payment = session.get(RemittancePaymentRecord, payment_id)
+    if payment is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    try:
+        manually_allocate(session, payment, [(item.match_id, item.amount) for item in body.allocations],
+                          actor=reviewer.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()
+    return payment_result(session, payment)
+
+
+@app.get("/reviewer/payments/{payment_id}/events")
+def payment_events(
+    payment_id: str, session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    if session.get(RemittancePaymentRecord, payment_id) is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    events = session.scalars(select(PaymentReconciliationEventRecord).where(
+        PaymentReconciliationEventRecord.payment_id == payment_id
+    ).order_by(PaymentReconciliationEventRecord.created_at)).all()
+    return [{"id": event.id, "event_type": event.event_type, "actor": event.actor,
+             "details": event.details, "created_at": _timestamp(event.created_at)} for event in events]
 
 
 @app.get("/reviewer/reports/operations")

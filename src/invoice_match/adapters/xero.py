@@ -78,6 +78,17 @@ class XeroAdapter:
             session_factory=session_factory,
         )
 
+    @classmethod
+    def from_configuration(cls, config: dict, *, session_factory=None):
+        return cls(
+            client_id=config["client_id"], client_secret=config["client_secret"],
+            tenant_id=config["tenant_id"], encryption_key=config["token_encryption_key"],
+            refresh_token=config["refresh_token"], contact_map=config.get("contact_map", {}),
+            item_map=config.get("item_map", {}), tax_type_map=config.get("tax_type_map", {}),
+            expense_account_code=config.get("expense_account_code"),
+            timeout=float(config.get("timeout", 20)), session_factory=session_factory,
+        )
+
     @staticmethod
     def _normalize_map(source):
         return {" ".join(key.casefold().split()): value for key, value in source.items()}
@@ -211,3 +222,25 @@ class XeroAdapter:
         if not invoices or invoices[0].get("HasErrors"):
             raise XeroAPIError(f"Xero did not create invoice {invoice_number!r}: {data}")
         return str(invoices[0].get("InvoiceID") or "")
+
+    def fetch_invoice_status(self, external_reference: str) -> dict:
+        data = self._api(f"Invoices/{external_reference}")
+        invoices = data.get("Invoices") or []
+        invoice = next((item for item in invoices if item.get("Type") == "ACCPAY"), None)
+        if invoice is None:
+            raise XeroAPIError("Xero returned no accounts-payable invoice for the supplied reference")
+        provider_status = str(invoice.get("Status") or "UNKNOWN").upper()
+        amount_due = Decimal(str(invoice.get("AmountDue") or 0))
+        amount_paid = Decimal(str(invoice.get("AmountPaid") or 0))
+        if provider_status in {"VOIDED", "DELETED"}:
+            status = "VOIDED"
+        elif provider_status == "PAID" or amount_due <= Decimal("0.01"):
+            status = "PAID"
+        elif amount_paid > 0:
+            status = "PARTIALLY_PAID"
+        else:
+            status = "OPEN"
+        return {"status": status, "provider_status": provider_status,
+                "total_amount": str(invoice.get("Total")), "amount_paid": str(amount_paid),
+                "amount_due": str(amount_due), "currency": invoice.get("CurrencyCode"),
+                "document_number": invoice.get("InvoiceNumber")}

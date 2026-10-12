@@ -259,6 +259,9 @@ class APOutboxItem(StrictModel):
     next_attempt_at: str | None = None
     last_error: str | None = None
     external_reference: str | None = None
+    accounting_status: str = "UNKNOWN"
+    accounting_status_detail: dict = Field(default_factory=dict)
+    accounting_status_checked_at: str | None = None
 
 
 class ReviewerAPOutboxItem(StrictModel):
@@ -274,30 +277,9 @@ class ReviewerAPOutboxItem(StrictModel):
     next_attempt_at: str | None = None
     last_error: str | None = None
     external_reference: str | None = None
-
-
-class APExportAcknowledgement(StrictModel):
-    external_reference: str | None = Field(default=None, max_length=255)
-
-
-class APReferenceReconciliation(StrictModel):
-    external_reference: str = Field(min_length=1, max_length=255)
-    note: str | None = Field(default=None, max_length=2000)
-
-
-class ReviewerAPOutboxItem(StrictModel):
-    match_id: str
-    state: Literal["PENDING", "ACKNOWLEDGED", "DEAD"]
-    vendor: str
-    invoice_number: str | None = None
-    currency: str
-    total_amount: Decimal
-    created_at: str
-    acknowledged_at: str | None = None
-    attempt_count: int
-    next_attempt_at: str | None = None
-    last_error: str | None = None
-    external_reference: str | None = None
+    accounting_status: str = "UNKNOWN"
+    accounting_status_detail: dict = Field(default_factory=dict)
+    accounting_status_checked_at: str | None = None
 
 
 class APExportAcknowledgement(StrictModel):
@@ -341,3 +323,48 @@ class DocumentCaptureAuditEntry(StrictModel):
     actor: str
     details: dict
     created_at: datetime
+
+
+class AccountingConnectionUpsert(StrictModel):
+    configuration: dict
+    enabled: bool = True
+
+
+class PaymentAdviceAllocation(StrictModel):
+    invoice_reference: str = Field(min_length=1, max_length=255)
+    amount: Decimal = Field(gt=0)
+
+
+class RemittancePaymentCreate(StrictModel):
+    external_id: str = Field(min_length=1, max_length=160)
+    vendor: str = Field(min_length=1, max_length=255)
+    currency: str = Field(min_length=3, max_length=3)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=4)
+    reference: str | None = Field(default=None, max_length=255)
+    payment_date: datetime | None = None
+    allocations: list[PaymentAdviceAllocation] | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_payment_allocations(self):
+        self.currency = self.currency.upper()
+        if self.allocations and sum((allocation.amount for allocation in self.allocations), Decimal(0)) > self.amount:
+            raise ValueError("Allocation total cannot exceed payment amount")
+        references = [allocation.invoice_reference.casefold() for allocation in self.allocations or []]
+        if len(references) != len(set(references)):
+            raise ValueError("Each invoice reference may appear once in payment allocations")
+        return self
+
+
+class ManualPaymentAllocation(StrictModel):
+    match_id: str = Field(min_length=1, max_length=36)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=4)
+
+
+class ManualPaymentAllocationRequest(StrictModel):
+    allocations: list[ManualPaymentAllocation] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def unique_match_ids(self):
+        if len({item.match_id for item in self.allocations}) != len(self.allocations):
+            raise ValueError("Each invoice may appear once in an allocation request")
+        return self

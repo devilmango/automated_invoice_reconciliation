@@ -5,6 +5,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://invoice_match:invoice_match@db:5432/invoice_match
+      ACCOUNTING_CONNECTIONS_ENCRYPTION_KEY: "${ACCOUNTING_CONNECTIONS_ENCRYPTION_KEY:-}"
       INVOICE_MATCH_RULES: /app/config/rules.yaml
       REVIEWER_TOKENS: "${REVIEWER_TOKENS:?Set REVIEWER_TOKENS in .env; see .env.example}"
       INTEGRATION_TOKENS: "${INTEGRATION_TOKENS:?Set INTEGRATION_TOKENS in .env; see .env.example}"
@@ -67,6 +68,7 @@ services:
     command: ["invoice-match", "worker", "--interval", "30"]
     environment:
       DATABASE_URL: postgresql+psycopg://invoice_match:invoice_match@db:5432/invoice_match
+      ACCOUNTING_CONNECTIONS_ENCRYPTION_KEY: "${ACCOUNTING_CONNECTIONS_ENCRYPTION_KEY:-}"
       REVIEWER_TOKENS: "${REVIEWER_TOKENS:?Set REVIEWER_TOKENS in .env; see .env.example}"
       INTEGRATION_TOKENS: "${INTEGRATION_TOKENS:?Set INTEGRATION_TOKENS in .env; see .env.example}"
       AP_ADAPTER_DIRECTORY: /var/lib/invoice-match/ap-adapter-data

@@ -241,6 +241,7 @@ def deliver(
     from .adapters import create_adapter
     from .database import SessionLocal
     from .delivery import deliver_pending
+    from .accounting_status import refresh_due_accounting_statuses
 
     try:
         provider = create_adapter(adapter, directory=str(directory) if directory else None,
@@ -329,6 +330,7 @@ def worker(
     """Poll AP and notification outboxes with bounded retries and dead-letter handling."""
     import time
     from .adapters import create_adapter
+    from .adapters.factory import create_adapter_for_company
     from sqlalchemy import select
     from datetime import datetime, timezone
     from .database import SessionLocal, WorkerHeartbeatRecord
@@ -358,11 +360,14 @@ def worker(
     while True:
         cycle = []
         for company_id in companies:
-            provider = create_adapter(adapter_name, company_id=company_id)
+            provider = create_adapter_for_company(company_id)
             with SessionLocal() as session:
                 session.info["company_id"] = company_id
                 ap = deliver_pending(session, provider, limit=limit, max_attempts=ap_attempts,
                                      initial_retry_seconds=ap_initial, max_retry_seconds=ap_max)
+                accounting_status = refresh_due_accounting_statuses(
+                    session, provider, limit=limit, actor=worker_name,
+                )
                 notifications = {"delivered": 0, "failed": 0, "dead_lettered": 0}
                 if notification_adapter:
                     escalated = escalate_overdue(
@@ -390,10 +395,12 @@ def worker(
                 heartbeat.last_started_at = now
                 heartbeat.last_succeeded_at = now
                 failures = ap.get("failed", 0) + ap.get("dead_lettered", 0) \
-                    + notifications.get("failed", 0) + notifications.get("dead_lettered", 0)
+                    + notifications.get("failed", 0) + notifications.get("dead_lettered", 0) \
+                    + accounting_status.get("failed", 0)
                 heartbeat.last_error = f"{failures} delivery attempt(s) failed or dead-lettered" if failures else None
                 session.commit()
-                cycle.append({"company_id": company_id, "ap": ap, "notifications": notifications,
+                cycle.append({"company_id": company_id, "ap": ap,
+                              "accounting_status": accounting_status, "notifications": notifications,
                               "health": "DEGRADED" if failures else "HEALTHY"})
         typer.echo(json.dumps({"companies": cycle}, indent=2))
         if once:

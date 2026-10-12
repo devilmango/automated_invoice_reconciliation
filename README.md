@@ -373,6 +373,39 @@ An admin can retry pending or dead-lettered exports from this page. Set `AP_DELI
 
 The report endpoint accepts optional UTC date filters, for example `GET /reviewer/reports/operations?start_date=2026-10-01&end_date=2026-10-31`. Ranges are limited to 366 days. Reviewer tokens can read reports and export state; admin tokens are required to retry deliveries or change a reconciled reference.
 
+### Company accounting connections, status sync, and payment reconciliation
+
+Accounting connections are configured per company by an admin. Generate a Fernet key with `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`, set it as `ACCOUNTING_CONNECTIONS_ENCRYPTION_KEY` for both the API and worker, then save a provider configuration. The outer key encrypts the complete provider configuration in the database; provider OAuth token keys continue to encrypt the rotated provider tokens. Store both keys in your deployment secret manager and keep backups of the outer key, because losing it makes saved connection settings unreadable.
+
+```bash
+curl --request PUT http://127.0.0.1:8000/admin/accounting-connections/quickbooks \
+  --header 'Authorization: Bearer <admin-token>' \
+  --header 'Content-Type: application/json' \
+  --data '{"configuration":{"client_id":"...","client_secret":"...","realm_id":"123456","refresh_token":"...","token_encryption_key":"<provider-fernet-key>","environment":"sandbox","vendor_map":{"ABC Supplies":"37"},"item_map":{"A100":"12"}},"enabled":true}'
+
+curl http://127.0.0.1:8000/admin/accounting-connections \
+  --header 'Authorization: Bearer <admin-token>'
+```
+
+The list response contains provider/account metadata and configured field names, never secret values. `DELETE /admin/accounting-connections/{quickbooks|xero}` disables a connection while preserving its encrypted configuration and audit history. A configured company connection takes precedence over `AP_DELIVERY_ADAPTER` when the worker or an admin retries an export. `/reviewer/ap-outbox/{match_id}/sync-status` (admin) checks an acknowledged invoice with an external reference against QuickBooks or Xero and records status changes in the match audit log. The current status and last check time appear in reviewer AP outbox responses. Status lookup is not available for filesystem or generic HTTP adapters.
+
+Payment systems can send remittances to `POST /integrations/payments/remittances`; the company integration token scopes the payment and external ID. Replays with the same external ID and the same vendor/currency/amount return the existing payment. The matcher allocates a uniquely identified invoice payment, supports a uniquely identifiable short payment, and matches a unique exact sum across a small set of invoices. Ambiguous or inconsistent remittances remain `NEEDS_REVIEW` for the reviewer queue at `GET /reviewer/payments`. A reviewer with the `approver` role can allocate a payment explicitly with `POST /reviewer/payments/{payment_id}/allocate`, supplying invoice match IDs and amounts. Allocations enforce vendor, currency, acknowledgement, remaining-balance, and payment-total boundaries and write payment and invoice audit events. Payment history is available at `/reviewer/payments/{payment_id}/events`.
+
+Example remittance payload:
+
+```json
+{
+  "external_id": "BANK-2026-00041",
+  "vendor": "ABC Supplies",
+  "currency": "USD",
+  "amount": "950.00",
+  "reference": "INV-10041",
+  "allocations": [{"invoice_reference": "INV-10041", "amount": "950.00"}]
+}
+```
+
+Use explicit `allocations` when the bank remittance advice identifies invoice references. References may be the supplier invoice number, match ID, or saved accounting-system reference. If an advice line does not resolve to exactly one outstanding invoice, the payment stays in the review queue rather than guessing.
+
 ### Configure company-scoped access
 
 Give every reviewer and integration credential an explicit `company_id` when operating more than one company. For example:
@@ -622,6 +655,7 @@ The Compose file uses development credentials. Change credentials and manage the
 | `NOTIFICATION_WEBHOOK_TOKEN` | unset | Optional bearer credential sent to the notification endpoint |
 | `NOTIFICATION_WEBHOOK_SECRET` | unset | Optional HMAC-SHA256 signing secret for webhook requests |
 | `QBO_CLIENT_ID` / `QBO_CLIENT_SECRET` | unset | Intuit OAuth application credentials |
+| `ACCOUNTING_CONNECTIONS_ENCRYPTION_KEY` | unset | Fernet key required to encrypt company-level accounting connection configuration |
 | `QBO_REALM_ID` / `QBO_REFRESH_TOKEN` | unset | QuickBooks company ID and initial OAuth refresh token |
 | `QBO_TOKEN_ENCRYPTION_KEY` | unset | Fernet key used to encrypt rotated OAuth tokens at rest |
 | `QBO_ENVIRONMENT` | `sandbox` | QuickBooks target environment: `sandbox` or `production` |

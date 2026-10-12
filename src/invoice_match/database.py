@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, String, create_engine, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, Numeric, String, create_engine, text, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker, with_loader_criteria
 from sqlalchemy import event
 
@@ -128,6 +129,9 @@ class APOutboxRecord(CompanyScoped, Base):
     external_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accounting_status: Mapped[str] = mapped_column(String(32), default="UNKNOWN", index=True)
+    accounting_status_detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    accounting_status_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CapturedDocumentRecord(CompanyScoped, Base):
@@ -268,3 +272,66 @@ class WorkerHeartbeatRecord(CompanyScoped, Base):
     last_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     last_succeeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class AccountingConnectionRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_connections"
+    __table_args__ = (Index("uq_accounting_connection_company_provider", "company_id", "provider", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    encrypted_config: Mapped[str] = mapped_column(String)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    updated_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AccountingConnectionEventRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_connection_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    actor: Mapped[str] = mapped_column(String(255))
+    details: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class RemittancePaymentRecord(CompanyScoped, Base):
+    __tablename__ = "remittance_payments"
+    __table_args__ = (Index("uq_remittance_payment_company_external", "company_id", "external_id", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    external_id: Mapped[str] = mapped_column(String(160))
+    vendor: Mapped[str] = mapped_column(String(255))
+    currency: Mapped[str] = mapped_column(String(3))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payment_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="NEEDS_REVIEW", index=True)
+    input_data: Mapped[dict] = mapped_column(JSON)
+    allocated_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class PaymentAllocationRecord(CompanyScoped, Base):
+    __tablename__ = "payment_allocations"
+    __table_args__ = (Index("uq_payment_allocation_payment_match", "company_id", "payment_id", "match_id", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    payment_id: Mapped[str] = mapped_column(ForeignKey("remittance_payments.id"), index=True)
+    match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class PaymentReconciliationEventRecord(CompanyScoped, Base):
+    __tablename__ = "payment_reconciliation_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    payment_id: Mapped[str] = mapped_column(ForeignKey("remittance_payments.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(40), index=True)
+    actor: Mapped[str] = mapped_column(String(255))
+    details: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

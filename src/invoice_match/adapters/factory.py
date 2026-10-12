@@ -24,15 +24,49 @@ def create_adapter(
         if not selected_endpoint or not selected_token:
             raise ValueError("HTTP adapter requires --endpoint/--token or AP_ADAPTER_URL/AP_ADAPTER_TOKEN")
         return GenericHTTPAPAdapter(selected_endpoint, selected_token)
-    if name == "xero":
+    if name in {"quickbooks", "xero"}:
+        config, configured = _company_configuration(name, company_id)
         from ..database import SessionLocal
-
-        return XeroAdapter.from_environment(session_factory=_company_session_factory(SessionLocal, company_id))
-    if name == "quickbooks":
-        from ..database import SessionLocal
-
-        return QuickBooksOnlineAdapter.from_environment(session_factory=_company_session_factory(SessionLocal, company_id))
+        session_factory = _company_session_factory(SessionLocal, company_id)
+        if configured:
+            if name == "xero":
+                return XeroAdapter.from_configuration(config, session_factory=session_factory)
+            return QuickBooksOnlineAdapter.from_configuration(config, session_factory=session_factory)
+        if company_id != "default":
+            raise ValueError(f"No enabled {name} connection is configured for company {company_id!r}")
+        if name == "xero":
+            return XeroAdapter.from_environment(session_factory=session_factory)
+        return QuickBooksOnlineAdapter.from_environment(session_factory=session_factory)
     raise ValueError("Adapter must be one of: filesystem, http, quickbooks, xero")
+
+
+def create_adapter_for_company(company_id: str = "default"):
+    from sqlalchemy import select
+    from ..database import AccountingConnectionRecord, SessionLocal
+
+    with _company_session_factory(SessionLocal, company_id)() as session:
+        connection = session.scalar(select(AccountingConnectionRecord).where(
+            AccountingConnectionRecord.enabled.is_(True)
+        ).order_by(AccountingConnectionRecord.updated_at.desc()).limit(1))
+        if connection is not None:
+            return create_adapter(connection.provider, company_id=company_id)
+    return create_adapter(os.getenv("AP_DELIVERY_ADAPTER", "filesystem"), company_id=company_id)
+
+
+def _company_configuration(provider: str, company_id: str) -> tuple[dict | None, bool]:
+    from sqlalchemy import select
+    from ..accounting_connections import decrypt_configuration
+    from ..database import AccountingConnectionRecord, SessionLocal
+
+    with _company_session_factory(SessionLocal, company_id)() as session:
+        record = session.scalar(select(AccountingConnectionRecord).where(
+            AccountingConnectionRecord.provider == provider
+        ))
+        if record is None:
+            return None, False
+        if not record.enabled:
+            raise ValueError(f"The {provider} accounting connection is disabled for company {company_id!r}")
+        return decrypt_configuration(record.encrypted_config), True
 
 
 def _company_session_factory(session_factory, company_id: str):

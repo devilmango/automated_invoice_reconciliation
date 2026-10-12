@@ -52,6 +52,7 @@ class QuickBooksOnlineAdapter:
         ap_account_id: str | None = None,
         freight_account_id: str | None = None,
         discount_account_id: str | None = None,
+        minor_version: str | None = None,
         timeout: float = 20.0,
         session_factory: Callable[[], Session] | None = None,
         opener=urlopen,
@@ -84,7 +85,7 @@ class QuickBooksOnlineAdapter:
         self.discount_account_id = discount_account_id
         self.timeout = timeout
         self.opener = opener
-        minor_version = os.getenv("QBO_MINOR_VERSION")
+        minor_version = minor_version or os.getenv("QBO_MINOR_VERSION")
         self.minor_version = minor_version.strip() if minor_version else None
 
     @classmethod
@@ -114,6 +115,20 @@ class QuickBooksOnlineAdapter:
             freight_account_id=os.getenv("QBO_FREIGHT_ACCOUNT_ID"),
             discount_account_id=os.getenv("QBO_DISCOUNT_ACCOUNT_ID"),
             timeout=float(os.getenv("QBO_TIMEOUT_SECONDS", "20")),
+            session_factory=session_factory,
+        )
+
+    @classmethod
+    def from_configuration(cls, config: dict, *, session_factory=None) -> "QuickBooksOnlineAdapter":
+        return cls(
+            client_id=config["client_id"], client_secret=config["client_secret"],
+            realm_id=config["realm_id"], encryption_key=config["token_encryption_key"],
+            refresh_token=config["refresh_token"], environment=config.get("environment", "sandbox"),
+            vendor_map=config.get("vendor_map", {}), item_map=config.get("item_map", {}),
+            tax_code_map=config.get("tax_code_map", {}), ap_account_id=config.get("ap_account_id"),
+            freight_account_id=config.get("freight_account_id"),
+            discount_account_id=config.get("discount_account_id"),
+            timeout=float(config.get("timeout", 20)), minor_version=config.get("minor_version"),
             session_factory=session_factory,
         )
 
@@ -210,6 +225,23 @@ class QuickBooksOnlineAdapter:
             raise RuntimeError("QuickBooks returned no Bill ID after create")
         self._validate_bill_total(result, payload)
         return str(result["Id"])
+
+    def fetch_invoice_status(self, external_reference: str) -> dict:
+        response = self._request("GET", f"bill/{external_reference}")
+        bill = response.get("Bill") if isinstance(response, dict) else None
+        if not isinstance(bill, dict):
+            raise RuntimeError("QuickBooks returned no Bill for the supplied external reference")
+        total = Decimal(str(bill.get("TotalAmt") or 0))
+        balance = Decimal(str(bill.get("Balance", total)))
+        if balance <= Decimal("0.01"):
+            status = "PAID"
+        elif balance < total:
+            status = "PARTIALLY_PAID"
+        else:
+            status = "OPEN"
+        return {"status": status, "total_amount": str(total), "amount_due": str(balance),
+                "currency": (bill.get("CurrencyRef") or {}).get("value"),
+                "document_number": bill.get("DocNumber"), "provider_status": bill.get("TxnStatus")}
 
     @staticmethod
     def _validate_bill_total(bill: dict, payload: dict) -> None:
