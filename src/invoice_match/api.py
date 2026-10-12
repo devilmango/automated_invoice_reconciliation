@@ -27,6 +27,7 @@ from .database import (
     ExceptionRecord,
     MatchRecord,
     NotificationOutboxRecord,
+    ProcurementRecord,
     RuleVersionEvent,
     RuleVersionRecord,
     SessionLocal,
@@ -36,6 +37,7 @@ from .integration_auth import require_integration
 from .matcher import match_documents
 from .notification_delivery import escalate_overdue, queue_notification
 from .delivery import deliver_match
+from .procurement_sync import sync_procurement
 from .vendor_profiles import canonical_vendor, load_vendor_profiles, normalize_name, vendor_aliases
 from .reviewer_auth import Principal, require_admin, require_approver, require_reviewer
 from .rules import ToleranceRules, load_rules, parse_rules_yaml
@@ -377,6 +379,40 @@ def reviewer_capture_inbox():
 @app.get("/reviewer/operations", include_in_schema=False)
 def reviewer_operations_dashboard():
     return FileResponse(Path(__file__).parent / "static" / "reviewer-operations.html")
+
+
+@app.post("/admin/procurement/sync")
+def synchronize_procurement(
+    session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    adapter_name = os.getenv("AP_PROCUREMENT_ADAPTER", "filesystem")
+    try:
+        adapter = create_adapter(adapter_name)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=f"Procurement adapter is unavailable: {exc}") from exc
+    if not callable(getattr(adapter, "list_purchase_orders", None)) or not callable(
+        getattr(adapter, "fetch_receipts", None)
+    ):
+        raise HTTPException(status_code=503, detail=f"The {adapter_name!r} adapter cannot sync procurement documents")
+    return sync_procurement(session, adapter)
+
+
+@app.get("/integrations/procurement/purchase-orders/{po_number}")
+def get_synced_procurement(
+    po_number: str,
+    session: Session = Depends(get_session),
+    integration: str = Depends(require_integration),
+):
+    record = session.get(ProcurementRecord, po_number)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Purchase order has not been synchronized")
+    return {
+        "purchase_order": record.purchase_order,
+        "receipts": record.receipts,
+        "source_adapter": record.source_adapter,
+        "synced_at": _timestamp(record.synced_at),
+    }
 
 
 def _captured_result(record: CapturedDocumentRecord) -> CapturedDocumentResult:

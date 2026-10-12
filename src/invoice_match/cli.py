@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 import typer
 
@@ -78,6 +82,147 @@ def match_from_ap(
     typer.echo(json.dumps(result.model_dump(mode="json"), indent=2))
     if result.status.value == "EXCEPTION":
         raise typer.Exit(code=2)
+
+
+@app.command("procurement-sync")
+def procurement_sync(
+    adapter: str = typer.Option(None, help="Source adapter; defaults to AP_PROCUREMENT_ADAPTER or filesystem."),
+    directory: Path | None = typer.Option(None, help="Filesystem adapter fixture directory."),
+    endpoint: str | None = typer.Option(None, help="Generic HTTP adapter base URL."),
+    token: str | None = typer.Option(None, help="Generic HTTP adapter bearer token."),
+):
+    """Fetch and persist current POs and receipts; schedule this command for recurring sync."""
+    from .adapters import create_adapter
+    from .database import SessionLocal
+    from .procurement_sync import sync_procurement as run_sync
+
+    adapter_name = adapter or os.getenv("AP_PROCUREMENT_ADAPTER", "filesystem")
+    try:
+        provider = create_adapter(
+            adapter_name,
+            directory=str(directory) if directory else None,
+            endpoint=endpoint,
+            token=token,
+        )
+        if not callable(getattr(provider, "list_purchase_orders", None)) or not callable(
+            getattr(provider, "fetch_receipts", None)
+        ):
+            raise ValueError(f"The {adapter_name!r} adapter cannot sync procurement documents")
+        with SessionLocal() as session:
+            summary = run_sync(session, provider)
+    except (ValueError, RuntimeError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(summary, indent=2))
+    if summary["failed"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("capture-inbox")
+def capture_inbox(
+    directory: Path | None = typer.Option(None, envvar="INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY",
+                                          exists=True, file_okay=False, readable=True,
+                                          help="Folder containing PDF, EML, or text invoice files."),
+    api_url: str = typer.Option(None, help="Invoice Match API base URL (default: INVOICE_MATCH_API_URL)."),
+    token: str = typer.Option(None, envvar="INVOICE_MATCH_INTEGRATION_TOKEN",
+                              help="Integration bearer token."),
+    limit: int = typer.Option(100, min=1, max=1000, help="Maximum files to process per run."),
+):
+    """Capture files in an inbox directory and archive accepted or duplicate documents."""
+    if directory is None:
+        typer.echo("Provide --directory or set INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY", err=True)
+        raise typer.Exit(code=1)
+    base_url = api_url or os.getenv("INVOICE_MATCH_API_URL", "http://127.0.0.1:8000")
+    if not token:
+        typer.echo("Provide --token or set INVOICE_MATCH_INTEGRATION_TOKEN", err=True)
+        raise typer.Exit(code=1)
+    if not base_url.startswith(("http://", "https://")):
+        typer.echo("API URL must start with http:// or https://", err=True)
+        raise typer.Exit(code=1)
+    summary = _capture_inbox(directory, base_url, token, limit)
+    typer.echo(json.dumps(summary, indent=2))
+    if summary["failed"] or summary["rejected"]:
+        raise typer.Exit(code=1)
+
+
+def _capture_inbox(directory: Path, api_url: str, token: str, limit: int) -> dict:
+    supported_types = {
+        ".pdf": "application/pdf",
+        ".eml": "message/rfc822",
+        ".txt": "text/plain",
+    }
+    summary = {"scanned": 0, "captured": 0, "duplicates": 0, "failed": 0,
+               "rejected": 0, "items": []}
+    processed_dir = directory / "processed"
+    rejected_dir = directory / "rejected"
+    processed_dir.mkdir(exist_ok=True)
+    rejected_dir.mkdir(exist_ok=True)
+    endpoint = urljoin(api_url.rstrip("/") + "/", "documents/extract")
+    candidates = [path for path in sorted(directory.iterdir()) if path.is_file() and not path.name.startswith(".")]
+    for path in candidates[:limit]:
+        summary["scanned"] += 1
+        content_type = supported_types.get(path.suffix.casefold())
+        if content_type is None:
+            summary["rejected"] += 1
+            summary["items"].append({"filename": path.name, "state": "REJECTED", "error": "Unsupported file type"})
+            _archive_capture(path, rejected_dir)
+            continue
+        if path.stat().st_size > 10 * 1024 * 1024:
+            summary["rejected"] += 1
+            summary["items"].append({"filename": path.name, "state": "REJECTED", "error": "Document exceeds 10 MiB"})
+            _archive_capture(path, rejected_dir)
+            continue
+        request = Request(
+            endpoint,
+            data=path.read_bytes(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+                "X-Filename": path.name,
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                body = response.read()
+            payload = json.loads(body) if body else {}
+            summary["captured"] += 1
+            summary["items"].append({
+                "filename": path.name,
+                "state": "CAPTURED",
+                "document_id": payload.get("document_id"),
+            })
+            _archive_capture(path, processed_dir)
+        except HTTPError as exc:
+            detail = exc.read(1000).decode("utf-8", errors="replace")
+            if exc.code == 409:
+                try:
+                    document_id = json.loads(detail).get("detail", {}).get("document_id")
+                except (json.JSONDecodeError, AttributeError):
+                    document_id = None
+                summary["duplicates"] += 1
+                summary["items"].append({"filename": path.name, "state": "DUPLICATE", "document_id": document_id})
+                _archive_capture(path, processed_dir)
+            elif 400 <= exc.code < 500 and exc.code != 429:
+                summary["rejected"] += 1
+                summary["items"].append({"filename": path.name, "state": "REJECTED", "error": detail})
+                _archive_capture(path, rejected_dir)
+            else:
+                summary["failed"] += 1
+                summary["items"].append({"filename": path.name, "state": "RETRY", "error": detail})
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            summary["failed"] += 1
+            summary["items"].append({"filename": path.name, "state": "RETRY", "error": str(exc)[:500]})
+    return summary
+
+
+def _archive_capture(source: Path, destination: Path) -> None:
+    target = destination / source.name
+    if target.exists():
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+        target = destination / f"{source.stem}-{digest}{source.suffix}"
+    source.replace(target)
 
 
 @app.command()

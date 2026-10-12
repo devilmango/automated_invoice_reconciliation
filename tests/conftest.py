@@ -57,6 +57,8 @@ def clear_database(apply_database_migrations):
         connection.exec_driver_sql("DELETE FROM rule_version_events")
         connection.exec_driver_sql("DELETE FROM rule_versions")
         connection.exec_driver_sql("DELETE FROM captured_documents")
+        connection.exec_driver_sql("DELETE FROM procurement_records")
+        connection.exec_driver_sql("DELETE FROM procurement_sync_state")
         connection.exec_driver_sql("DELETE FROM ap_outbox")
         connection.exec_driver_sql("DELETE FROM audit_events")
         connection.exec_driver_sql("DELETE FROM exceptions")

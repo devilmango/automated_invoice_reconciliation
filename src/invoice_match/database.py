@@ -116,6 +116,25 @@ class CapturedDocumentRecord(Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ProcurementRecord(Base):
+    __tablename__ = "procurement_records"
+
+    po_number: Mapped[str] = mapped_column(String(100), primary_key=True)
+    purchase_order: Mapped[dict] = mapped_column(JSON)
+    receipts: Mapped[list] = mapped_column(JSON, default=list)
+    source_adapter: Mapped[str] = mapped_column(String(40))
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ProcurementSyncState(Base):
+    __tablename__ = "procurement_sync_state"
+
+    source_adapter: Mapped[str] = mapped_column(String(40), primary_key=True)
+    last_successful_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class DocumentCaptureEvent(Base):
     __tablename__ = "document_capture_events"
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 
@@ -12,9 +13,11 @@ class PayablesDeliveryAdapter(Protocol):
 
 
 class APAdapter(PayablesDeliveryAdapter, Protocol):
-    """Adapter that can also fetch source PO and receipt documents."""
+    """Adapter that can also synchronize source PO and receipt documents."""
 
     name: str
+
+    def list_purchase_orders(self, *, updated_since: datetime | None = None) -> list[dict]: ...
 
     def fetch_purchase_order(self, po_number: str) -> dict: ...
 

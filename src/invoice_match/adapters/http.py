@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin
+from datetime import datetime
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -15,6 +16,19 @@ class GenericHTTPAPAdapter:
         self.endpoint = endpoint.rstrip("/") + "/"
         self.token = token
         self.timeout = timeout
+
+    def list_purchase_orders(self, *, updated_since: datetime | None = None) -> list[dict]:
+        path = "purchase-orders"
+        if updated_since is not None:
+            path += "?" + urlencode({"updated_since": updated_since.isoformat()})
+        data = self._request("GET", path)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            orders = data.get("purchase_orders")
+            if isinstance(orders, list):
+                return orders
+        raise RuntimeError("AP adapter returned an invalid purchase-order listing")
 
     def fetch_purchase_order(self, po_number: str) -> dict:
         return self._request("GET", f"purchase-orders/{quote(po_number, safe='')}")

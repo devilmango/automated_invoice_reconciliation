@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,6 +15,30 @@ class FilesystemAPAdapter:
 
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
+
+    def list_purchase_orders(self, *, updated_since: datetime | None = None) -> list[dict]:
+        order_dir = self.directory / "purchase_orders"
+        if not order_dir.exists():
+            return []
+        orders = []
+        for path in sorted(order_dir.glob("*.json")):
+            if not path.is_file():
+                continue
+            order = self._read(path)
+            wrapped = order.get("purchase_order", order)
+            number = wrapped.get("number") if isinstance(wrapped, dict) else None
+            modified_at = path.stat().st_mtime
+            if number:
+                receipt_path = self.directory / "receipts" / f"{quote(str(number), safe='')}.json"
+                if receipt_path.exists():
+                    modified_at = max(modified_at, receipt_path.stat().st_mtime)
+            watermark = updated_since
+            if watermark is not None:
+                watermark = watermark.replace(tzinfo=timezone.utc) if watermark.tzinfo is None else watermark
+            if watermark is not None and modified_at < watermark.timestamp():
+                continue
+            orders.append(order)
+        return orders
 
     def fetch_purchase_order(self, po_number: str) -> dict:
         return self._read(self.directory / "purchase_orders" / f"{quote(po_number, safe='')}.json")

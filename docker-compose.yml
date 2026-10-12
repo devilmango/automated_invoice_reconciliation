@@ -11,7 +11,11 @@ services:
       AP_ADAPTER_URL: "${AP_ADAPTER_URL:-}"
       AP_ADAPTER_TOKEN: "${AP_ADAPTER_TOKEN:-}"
       AP_ADAPTER_DIRECTORY: /var/lib/invoice-match/ap-adapter-data
+      AP_PROCUREMENT_ADAPTER: "${AP_PROCUREMENT_ADAPTER:-filesystem}"
       AP_DELIVERY_ADAPTER: "${AP_DELIVERY_ADAPTER:-filesystem}"
+      INVOICE_MATCH_API_URL: http://127.0.0.1:8000
+      INVOICE_MATCH_INTEGRATION_TOKEN: "${INVOICE_MATCH_INTEGRATION_TOKEN:-}"
+      INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY: /var/lib/invoice-match/invoice-inbox
       NOTIFICATION_WEBHOOK_URL: "${NOTIFICATION_WEBHOOK_URL:-}"
       NOTIFICATION_WEBHOOK_TOKEN: "${NOTIFICATION_WEBHOOK_TOKEN:-}"
       NOTIFICATION_WEBHOOK_SECRET: "${NOTIFICATION_WEBHOOK_SECRET:-}"
@@ -31,6 +35,7 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ${AP_ADAPTER_DIRECTORY:-./ap-adapter-data}:/var/lib/invoice-match/ap-adapter-data
+      - ${INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY:-./invoice-inbox}:/var/lib/invoice-match/invoice-inbox
     depends_on:
       db:
         condition: service_healthy

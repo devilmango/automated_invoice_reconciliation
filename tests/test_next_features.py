@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -35,6 +36,7 @@ def test_filesystem_adapter_fetches_sources_and_writes_idempotent_exports(tmp_pa
     adapter = FilesystemAPAdapter(tmp_path)
     payload = {"match_id": "match-1", "total_amount": "20.00"}
 
+    assert [order["number"] for order in adapter.list_purchase_orders()] == ["PO-1"]
     assert adapter.fetch_purchase_order("PO-1")["number"] == "PO-1"
     assert adapter.fetch_receipts("PO-1")[0]["number"] == "GR-1"
     assert adapter.submit_invoice(payload, idempotency_key="match-1") == "match-1"
@@ -58,7 +60,7 @@ def test_generic_http_adapter_uses_documented_routes_and_idempotency_header(monk
         def read(self):
             return self.payload
 
-    responses = [{"number": "PO-1"}, {"receipts": []}, {"id": "AP-1"}]
+    responses = [[{"number": "PO-1"}], {"number": "PO-1"}, {"receipts": []}, {"id": "AP-1"}]
 
     def fake_urlopen(request, timeout):
         calls.append((request, timeout))
@@ -66,11 +68,13 @@ def test_generic_http_adapter_uses_documented_routes_and_idempotency_header(monk
 
     monkeypatch.setattr("invoice_match.adapters.http.urlopen", fake_urlopen)
     adapter = GenericHTTPAPAdapter("https://ap.example.test/api", "secret")
+    assert adapter.list_purchase_orders(updated_since=datetime(2026, 10, 1, tzinfo=timezone.utc))[0]["number"] == "PO-1"
     assert adapter.fetch_purchase_order("PO/1")["number"] == "PO-1"
     assert adapter.fetch_receipts("PO-1") == []
     assert adapter.submit_invoice({"match_id": "m1"}, idempotency_key="m1") == "AP-1"
-    assert calls[0][0].full_url.endswith("purchase-orders/PO%2F1")
-    assert calls[2][0].get_header("Idempotency-key") == "m1"
+    assert calls[0][0].full_url.endswith("purchase-orders?updated_since=2026-10-01T00%3A00%3A00%2B00%3A00")
+    assert calls[1][0].full_url.endswith("purchase-orders/PO%2F1")
+    assert calls[3][0].get_header("Idempotency-key") == "m1"
 
 
 def test_delivery_service_records_success_and_retries_failures(clear_database):

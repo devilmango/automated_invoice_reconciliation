@@ -19,6 +19,8 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 - **Idempotency and duplicate detection:** Replay safe request retries, reject exact duplicate supplier invoices, and flag amount/date/number near-matches for review across configured supplier aliases.
 - **AP export outbox:** Poll approved payables as structured JSON and acknowledge downstream delivery.
 - **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
+- **Scheduled procurement sync:** Synchronize purchase orders and their receipts into the database using filesystem or generic REST adapters; reruns update the stored snapshot.
+- **Invoice inbox intake:** Poll a mounted directory of PDF, EML, and text invoices, submit each capture for OCR-assisted review, and archive accepted/duplicate files while leaving transient failures ready for retry.
 - **QuickBooks Online export:** Create mapped QuickBooks Bills with encrypted OAuth token storage, token refresh, provider-side duplicate checks, and retry-safe request IDs.
 - **Reviewer notifications:** Persist exception, reminder, and escalation events in an outbox and deliver them to an HTTPS webhook with backoff and dead-letter handling.
 - **PDF/email capture:** Extract candidate invoice fields with confidence and require human verification before matching.
@@ -87,6 +89,8 @@ See available commands and options:
 invoice-match --help
 invoice-match match --help
 invoice-match match-ap --help
+invoice-match procurement-sync --help
+invoice-match capture-inbox --help
 invoice-match deliver --help
 ```
 
@@ -105,10 +109,37 @@ invoice-match deliver --adapter filesystem --directory /tmp/ap-adapter-demo
 
 The fixture intentionally has a short receipt, so the match command exits with status `2` and reports an exception. The delivery command operates on the persistent API outbox; run it after starting the API and approving an exception.
 
+### Synchronize purchase orders and receipts
+
+The filesystem adapter discovers JSON files in `purchase_orders/` and includes POs whose order or receipt file changed since the last successful sync. The generic HTTP adapter uses `GET /purchase-orders` for a list (a JSON list or `{"purchase_orders": [...]}`) and passes an ISO-8601 `updated_since` query parameter after the first successful run; its per-PO receipt route supplies the current receipt snapshot. Both must return documents that match the project's PO and receipt JSON schemas.
+
+Run a sync manually or schedule it with cron/systemd/Docker:
+
+```bash
+invoice-match procurement-sync --adapter filesystem --directory ./ap-adapter-data
+# Or, in the Compose service configured by .env:
+docker compose exec -T api invoice-match procurement-sync
+```
+
+Each successful run upserts the latest PO and receipt snapshot and advances a per-adapter checkpoint. If one PO fails validation or its receipt fetch fails, other POs still synchronize and the checkpoint does not advance; the next run re-fetches all changes since the last fully successful run, so failed documents are retried. The CLI returns a nonzero exit code with per-PO errors. `POST /admin/procurement/sync` triggers the configured adapter from the API (admin bearer token required); integrations can read the saved snapshot from `GET /integrations/procurement/purchase-orders/{po_number}`. Schedule `procurement-sync` at the cadence appropriate for the provider; the command is intentionally a one-shot job rather than an in-process scheduler.
+
+### Process a mounted invoice inbox
+
+Place `.pdf`, `.eml`, or `.txt` invoices in the configured inbox directory. The intake command posts each file to the existing capture and extraction pipeline; invoices remain `REVIEW_REQUIRED` until a separate approver verifies the extracted fields. With Docker Compose, set `INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY` in `.env` to the host folder and `INVOICE_MATCH_INTEGRATION_TOKEN` to a token configured in `INTEGRATION_TOKENS`:
+
+```bash
+invoice-match capture-inbox --directory ./invoice-inbox --token "$INVOICE_MATCH_INTEGRATION_TOKEN"
+# With the Compose volume and environment configured:
+docker compose exec -T api invoice-match capture-inbox
+```
+
+The command processes up to 100 files per run by default (`--limit` changes this). Accepted files and duplicate uploads move to `processed/`; permanent client-side rejections and unsupported/oversized files move to `rejected/`; timeouts and server errors stay in the inbox for the next run. Content-hash deduplication in the capture API makes retries safe. A mounted object-storage or mailbox-export folder can feed the same inbox; the repository does not currently connect to a mailbox or cloud-storage API directly.
+
 The generic HTTP adapter uses this REST contract relative to `AP_ADAPTER_URL`:
 
 | Method | Path | Contract |
 | --- | --- | --- |
+| `GET` | `/purchase-orders?updated_since=<ISO-8601>` | JSON array or `{ "purchase_orders": [...] }` for incremental procurement sync; query omitted on first run |
 | `GET` | `/purchase-orders/{po_number}` | PO JSON object or `{ "purchase_order": ... }` |
 | `GET` | `/purchase-orders/{po_number}/receipts` | Receipt JSON array or `{ "receipts": [...] }` |
 | `POST` | `/invoices` | AP export JSON with `Authorization` and `Idempotency-Key` headers |
@@ -385,6 +416,8 @@ The connector queries by supplier invoice number before creating a Bill and stor
 | `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
 | `GET` | `/reviewer/captures` | Browser-based capture review inbox |
 | `GET` | `/reviewer/operations` | Operations reporting and AP export reconciliation dashboard |
+| `POST` | `/admin/procurement/sync` | Synchronize POs and receipts from the configured provider (admin token required) |
+| `GET` | `/integrations/procurement/purchase-orders/{po_number}` | Read a synchronized PO and receipt snapshot (integration token required) |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
 | `POST` | `/documents/extract` | Capture a raw PDF, email, or text invoice for extraction |
@@ -531,7 +564,11 @@ The Compose file uses development credentials. Change credentials and manage the
 | `AP_ADAPTER_URL` | unset | Base URL for the generic REST adapter |
 | `AP_ADAPTER_TOKEN` | unset | Bearer token for the generic REST adapter |
 | `AP_ADAPTER_DIRECTORY` | `./ap-adapter-data` | Filesystem adapter input and export directory |
+| `AP_PROCUREMENT_ADAPTER` | `filesystem` | Adapter used by scheduled/API procurement sync: `filesystem` or `http` |
 | `AP_DELIVERY_ADAPTER` | `filesystem` | Adapter used for operations-dashboard retries: `filesystem`, `http`, or `quickbooks` |
+| `INVOICE_MATCH_API_URL` | `http://127.0.0.1:8000` | Invoice Match API base URL used by inbox intake |
+| `INVOICE_MATCH_INTEGRATION_TOKEN` | unset | Integration token used by `capture-inbox` |
+| `INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY` | `./invoice-inbox` | Host folder mounted as the container's invoice inbox |
 | `NOTIFICATION_WEBHOOK_URL` | unset | HTTPS destination for scheduled reviewer notification delivery |
 | `NOTIFICATION_WEBHOOK_TOKEN` | unset | Optional bearer credential sent to the notification endpoint |
 | `NOTIFICATION_WEBHOOK_SECRET` | unset | Optional HMAC-SHA256 signing secret for webhook requests |
