@@ -21,14 +21,15 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 - **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
 - **Scheduled procurement sync:** Synchronize purchase orders and their receipts into the database using filesystem or generic REST adapters; reruns update the stored snapshot.
 - **Invoice inbox intake:** Poll a mounted directory of PDF, EML, and text invoices, submit each capture for OCR-assisted review, and archive accepted/duplicate files while leaving transient failures ready for retry.
-- **QuickBooks Online export:** Create mapped QuickBooks Bills with encrypted OAuth token storage, token refresh, provider-side duplicate checks, and retry-safe request IDs.
-- **Reviewer notifications:** Persist exception, reminder, and escalation events in an outbox and deliver them to an HTTPS webhook with backoff and dead-letter handling.
+- **Accounting exports:** Create mapped QuickBooks Bills or Xero Accounts Payable invoices with encrypted, refreshable OAuth tokens and provider-side duplicate checks.
+- **Durable delivery workers:** Poll AP and notification outboxes, retry with configurable exponential backoff, dead-letter exhausted deliveries, and report worker health.
 - **PDF/email capture:** Extract candidate invoice fields with confidence and require human verification before matching.
 - **Capture review inbox:** Preview source documents, inspect field confidence and extraction notes, correct invoice fields, and verify with a distinct approver.
 - **Vendor extraction profiles:** Configure supplier aliases, custom invoice labels, date formats, default currencies, and SKU aliases in YAML.
 - **Procurement edge cases:** Support cumulative partial invoices, multiple receipts, revisioned POs, credit notes, and configured unit conversions.
 - **CSV intake:** Submit line-oriented PO, receipt, and invoice CSVs through the same matching pipeline.
 - **Reviewer roles:** Separate read-only reviewers, approvers, and admins; support distinct reviewers for multi-step approval.
+- **Company isolation:** Bind reviewer and integration credentials to a company ID and scope persisted records and uniqueness rules to that company. Existing rows are assigned to `default` during migration.
 - **Audit history:** Record integration and reviewer identities, approval votes, decisions, and AP acknowledgements.
 - **Database migrations:** Evolve PostgreSQL and SQLite schemas with Alembic revisions.
 - **Persistent storage:** Use PostgreSQL in Docker Compose or SQLite for local development.
@@ -96,7 +97,7 @@ invoice-match deliver --help
 
 ### Connect to an AP provider
 
-The provider-neutral adapter contract exposes `fetch_purchase_order`, `fetch_receipts`, and `submit_invoice`. `match-ap` fetches source documents and matches a local invoice JSON file. `deliver` sends approved outbox payloads and records successes and failures; failed entries remain pending for retry, and deliveries use the match ID as their idempotency key.
+The provider-neutral adapter contract exposes `fetch_purchase_order`, `fetch_receipts`, and `submit_invoice`. `match-ap` fetches source documents and matches a local invoice JSON file. `deliver` sends approved outbox payloads and records successes and failures; failed entries are retried on a bounded exponential schedule, and deliveries use the match ID as their idempotency key. Use `invoice-match worker` or the Compose `worker` service for continuous delivery.
 
 The local filesystem adapter expects `purchase_orders/<PO_NUMBER>.json` and `receipts/<PO_NUMBER>.json` under its directory and writes payables to `invoices/<MATCH_ID>.json`:
 
@@ -366,11 +367,40 @@ Each payload contains invoice and PO identifiers, supplier, currency, cost cente
 
 ### AP delivery recovery and operations reporting
 
-Open [http://127.0.0.1:8000/reviewer/operations](http://127.0.0.1:8000/reviewer/operations) to review match rate, vendor outcomes, exception reasons, approval turnaround, overdue work, and export backlog for a date range. The export table shows attempts, most recent failure, acknowledgement state, and external accounting reference. Pending entries older than one hour are marked stalled; failed entries show their last delivery error.
+Open [http://127.0.0.1:8000/reviewer/operations](http://127.0.0.1:8000/reviewer/operations) to review match rate, vendor outcomes, exception reasons, approval turnaround, overdue work, and export backlog for a date range. The export table shows attempts, most recent failure, acknowledgement state, and external accounting reference. Pending entries older than one hour are marked stalled; failed entries show their last delivery error. The worker health endpoint reports its latest completed poll cycle.
 
-An admin can retry a pending export from this page. Set `AP_DELIVERY_ADAPTER` to the same adapter used by the worker (`filesystem`, `http`, or `quickbooks`); retries use the match ID as an idempotency key and record request, success, and failure events in the match audit trail. Acknowledged exports can be reconciled by saving the external AP/ERP reference. Integration clients can also include `{"external_reference":"AP-BILL-123"}` in the acknowledgement request so the provider reference is stored as part of the initial delivery audit.
+An admin can retry pending or dead-lettered exports from this page. Set `AP_DELIVERY_ADAPTER` to the same adapter used by the worker (`filesystem`, `http`, `quickbooks`, or `xero`); retries use the match ID as an idempotency key and record request, success, and failure events in the match audit trail. Acknowledged exports can be reconciled by saving the external AP/ERP reference. Integration clients can also include `{"external_reference":"AP-BILL-123"}` in the acknowledgement request so the provider reference is stored as part of the initial delivery audit.
 
 The report endpoint accepts optional UTC date filters, for example `GET /reviewer/reports/operations?start_date=2026-10-01&end_date=2026-10-31`. Ranges are limited to 366 days. Reviewer tokens can read reports and export state; admin tokens are required to retry deliveries or change a reconciled reference.
+
+### Configure company-scoped access
+
+Give every reviewer and integration credential an explicit `company_id` when operating more than one company. For example:
+
+```dotenv
+REVIEWER_TOKENS={"acme-reviewer":{"token":"<32+-character-secret>","roles":["reviewer"],"company_id":"acme"},"northwind-admin":{"token":"<different-32+-character-secret>","roles":["reviewer","approver","admin"],"company_id":"northwind"}}
+INTEGRATION_TOKENS={"acme-ap":{"token":"<different-32+-character-secret>","company_id":"acme"},"northwind-ap":{"token":"<another-32+-character-secret>","company_id":"northwind"}}
+```
+
+Each authenticated request is scoped to the company bound to its bearer token. The scope covers match, exception, audit, capture, procurement, rule, notification, AP outbox, and accounting credential records, including company-local uniqueness for invoice IDs and deduplication keys. Existing installations migrate their records into the `default` company; move them only after separately provisioning credentials for the intended company. The company identifier is an access boundary and should be administered like any other identity setting.
+
+### Run durable background delivery
+
+Run the worker as a separate process to poll AP and notification outboxes. The Docker Compose configuration starts it alongside the API and database:
+
+```bash
+docker compose up --build
+```
+
+For local development, start the API in one terminal and the worker in another:
+
+```bash
+invoice-match worker --interval 30 --limit 100
+```
+
+Use `--once` for a single polling cycle. The worker processes every company ID found in `REVIEWER_TOKENS` and `INTEGRATION_TOKENS`. `GET /reviewer/health/workers` reports the last successful cycle and marks stale or degraded workers; reviewer authentication is required. `/health` checks database connectivity.
+
+AP and notification retries default to eight attempts, starting at 30 seconds and doubling up to one hour. Set `AP_RETRY_MAX_ATTEMPTS`, `AP_RETRY_INITIAL_SECONDS`, and `AP_RETRY_MAX_SECONDS` or the corresponding `NOTIFICATION_RETRY_*` variables to tune those limits. Exhausted entries move to `DEAD`; an admin can inspect them and request a manual retry from the AP export dashboard. Preserve the match ID or notification dedupe key when retrying so destination adapters can avoid duplicates.
 
 ### Export approved invoices to QuickBooks Online
 
@@ -408,11 +438,30 @@ invoice-match deliver --adapter quickbooks --limit 100
 
 The connector queries by supplier invoice number before creating a Bill and stores the invoice-match ID in the QuickBooks private note. A retry for the same match returns the existing Bill instead of creating a duplicate; a Bill with that invoice number belonging to another match is rejected. A stable QBO `requestid` is also sent. Current connector scope is Bill export only: `match-ap` still needs an inbound-capable adapter for PO and receipt retrieval, and QuickBooks credit notes, PO-line linking, and account-specific tax behavior need explicit provider support before use. Test mappings and tax treatment in the QBO sandbox before enabling production delivery.
 
+### Export approved invoices to Xero
+
+Select `xero` as `AP_DELIVERY_ADAPTER`. Complete Xero OAuth authorization with `offline_access`, the Accounting API scope, and the initial tenant consent before starting delivery. Configure the client credentials, tenant ID, refresh token, and a Fernet key. The adapter rotates refresh tokens and stores them encrypted in `xero_credentials`; keep the encryption key in a secret manager. Xero refresh tokens rotate and are time-limited, so the worker must stay online to refresh before expiration. Xero's API supports `ACCPAY` invoices, `InvoiceNumbers` lookup, OAuth refresh, and `Idempotency-Key`; the adapter checks the invoice number/reference marker before creation and sends the stable match ID as the POST idempotency key. See the [Xero invoices API](https://developer.xero.com/documentation/api/accounting/invoices), [OAuth token guide](https://developer.xero.com/documentation/guides/oauth2/token-types/), and [idempotency guide](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/).
+
+Map each supplier to an existing Xero ContactID and each SKU to an existing ItemCode. Tax codes map to Xero tax types; an optional account code can be configured for expense lines. The adapter exports invoices only, not credit notes, and does not host the interactive OAuth consent flow. Validate account, tax, rounding, and mapping behavior in a Xero test organisation before enabling production delivery.
+
+```dotenv
+AP_DELIVERY_ADAPTER=xero
+XERO_CLIENT_ID=...
+XERO_CLIENT_SECRET=...
+XERO_TENANT_ID=...
+XERO_REFRESH_TOKEN=...
+XERO_TOKEN_ENCRYPTION_KEY=...
+XERO_CONTACT_ID_MAP={"ABC Supplies":"<contact-id>"}
+XERO_ITEM_CODE_MAP={"A100":"A100"}
+XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
+```
+
 ## API reference
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/health` | Service health check |
+| `GET` | `/health` | API and database readiness check |
+| `GET` | `/reviewer/health/workers` | Background worker liveness and recent cycle health (reviewer token required) |
 | `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
 | `GET` | `/reviewer/captures` | Browser-based capture review inbox |
 | `GET` | `/reviewer/operations` | Operations reporting and AP export reconciliation dashboard |
@@ -559,13 +608,13 @@ The Compose file uses development credentials. Change credentials and manage the
 | `DATABASE_URL` | `sqlite:///./invoice_match.db` | SQLAlchemy database URL |
 | `INVOICE_MATCH_RULES` | `config/rules.yaml` | YAML rules path |
 | `INVOICE_MATCH_VENDOR_PROFILES` | `config/vendor_profiles.yaml` | Supplier aliases and extraction profile YAML path |
-| `REVIEWER_TOKENS` | unset | JSON map of reviewer names to `{token, roles}`; roles: reviewer, approver, admin |
-| `INTEGRATION_TOKENS` | unset | JSON map of integration names to unique bearer tokens |
+| `REVIEWER_TOKENS` | unset | JSON map of reviewer names to `{token, roles, company_id}`; `company_id` defaults to `default` |
+| `INTEGRATION_TOKENS` | unset | JSON map of integration names to unique bearer tokens or `{token, company_id}` objects |
 | `AP_ADAPTER_URL` | unset | Base URL for the generic REST adapter |
 | `AP_ADAPTER_TOKEN` | unset | Bearer token for the generic REST adapter |
 | `AP_ADAPTER_DIRECTORY` | `./ap-adapter-data` | Filesystem adapter input and export directory |
 | `AP_PROCUREMENT_ADAPTER` | `filesystem` | Adapter used by scheduled/API procurement sync: `filesystem` or `http` |
-| `AP_DELIVERY_ADAPTER` | `filesystem` | Adapter used for operations-dashboard retries: `filesystem`, `http`, or `quickbooks` |
+| `AP_DELIVERY_ADAPTER` | `filesystem` | Adapter used for operations-dashboard retries: `filesystem`, `http`, `quickbooks`, or `xero` |
 | `INVOICE_MATCH_API_URL` | `http://127.0.0.1:8000` | Invoice Match API base URL used by inbox intake |
 | `INVOICE_MATCH_INTEGRATION_TOKEN` | unset | Integration token used by `capture-inbox` |
 | `INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY` | `./invoice-inbox` | Host folder mounted as the container's invoice inbox |
@@ -582,6 +631,14 @@ The Compose file uses development credentials. Change credentials and manage the
 | `QBO_AP_ACCOUNT_ID` | unset | Explicit accounts-payable account ID for companies with multiple AP accounts |
 | `QBO_FREIGHT_ACCOUNT_ID` / `QBO_DISCOUNT_ACCOUNT_ID` | unset | Existing expense account IDs for invoices carrying those amounts |
 | `QBO_TIMEOUT_SECONDS` / `QBO_MINOR_VERSION` | `20` / provider default | QuickBooks request timeout and optional API minor version |
+| `AP_RETRY_MAX_ATTEMPTS` / `AP_RETRY_INITIAL_SECONDS` / `AP_RETRY_MAX_SECONDS` | `8` / `30` / `3600` | AP worker retry limit and bounded exponential backoff |
+| `NOTIFICATION_RETRY_MAX_ATTEMPTS` / `NOTIFICATION_RETRY_INITIAL_SECONDS` / `NOTIFICATION_RETRY_MAX_SECONDS` | `8` / `30` / `3600` | Notification retry limit and bounded exponential backoff |
+| `XERO_CLIENT_ID` / `XERO_CLIENT_SECRET` | unset | Xero OAuth application credentials |
+| `XERO_TENANT_ID` / `XERO_REFRESH_TOKEN` | unset | Connected Xero organisation and initial refresh token |
+| `XERO_TOKEN_ENCRYPTION_KEY` | unset | Fernet key used to encrypt Xero OAuth tokens at rest |
+| `XERO_CONTACT_ID_MAP` / `XERO_ITEM_CODE_MAP` / `XERO_TAX_TYPE_MAP` | `{}` | JSON supplier, SKU, and tax mappings for Xero |
+| `XERO_EXPENSE_ACCOUNT_CODE` | unset | Optional Xero expense account code for invoice lines |
+| `DELIVERY_WORKER_NAME` | `invoice-match-worker` | Worker heartbeat identity |
 
 Example PostgreSQL URL:
 
@@ -593,7 +650,7 @@ alembic upgrade head
 invoice-match serve
 ```
 
-Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, notification delivery state in `notification_outbox`, and encrypted QuickBooks OAuth tokens in `quickbooks_credentials`.
+Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, notification delivery state in `notification_outbox`, encrypted QuickBooks and Xero OAuth tokens in their credential tables, and worker liveness in `worker_heartbeats`. Migration `0007_company_delivery_xero` adds per-company data boundaries and retry scheduling; pre-existing data is assigned to `default`.
 
 ## Project layout
 
@@ -627,11 +684,11 @@ pytest
 invoice-match --help
 ```
 
-The automated suite covers matching and financial calculations, cumulative partial invoices, PO revisions, units and credit notes, adapter retries, PDF/email capture and verification, idempotent submissions, CSV validation, approval workflows, and audit history.
+The automated suite covers matching and financial calculations, cumulative partial invoices, PO revisions, units and credit notes, adapter retries and dead letters, company data isolation, PDF/email capture and verification, idempotent submissions, CSV validation, approval workflows, and audit history.
 
 ## Security and scope
 
-Reviewer read, audit, and queue routes require reviewer tokens; approve and reject routes additionally require the `approver` or `admin` role. Integration submission and AP outbox routes require tokens from `INTEGRATION_TOKENS`; `/health` is public. Store tokens in a secret manager in deployed environments and rotate them when access changes. The example PostgreSQL credentials in Docker Compose are for local development only.
+Reviewer read, audit, queue, and worker-health routes require reviewer tokens; approve and reject routes additionally require the `approver` or `admin` role. Integration submission and AP outbox routes require tokens from `INTEGRATION_TOKENS`; `/health` is public. Store tokens in a secret manager in deployed environments and rotate them when access changes. The example PostgreSQL credentials in Docker Compose are for local development only.
 
 Captured source documents are stored in the application database; apply access controls, encryption, backups, and retention policies appropriate for financial records. OCR depends on local Poppler and Tesseract binaries and remains subject to human review. Vendor profiles are operator-maintained extraction hints, not a general-purpose OCR model. The HTTP adapter defines a generic REST shape rather than a vendor-certified connector. The project does not initiate payments or fetch live exchange rates. Review tolerances, tax assumptions, unit families, and rates against your accounting policy before processing live invoices.
 

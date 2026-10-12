@@ -4,7 +4,8 @@ import os
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, String, create_engine, text
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker, with_loader_criteria
+from sqlalchemy import event
 
 
 def _database_url() -> str:
@@ -27,10 +28,41 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class MatchRecord(Base):
+class CompanyScoped:
+    company_id: Mapped[str] = mapped_column(String(100), default="default", server_default="default", index=True)
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _scope_company_queries(execute_state) -> None:
+    company_id = execute_state.session.info.get("company_id", "default")
+    if execute_state.is_select:
+        execute_state.statement = execute_state.statement.options(
+            with_loader_criteria(
+                CompanyScoped,
+                lambda model: model.company_id == company_id,
+                include_aliases=True,
+            )
+        )
+
+
+@event.listens_for(Session, "before_flush")
+def _assign_company_id(session, flush_context, instances) -> None:
+    company_id = session.info.get("company_id", "default")
+    for obj in session.new:
+        if isinstance(obj, CompanyScoped):
+            if obj.company_id not in (None, "default", company_id):
+                raise ValueError("Cannot create a record for another company")
+            obj.company_id = company_id
+    for obj in session.dirty:
+        if isinstance(obj, CompanyScoped) and obj.company_id != company_id:
+            raise ValueError("Cannot modify a record for another company")
+
+
+class MatchRecord(CompanyScoped, Base):
     __tablename__ = "matches"
     __table_args__ = (
-        Index("uq_matches_vendor_invoice_number", "vendor_key", "invoice_number_key", unique=True),
+        Index("uq_matches_vendor_invoice_number", "company_id", "vendor_key", "invoice_number_key", unique=True),
+        Index("ix_matches_idempotency_key", "company_id", "idempotency_key", unique=True),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -42,7 +74,7 @@ class MatchRecord(Base):
     vendor_key: Mapped[str] = mapped_column(String(255))
     reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
     invoice_number_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True, index=True, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     cost_center: Mapped[str | None] = mapped_column(String(100), nullable=True)
     approval_policy: Mapped[str] = mapped_column(String(100), default="default")
@@ -60,7 +92,7 @@ class MatchRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class ExceptionRecord(Base):
+class ExceptionRecord(CompanyScoped, Base):
     __tablename__ = "exceptions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -73,7 +105,7 @@ class ExceptionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class AuditEvent(Base):
+class AuditEvent(CompanyScoped, Base):
     __tablename__ = "audit_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -84,26 +116,28 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class APOutboxRecord(Base):
+class APOutboxRecord(CompanyScoped, Base):
     __tablename__ = "ap_outbox"
 
     match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), primary_key=True)
     payload: Mapped[dict] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     external_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class CapturedDocumentRecord(Base):
+class CapturedDocumentRecord(CompanyScoped, Base):
     __tablename__ = "captured_documents"
+    __table_args__ = (Index("ix_captured_documents_source_sha256", "company_id", "source_sha256", unique=True),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     filename: Mapped[str] = mapped_column(String(255))
     content_type: Mapped[str] = mapped_column(String(100))
-    source_sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    source_sha256: Mapped[str] = mapped_column(String(64))
     source_data: Mapped[bytes] = mapped_column(LargeBinary)
     status: Mapped[str] = mapped_column(String(24), default="REVIEW_REQUIRED", index=True)
     extracted_fields: Mapped[dict] = mapped_column(JSON)
@@ -116,9 +150,10 @@ class CapturedDocumentRecord(Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class ProcurementRecord(Base):
+class ProcurementRecord(CompanyScoped, Base):
     __tablename__ = "procurement_records"
 
+    company_id: Mapped[str] = mapped_column(String(100), default="default", server_default="default", primary_key=True, index=True)
     po_number: Mapped[str] = mapped_column(String(100), primary_key=True)
     purchase_order: Mapped[dict] = mapped_column(JSON)
     receipts: Mapped[list] = mapped_column(JSON, default=list)
@@ -126,16 +161,17 @@ class ProcurementRecord(Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class ProcurementSyncState(Base):
+class ProcurementSyncState(CompanyScoped, Base):
     __tablename__ = "procurement_sync_state"
 
+    company_id: Mapped[str] = mapped_column(String(100), default="default", server_default="default", primary_key=True, index=True)
     source_adapter: Mapped[str] = mapped_column(String(40), primary_key=True)
     last_successful_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_summary: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-class DocumentCaptureEvent(Base):
+class DocumentCaptureEvent(CompanyScoped, Base):
     __tablename__ = "document_capture_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -146,20 +182,21 @@ class DocumentCaptureEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class RuleVersionRecord(Base):
+class RuleVersionRecord(CompanyScoped, Base):
     __tablename__ = "rule_versions"
     __table_args__ = (
         Index(
             "uq_rule_versions_single_active",
-            "status",
+            "company_id", "status",
             unique=True,
             sqlite_where=text("status = 'ACTIVE'"),
             postgresql_where=text("status = 'ACTIVE'"),
         ),
+        Index("ix_rule_versions_version", "company_id", "version", unique=True),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    version: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    version: Mapped[int] = mapped_column(Integer)
     digest: Mapped[str] = mapped_column(String(64), index=True)
     content: Mapped[str] = mapped_column(String)
     snapshot: Mapped[dict] = mapped_column(JSON)
@@ -170,7 +207,7 @@ class RuleVersionRecord(Base):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class RuleVersionEvent(Base):
+class RuleVersionEvent(CompanyScoped, Base):
     __tablename__ = "rule_version_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -181,12 +218,13 @@ class RuleVersionEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class NotificationOutboxRecord(Base):
+class NotificationOutboxRecord(CompanyScoped, Base):
     __tablename__ = "notification_outbox"
+    __table_args__ = (Index("ix_notification_outbox_dedupe_key", "company_id", "dedupe_key", unique=True),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), index=True)
-    dedupe_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255))
     event_type: Mapped[str] = mapped_column(String(40), index=True)
     channel: Mapped[str] = mapped_column(String(24), default="webhook")
     payload: Mapped[dict] = mapped_column(JSON)
@@ -199,7 +237,7 @@ class NotificationOutboxRecord(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class QuickBooksCredentialRecord(Base):
+class QuickBooksCredentialRecord(CompanyScoped, Base):
     __tablename__ = "quickbooks_credentials"
 
     realm_id: Mapped[str] = mapped_column(String(100), primary_key=True)
@@ -207,3 +245,26 @@ class QuickBooksCredentialRecord(Base):
     encrypted_refresh_token: Mapped[str] = mapped_column(String)
     access_token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class XeroCredentialRecord(CompanyScoped, Base):
+    __tablename__ = "xero_credentials"
+
+    company_id: Mapped[str] = mapped_column(String(100), default="default", server_default="default", primary_key=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    encrypted_access_token: Mapped[str] = mapped_column(String)
+    encrypted_refresh_token: Mapped[str] = mapped_column(String)
+    access_token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class WorkerHeartbeatRecord(CompanyScoped, Base):
+    __tablename__ = "worker_heartbeats"
+    __table_args__ = (Index("uq_worker_heartbeats_company_name", "company_id", "worker_name", unique=True),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    worker_name: Mapped[str] = mapped_column(String(100))
+    poll_interval_seconds: Mapped[int] = mapped_column(Integer, default=30)
+    last_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_succeeded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)

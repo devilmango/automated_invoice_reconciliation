@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .adapters.base import PayablesDeliveryAdapter
 from .database import APOutboxRecord, AuditEvent
+
+MAX_AP_ATTEMPTS = 8
 
 
 def deliver_match(session: Session, adapter: PayablesDeliveryAdapter, match_id: str) -> dict:
@@ -16,8 +18,9 @@ def deliver_match(session: Session, adapter: PayablesDeliveryAdapter, match_id: 
     )
     if record is None:
         raise LookupError("AP outbox item not found")
-    if record.state != "PENDING":
+    if record.state not in {"PENDING", "DEAD"}:
         raise ValueError("AP outbox item is already acknowledged")
+    record.state = "PENDING"
     record.attempt_count += 1
     session.commit()
     try:
@@ -25,6 +28,13 @@ def deliver_match(session: Session, adapter: PayablesDeliveryAdapter, match_id: 
     except Exception as exc:
         record = session.get(APOutboxRecord, match_id)
         record.last_error = str(exc)[:1000]
+        if record.attempt_count >= MAX_AP_ATTEMPTS:
+            record.state = "DEAD"
+            record.next_attempt_at = None
+        else:
+            record.next_attempt_at = datetime.now(timezone.utc) + timedelta(
+                seconds=min(3600, 30 * (2 ** (record.attempt_count - 1)))
+            )
         session.add(AuditEvent(
             match_id=match_id,
             event_type="AP_EXPORT_FAILED",
@@ -38,6 +48,7 @@ def deliver_match(session: Session, adapter: PayablesDeliveryAdapter, match_id: 
         record.acknowledged_at = datetime.now(timezone.utc)
         record.external_reference = reference[:255] if reference else None
         record.last_error = None
+        record.next_attempt_at = None
         session.add(AuditEvent(
             match_id=match_id,
             event_type="AP_EXPORT_ACKNOWLEDGED",
@@ -57,49 +68,69 @@ def deliver_match(session: Session, adapter: PayablesDeliveryAdapter, match_id: 
     }
 
 
-def deliver_pending(session: Session, adapter: PayablesDeliveryAdapter, *, limit: int = 100) -> dict:
-    """Send pending outbox payloads and persist success/failure for each item."""
-    match_ids = session.scalars(
-        select(APOutboxRecord.match_id)
-        .where(APOutboxRecord.state == "PENDING")
-        .order_by(APOutboxRecord.created_at.asc())
-        .limit(limit)
-    ).all()
-    session.commit()
-    summary = {"adapter": adapter.name, "acknowledged": 0, "failed": 0, "items": []}
-    for match_id in match_ids:
-        record = session.get(APOutboxRecord, match_id)
-        if record is None or record.state != "PENDING":
-            continue
+def deliver_pending(
+    session: Session,
+    adapter: PayablesDeliveryAdapter,
+    *,
+    limit: int = 100,
+    now: datetime | None = None,
+    max_attempts: int = MAX_AP_ATTEMPTS,
+    initial_retry_seconds: int = 30,
+    max_retry_seconds: int = 3600,
+) -> dict:
+    """Deliver due AP entries with bounded exponential retry and a dead-letter state."""
+    current = now or datetime.now(timezone.utc)
+    summary = {"adapter": adapter.name, "acknowledged": 0, "failed": 0,
+               "dead_lettered": 0, "items": []}
+    while len(summary["items"]) < limit:
+        record = session.scalar(
+            select(APOutboxRecord).where(
+                APOutboxRecord.state == "PENDING",
+                (APOutboxRecord.next_attempt_at.is_(None)
+                 | (APOutboxRecord.next_attempt_at <= current)),
+            ).order_by(APOutboxRecord.created_at.asc()).limit(1).with_for_update(skip_locked=True)
+        )
+        if record is None:
+            break
         record.attempt_count += 1
         try:
-            reference = adapter.submit_invoice(record.payload, idempotency_key=match_id)
-        except Exception as exc:  # Adapter failures are stored so operators can retry later.
+            reference = adapter.submit_invoice(record.payload, idempotency_key=record.match_id)
+        except Exception as exc:
             record.last_error = str(exc)[:1000]
+            if record.attempt_count >= max_attempts:
+                record.state = "DEAD"
+                record.next_attempt_at = None
+                summary["dead_lettered"] += 1
+            else:
+                delay_seconds = min(max_retry_seconds, initial_retry_seconds * (2 ** (record.attempt_count - 1)))
+                record.next_attempt_at = current + timedelta(seconds=delay_seconds)
+                summary["failed"] += 1
             session.add(AuditEvent(
-                match_id=match_id,
+                match_id=record.match_id,
                 event_type="AP_EXPORT_FAILED",
                 actor=f"adapter:{adapter.name}",
-                details={"attempt": record.attempt_count, "error": record.last_error},
+                details={"attempt": record.attempt_count, "state": record.state,
+                         "retry_at": record.next_attempt_at.isoformat() if record.next_attempt_at else None,
+                         "error": record.last_error},
             ))
-            summary["failed"] += 1
-            summary["items"].append({"match_id": match_id, "state": "FAILED", "error": record.last_error})
+            summary["items"].append({"match_id": record.match_id, "state": record.state,
+                                     "error": record.last_error,
+                                     "retry_at": record.next_attempt_at.isoformat() if record.next_attempt_at else None})
         else:
             record.state = "ACKNOWLEDGED"
-            record.acknowledged_at = datetime.now(timezone.utc)
+            record.acknowledged_at = current
             record.external_reference = reference[:255] if reference else None
             record.last_error = None
+            record.next_attempt_at = None
             session.add(AuditEvent(
-                match_id=match_id,
+                match_id=record.match_id,
                 event_type="AP_EXPORT_ACKNOWLEDGED",
                 actor=f"adapter:{adapter.name}",
-                details={"external_reference": record.external_reference},
+                details={"external_reference": record.external_reference,
+                         "attempt": record.attempt_count},
             ))
             summary["acknowledged"] += 1
-            summary["items"].append({
-                "match_id": match_id,
-                "state": "ACKNOWLEDGED",
-                "external_reference": record.external_reference,
-            })
+            summary["items"].append({"match_id": record.match_id, "state": "ACKNOWLEDGED",
+                                     "external_reference": record.external_reference})
         session.commit()
     return summary

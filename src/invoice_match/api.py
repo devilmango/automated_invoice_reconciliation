@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,7 @@ from .database import (
     RuleVersionEvent,
     RuleVersionRecord,
     SessionLocal,
+    WorkerHeartbeatRecord,
 )
 from .document_capture import extract_document
 from .integration_auth import require_integration
@@ -72,8 +73,13 @@ app = FastAPI(
 )
 
 
-def get_session():
+def get_session(request: Request):
+    from .integration_auth import company_for_token
+
+    authorization = request.headers.get("authorization", "")
+    token = authorization.split(None, 1)[1] if authorization.lower().startswith("bearer ") else None
     with SessionLocal() as session:
+        session.info["company_id"] = company_for_token(token)
         yield session
 
 
@@ -362,8 +368,40 @@ def _submit_match(
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(session: Session = Depends(get_session)):
+    try:
+        session.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database is unavailable") from exc
+    return {"status": "ok", "database": "ok"}
+
+
+@app.get("/reviewer/health/workers")
+def worker_health(
+    session: Session = Depends(get_session),
+    reviewer: Principal = Depends(require_reviewer),
+):
+    now = datetime.now(timezone.utc)
+    workers = session.scalars(select(WorkerHeartbeatRecord).order_by(
+        WorkerHeartbeatRecord.worker_name.asc()
+    )).all()
+    results = []
+    for worker in workers:
+        succeeded = worker.last_succeeded_at
+        if succeeded and succeeded.tzinfo is None:
+            succeeded = succeeded.replace(tzinfo=timezone.utc)
+        threshold = max(60, worker.poll_interval_seconds * 3)
+        healthy = succeeded is not None and (now - succeeded).total_seconds() <= threshold
+        results.append({
+            "worker": worker.worker_name,
+            "status": "DEGRADED" if worker.last_error else ("HEALTHY" if healthy else "STALE"),
+            "last_started_at": _timestamp(worker.last_started_at),
+            "last_succeeded_at": _timestamp(worker.last_succeeded_at),
+            "last_error": worker.last_error,
+            "poll_interval_seconds": worker.poll_interval_seconds,
+        })
+    return {"status": "ok" if all(row["status"] == "HEALTHY" for row in results) else "degraded",
+            "workers": results}
 
 
 @app.get("/reviewer", include_in_schema=False)
@@ -388,7 +426,7 @@ def synchronize_procurement(
 ):
     adapter_name = os.getenv("AP_PROCUREMENT_ADAPTER", "filesystem")
     try:
-        adapter = create_adapter(adapter_name)
+        adapter = create_adapter(adapter_name, company_id=session.info.get("company_id", "default"))
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=f"Procurement adapter is unavailable: {exc}") from exc
     if not callable(getattr(adapter, "list_purchase_orders", None)) or not callable(
@@ -404,7 +442,7 @@ def get_synced_procurement(
     session: Session = Depends(get_session),
     integration: str = Depends(require_integration),
 ):
-    record = session.get(ProcurementRecord, po_number)
+    record = session.get(ProcurementRecord, (session.info.get("company_id", "default"), po_number))
     if record is None:
         raise HTTPException(status_code=404, detail="Purchase order has not been synchronized")
     return {
@@ -1011,7 +1049,11 @@ def list_ap_outbox(
     integration: str = Depends(require_integration),
 ):
     items = session.scalars(select(APOutboxRecord)
-        .where(APOutboxRecord.state == "PENDING")
+        .where(
+            APOutboxRecord.state == "PENDING",
+            (APOutboxRecord.next_attempt_at.is_(None)
+             | (APOutboxRecord.next_attempt_at <= datetime.now(timezone.utc))),
+        )
         .order_by(APOutboxRecord.created_at.asc())
         .limit(limit)).all()
     return [APOutboxItem(
@@ -1021,6 +1063,7 @@ def list_ap_outbox(
         acknowledged_at=_timestamp(item.acknowledged_at),
         payload=item.payload,
         attempt_count=item.attempt_count,
+        next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
     ) for item in items]
@@ -1040,6 +1083,7 @@ def acknowledge_ap_outbox(
         raise HTTPException(status_code=409, detail="AP outbox item has already been acknowledged")
     item.state = "ACKNOWLEDGED"
     item.acknowledged_at = datetime.now(timezone.utc)
+    item.next_attempt_at = None
     if body and body.external_reference:
         item.external_reference = body.external_reference
     session.add(AuditEvent(
@@ -1056,6 +1100,7 @@ def acknowledge_ap_outbox(
         acknowledged_at=_timestamp(item.acknowledged_at),
         payload=item.payload,
         attempt_count=item.attempt_count,
+        next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
     )
@@ -1063,7 +1108,7 @@ def acknowledge_ap_outbox(
 
 @app.get("/reviewer/ap-outbox", response_model=list[ReviewerAPOutboxItem])
 def reviewer_ap_outbox(
-    state: str = Query(default="ALL", pattern="^(PENDING|ACKNOWLEDGED|ALL)$"),
+    state: str = Query(default="ALL", pattern="^(PENDING|ACKNOWLEDGED|DEAD|ALL)$"),
     limit: int = Query(default=500, ge=1, le=1000),
     session: Session = Depends(get_session),
     reviewer: Principal = Depends(require_reviewer),
@@ -1084,6 +1129,7 @@ def reviewer_ap_outbox(
         created_at=_timestamp(item.created_at),
         acknowledged_at=_timestamp(item.acknowledged_at),
         attempt_count=item.attempt_count,
+        next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
     ) for item, match in rows]
@@ -1098,11 +1144,11 @@ def retry_ap_outbox(
     item = session.get(APOutboxRecord, match_id)
     if item is None:
         raise HTTPException(status_code=404, detail="AP outbox item not found")
-    if item.state != "PENDING":
-        raise HTTPException(status_code=409, detail="Only pending AP exports can be retried")
+    if item.state not in {"PENDING", "DEAD"}:
+        raise HTTPException(status_code=409, detail="Only pending or dead-lettered AP exports can be retried")
     adapter_name = os.getenv("AP_DELIVERY_ADAPTER", "filesystem")
     try:
-        adapter = create_adapter(adapter_name)
+        adapter = create_adapter(adapter_name, company_id=session.info.get("company_id", "default"))
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=f"AP delivery adapter is unavailable: {exc}") from exc
     session.add(AuditEvent(
@@ -1170,6 +1216,7 @@ def reconcile_ap_reference(
         created_at=_timestamp(item.created_at),
         acknowledged_at=_timestamp(item.acknowledged_at),
         attempt_count=item.attempt_count,
+        next_attempt_at=_timestamp(item.next_attempt_at),
         last_error=item.last_error,
         external_reference=item.external_reference,
     )

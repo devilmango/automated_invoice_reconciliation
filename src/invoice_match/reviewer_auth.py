@@ -16,6 +16,7 @@ _REVIEWER_ROLES = {"reviewer", "approver", "admin"}
 class Principal:
     name: str
     roles: frozenset[str]
+    company_id: str = "default"
 
 
 def _reviewers() -> dict[str, dict]:
@@ -38,9 +39,12 @@ def _reviewers() -> dict[str, dict]:
         if not isinstance(name, str) or not name.strip() or not isinstance(entry, dict):
             _invalid_configuration()
         token, roles = entry.get("token"), entry.get("roles")
+        company_id = entry.get("company_id", entry.get("company", "default"))
         if (
             not isinstance(token, str)
             or len(token) < 32
+            or not isinstance(company_id, str)
+            or not company_id.strip()
             or not isinstance(roles, list)
             or not roles
             or any(not isinstance(role, str) or role not in _REVIEWER_ROLES for role in roles)
@@ -83,7 +87,8 @@ def authenticate_reviewer(
             headers={"WWW-Authenticate": "Bearer"},
         )
     name, entry = matched[0]
-    return Principal(name=name, roles=frozenset(entry["roles"]))
+    return Principal(name=name, roles=frozenset(entry["roles"]),
+                     company_id=entry.get("company_id", entry.get("company", "default")))
 
 
 def require_reviewer(principal: Principal = Depends(authenticate_reviewer)) -> Principal:

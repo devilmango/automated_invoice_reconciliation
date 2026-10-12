@@ -251,18 +251,19 @@ class APExportPayload(StrictModel):
 
 class APOutboxItem(StrictModel):
     match_id: str
-    state: Literal["PENDING", "ACKNOWLEDGED"]
+    state: Literal["PENDING", "ACKNOWLEDGED", "DEAD"]
     created_at: str
     acknowledged_at: str | None = None
     payload: APExportPayload
     attempt_count: int = 0
+    next_attempt_at: str | None = None
     last_error: str | None = None
     external_reference: str | None = None
 
 
 class ReviewerAPOutboxItem(StrictModel):
     match_id: str
-    state: Literal["PENDING", "ACKNOWLEDGED"]
+    state: Literal["PENDING", "ACKNOWLEDGED", "DEAD"]
     vendor: str
     invoice_number: str | None = None
     currency: str
@@ -270,6 +271,7 @@ class ReviewerAPOutboxItem(StrictModel):
     created_at: str
     acknowledged_at: str | None = None
     attempt_count: int
+    next_attempt_at: str | None = None
     last_error: str | None = None
     external_reference: str | None = None
 
@@ -285,7 +287,7 @@ class APReferenceReconciliation(StrictModel):
 
 class ReviewerAPOutboxItem(StrictModel):
     match_id: str
-    state: Literal["PENDING", "ACKNOWLEDGED"]
+    state: Literal["PENDING", "ACKNOWLEDGED", "DEAD"]
     vendor: str
     invoice_number: str | None = None
     currency: str
@@ -293,6 +295,7 @@ class ReviewerAPOutboxItem(StrictModel):
     created_at: str
     acknowledged_at: str | None = None
     attempt_count: int
+    next_attempt_at: str | None = None
     last_error: str | None = None
     external_reference: str | None = None
 

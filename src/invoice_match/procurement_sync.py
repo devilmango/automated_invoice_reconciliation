@@ -11,7 +11,8 @@ from .schemas import PurchaseOrder, ReceiptDocument
 def sync_procurement(session: Session, adapter) -> dict:
     """Fetch the provider's current PO/receipt snapshot and persist valid records."""
     now = datetime.now(timezone.utc)
-    state = session.get(ProcurementSyncState, adapter.name)
+    company_id = session.info.get("company_id", "default")
+    state = session.get(ProcurementSyncState, (company_id, adapter.name))
     if state is None:
         state = ProcurementSyncState(source_adapter=adapter.name)
         session.add(state)
@@ -53,7 +54,7 @@ def sync_procurement(session: Session, adapter) -> dict:
                     ReceiptDocument.model_validate(receipt).model_dump(mode="json")
                     for receipt in raw_receipts
                 ]
-                record = session.get(ProcurementRecord, number)
+                record = session.get(ProcurementRecord, (company_id, number))
                 if record is None:
                     record = ProcurementRecord(po_number=number)
                     session.add(record)

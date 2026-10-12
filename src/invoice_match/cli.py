@@ -86,6 +86,7 @@ def match_from_ap(
 
 @app.command("procurement-sync")
 def procurement_sync(
+    company_id: str = typer.Option("default", help="Company scope for this sync run."),
     adapter: str = typer.Option(None, help="Source adapter; defaults to AP_PROCUREMENT_ADAPTER or filesystem."),
     directory: Path | None = typer.Option(None, help="Filesystem adapter fixture directory."),
     endpoint: str | None = typer.Option(None, help="Generic HTTP adapter base URL."),
@@ -103,12 +104,14 @@ def procurement_sync(
             directory=str(directory) if directory else None,
             endpoint=endpoint,
             token=token,
+            company_id=company_id,
         )
         if not callable(getattr(provider, "list_purchase_orders", None)) or not callable(
             getattr(provider, "fetch_receipts", None)
         ):
             raise ValueError(f"The {adapter_name!r} adapter cannot sync procurement documents")
         with SessionLocal() as session:
+            session.info["company_id"] = company_id
             summary = run_sync(session, provider)
     except (ValueError, RuntimeError) as exc:
         typer.echo(str(exc), err=True)
@@ -227,6 +230,7 @@ def _archive_capture(source: Path, destination: Path) -> None:
 
 @app.command()
 def deliver(
+    company_id: str = typer.Option("default", help="Company scope for this delivery run."),
     adapter: str = typer.Option("filesystem", help="AP adapter: filesystem, http, or quickbooks."),
     directory: Path | None = typer.Option(None, help="Filesystem adapter fixture/export directory."),
     endpoint: str | None = typer.Option(None, help="Generic HTTP adapter base URL."),
@@ -240,17 +244,24 @@ def deliver(
 
     try:
         provider = create_adapter(adapter, directory=str(directory) if directory else None,
-                                  endpoint=endpoint, token=token)
+                                  endpoint=endpoint, token=token, company_id=company_id)
     except ValueError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     with SessionLocal() as session:
-        summary = deliver_pending(session, provider, limit=limit)
+        session.info["company_id"] = company_id
+        summary = deliver_pending(
+            session, provider, limit=limit,
+            max_attempts=int(os.getenv("AP_RETRY_MAX_ATTEMPTS", "8")),
+            initial_retry_seconds=int(os.getenv("AP_RETRY_INITIAL_SECONDS", "30")),
+            max_retry_seconds=int(os.getenv("AP_RETRY_MAX_SECONDS", "3600")),
+        )
     typer.echo(json.dumps(summary, indent=2))
 
 
 @app.command("notifications-run")
 def notifications_run(
+    company_id: str = typer.Option("default", help="Company scope for this notification run."),
     window_hours: int = typer.Option(24, min=1, max=720,
                                      help="Notify reviewers this long before due time."),
     limit: int = typer.Option(100, min=1, max=1000,
@@ -280,12 +291,18 @@ def notifications_run(
         raise typer.Exit(code=1) from exc
 
     with SessionLocal() as session:
+        session.info["company_id"] = company_id
         escalated = escalate_overdue(
             session, actor=os.getenv("NOTIFICATION_WORKER_NAME", "scheduler")
         )
         reminders = queue_due_reminders(session, window_hours=window_hours)
         session.commit()
-        delivery = deliver_pending_notifications(session, adapter, limit=limit)
+        delivery = deliver_pending_notifications(
+            session, adapter, limit=limit,
+            max_attempts=int(os.getenv("NOTIFICATION_RETRY_MAX_ATTEMPTS", "8")),
+            initial_retry_seconds=int(os.getenv("NOTIFICATION_RETRY_INITIAL_SECONDS", "30")),
+            max_retry_seconds=int(os.getenv("NOTIFICATION_RETRY_MAX_SECONDS", "3600")),
+        )
     typer.echo(json.dumps({
         "escalated_match_ids": escalated,
         "reminders_queued": len(reminders),
@@ -301,6 +318,87 @@ def parse_purchase_order_data(data: dict):
     if "purchase_order" in data:
         data = data["purchase_order"]
     return PurchaseOrder.model_validate(data)
+
+
+@app.command()
+def worker(
+    interval: int = typer.Option(30, min=1, max=3600, help="Seconds between durable outbox polling runs."),
+    limit: int = typer.Option(100, min=1, max=1000, help="Maximum records per outbox per company per cycle."),
+    once: bool = typer.Option(False, help="Run one polling cycle and exit."),
+):
+    """Poll AP and notification outboxes with bounded retries and dead-letter handling."""
+    import time
+    from .adapters import create_adapter
+    from sqlalchemy import select
+    from datetime import datetime, timezone
+    from .database import SessionLocal, WorkerHeartbeatRecord
+    from .delivery import deliver_pending
+    from .integration_auth import configured_company_ids
+    from .notification_delivery import (
+        WebhookNotificationAdapter, deliver_pending_notifications,
+        escalate_overdue, queue_due_reminders,
+    )
+
+    adapter_name = os.getenv("AP_DELIVERY_ADAPTER", "filesystem")
+    ap_attempts = int(os.getenv("AP_RETRY_MAX_ATTEMPTS", "8"))
+    ap_initial = int(os.getenv("AP_RETRY_INITIAL_SECONDS", "30"))
+    ap_max = int(os.getenv("AP_RETRY_MAX_SECONDS", "3600"))
+    notification_attempts = int(os.getenv("NOTIFICATION_RETRY_MAX_ATTEMPTS", "8"))
+    notification_initial = int(os.getenv("NOTIFICATION_RETRY_INITIAL_SECONDS", "30"))
+    notification_max = int(os.getenv("NOTIFICATION_RETRY_MAX_SECONDS", "3600"))
+    worker_name = os.getenv("DELIVERY_WORKER_NAME", "invoice-match-worker")
+    notification_endpoint = os.getenv("NOTIFICATION_WEBHOOK_URL")
+    notification_adapter = None
+    if notification_endpoint:
+        notification_adapter = WebhookNotificationAdapter(
+            notification_endpoint, token=os.getenv("NOTIFICATION_WEBHOOK_TOKEN"),
+            secret=os.getenv("NOTIFICATION_WEBHOOK_SECRET"),
+        )
+    companies = configured_company_ids()
+    while True:
+        cycle = []
+        for company_id in companies:
+            provider = create_adapter(adapter_name, company_id=company_id)
+            with SessionLocal() as session:
+                session.info["company_id"] = company_id
+                ap = deliver_pending(session, provider, limit=limit, max_attempts=ap_attempts,
+                                     initial_retry_seconds=ap_initial, max_retry_seconds=ap_max)
+                notifications = {"delivered": 0, "failed": 0, "dead_lettered": 0}
+                if notification_adapter:
+                    escalated = escalate_overdue(
+                        session, actor=os.getenv("NOTIFICATION_WORKER_NAME", "worker")
+                    )
+                    reminders = queue_due_reminders(session)
+                    session.commit()
+                    notifications = deliver_pending_notifications(
+                        session, notification_adapter, limit=limit,
+                        max_attempts=notification_attempts,
+                        initial_retry_seconds=notification_initial,
+                        max_retry_seconds=notification_max,
+                    )
+                    notifications["escalated"] = len(escalated)
+                    notifications["reminders_queued"] = len(reminders)
+                now = datetime.now(timezone.utc)
+                heartbeat = session.scalar(select(WorkerHeartbeatRecord).where(
+                    WorkerHeartbeatRecord.worker_name == worker_name
+                ))
+                if heartbeat is None:
+                    heartbeat = WorkerHeartbeatRecord(worker_name=worker_name,
+                        poll_interval_seconds=interval, last_started_at=now)
+                    session.add(heartbeat)
+                heartbeat.poll_interval_seconds = interval
+                heartbeat.last_started_at = now
+                heartbeat.last_succeeded_at = now
+                failures = ap.get("failed", 0) + ap.get("dead_lettered", 0) \
+                    + notifications.get("failed", 0) + notifications.get("dead_lettered", 0)
+                heartbeat.last_error = f"{failures} delivery attempt(s) failed or dead-lettered" if failures else None
+                session.commit()
+                cycle.append({"company_id": company_id, "ap": ap, "notifications": notifications,
+                              "health": "DEGRADED" if failures else "HEALTHY"})
+        typer.echo(json.dumps({"companies": cycle}, indent=2))
+        if once:
+            break
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

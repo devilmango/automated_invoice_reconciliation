@@ -48,7 +48,7 @@ def test_admin_can_retry_failed_ap_export_and_reconcile_reference(
             assert idempotency_key == match_id
             return "AP-BILL-44"
 
-    monkeypatch.setattr("invoice_match.api.create_adapter", lambda _name: FailingAdapter())
+    monkeypatch.setattr("invoice_match.api.create_adapter", lambda _name, **_kwargs: FailingAdapter())
     denied = client.post(f"/reviewer/ap-outbox/{match_id}/retry", headers=reviewer_headers)
     failed = client.post(f"/reviewer/ap-outbox/{match_id}/retry", headers=admin_headers)
     assert denied.status_code == 403
@@ -57,7 +57,7 @@ def test_admin_can_retry_failed_ap_export_and_reconcile_reference(
     assert failed.json()["attempt_count"] == 1
     assert failed.json()["last_error"] == "AP system temporarily unavailable"
 
-    monkeypatch.setattr("invoice_match.api.create_adapter", lambda _name: SuccessfulAdapter())
+    monkeypatch.setattr("invoice_match.api.create_adapter", lambda _name, **_kwargs: SuccessfulAdapter())
     retried = client.post(f"/reviewer/ap-outbox/{match_id}/retry", headers=admin_headers)
     assert retried.status_code == 200
     assert retried.json()["state"] == "ACKNOWLEDGED"

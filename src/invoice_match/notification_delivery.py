@@ -184,6 +184,8 @@ def deliver_pending_notifications(
     limit: int = 100,
     now: datetime | None = None,
     max_attempts: int = MAX_NOTIFICATION_ATTEMPTS,
+    initial_retry_seconds: int = 30,
+    max_retry_seconds: int = 3600,
 ) -> dict:
     current = now or datetime.now(timezone.utc)
     summary = {"adapter": adapter.name, "delivered": 0, "failed": 0, "dead_lettered": 0, "items": []}
@@ -205,7 +207,7 @@ def deliver_pending_notifications(
                 record.state = "DEAD"
                 summary["dead_lettered"] += 1
             else:
-                delay_seconds = min(3600, 30 * (2 ** (record.attempt_count - 1)))
+                delay_seconds = min(max_retry_seconds, initial_retry_seconds * (2 ** (record.attempt_count - 1)))
                 record.next_attempt_at = current + timedelta(seconds=delay_seconds)
                 summary["failed"] += 1
             session.add(AuditEvent(

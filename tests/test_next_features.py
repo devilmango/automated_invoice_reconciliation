@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -92,7 +92,7 @@ def test_delivery_service_records_success_and_retries_failures(clear_database):
                 return "AP-123"
 
         first = deliver_pending(session, Adapter())
-        second = deliver_pending(session, Adapter())
+        second = deliver_pending(session, Adapter(), now=datetime.now(timezone.utc) + timedelta(seconds=31))
         successful = session.get(APOutboxRecord, "delivery-success")
         failed = session.get(APOutboxRecord, "delivery-fail")
         assert first["acknowledged"] == 1 and first["failed"] == 1
@@ -331,3 +331,22 @@ def test_pdf_capture_uses_optional_ocr_for_scanned_pdf(monkeypatch):
     assert fields["items"][0]["sku"] == "A100"
     assert confidence["number"] == 0.98
     assert "OCR_USED_REVIEW_REQUIRED" in notes
+
+
+def test_ap_delivery_moves_exhausted_attempts_to_dead_letter(clear_database):
+    with SessionLocal() as session:
+        session.add(APOutboxRecord(match_id="dead-letter-match", payload={"match_id": "dead-letter-match"}))
+        session.commit()
+
+        class BrokenAdapter:
+            name = "test-broken"
+
+            def submit_invoice(self, _payload, *, idempotency_key):
+                raise RuntimeError("accounting provider unavailable")
+
+        summary = deliver_pending(session, BrokenAdapter(), max_attempts=1)
+        dead = session.get(APOutboxRecord, "dead-letter-match")
+        assert summary["dead_lettered"] == 1
+        assert dead.state == "DEAD"
+        assert dead.next_attempt_at is None
+        assert dead.attempt_count == 1

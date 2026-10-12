@@ -13,6 +13,13 @@ services:
       AP_ADAPTER_DIRECTORY: /var/lib/invoice-match/ap-adapter-data
       AP_PROCUREMENT_ADAPTER: "${AP_PROCUREMENT_ADAPTER:-filesystem}"
       AP_DELIVERY_ADAPTER: "${AP_DELIVERY_ADAPTER:-filesystem}"
+      AP_RETRY_MAX_ATTEMPTS: "${AP_RETRY_MAX_ATTEMPTS:-8}"
+      AP_RETRY_INITIAL_SECONDS: "${AP_RETRY_INITIAL_SECONDS:-30}"
+      AP_RETRY_MAX_SECONDS: "${AP_RETRY_MAX_SECONDS:-3600}"
+      NOTIFICATION_RETRY_MAX_ATTEMPTS: "${NOTIFICATION_RETRY_MAX_ATTEMPTS:-8}"
+      NOTIFICATION_RETRY_INITIAL_SECONDS: "${NOTIFICATION_RETRY_INITIAL_SECONDS:-30}"
+      NOTIFICATION_RETRY_MAX_SECONDS: "${NOTIFICATION_RETRY_MAX_SECONDS:-3600}"
+      DELIVERY_WORKER_NAME: "${DELIVERY_WORKER_NAME:-invoice-match-worker}"
       INVOICE_MATCH_API_URL: http://127.0.0.1:8000
       INVOICE_MATCH_INTEGRATION_TOKEN: "${INVOICE_MATCH_INTEGRATION_TOKEN:-}"
       INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY: /var/lib/invoice-match/invoice-inbox
@@ -32,12 +39,74 @@ services:
       QBO_AP_ACCOUNT_ID: "${QBO_AP_ACCOUNT_ID:-}"
       QBO_FREIGHT_ACCOUNT_ID: "${QBO_FREIGHT_ACCOUNT_ID:-}"
       QBO_DISCOUNT_ACCOUNT_ID: "${QBO_DISCOUNT_ACCOUNT_ID:-}"
+      XERO_CLIENT_ID: "${XERO_CLIENT_ID:-}"
+      XERO_CLIENT_SECRET: "${XERO_CLIENT_SECRET:-}"
+      XERO_TENANT_ID: "${XERO_TENANT_ID:-}"
+      XERO_REFRESH_TOKEN: "${XERO_REFRESH_TOKEN:-}"
+      XERO_TOKEN_ENCRYPTION_KEY: "${XERO_TOKEN_ENCRYPTION_KEY:-}"
+      XERO_CONTACT_ID_MAP: "${XERO_CONTACT_ID_MAP:-{}}"
+      XERO_ITEM_CODE_MAP: "${XERO_ITEM_CODE_MAP:-{}}"
+      XERO_TAX_TYPE_MAP: "${XERO_TAX_TYPE_MAP:-{}}"
+      XERO_EXPENSE_ACCOUNT_CODE: "${XERO_EXPENSE_ACCOUNT_CODE:-}"
     volumes:
       - ./config:/app/config:ro
       - ${AP_ADAPTER_DIRECTORY:-./ap-adapter-data}:/var/lib/invoice-match/ap-adapter-data
       - ${INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY:-./invoice-inbox}:/var/lib/invoice-match/invoice-inbox
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
     depends_on:
       db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["invoice-match", "worker", "--interval", "30"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://invoice_match:invoice_match@db:5432/invoice_match
+      REVIEWER_TOKENS: "${REVIEWER_TOKENS:?Set REVIEWER_TOKENS in .env; see .env.example}"
+      INTEGRATION_TOKENS: "${INTEGRATION_TOKENS:?Set INTEGRATION_TOKENS in .env; see .env.example}"
+      AP_ADAPTER_DIRECTORY: /var/lib/invoice-match/ap-adapter-data
+      AP_DELIVERY_ADAPTER: "${AP_DELIVERY_ADAPTER:-filesystem}"
+      AP_RETRY_MAX_ATTEMPTS: "${AP_RETRY_MAX_ATTEMPTS:-8}"
+      AP_RETRY_INITIAL_SECONDS: "${AP_RETRY_INITIAL_SECONDS:-30}"
+      AP_RETRY_MAX_SECONDS: "${AP_RETRY_MAX_SECONDS:-3600}"
+      NOTIFICATION_RETRY_MAX_ATTEMPTS: "${NOTIFICATION_RETRY_MAX_ATTEMPTS:-8}"
+      NOTIFICATION_RETRY_INITIAL_SECONDS: "${NOTIFICATION_RETRY_INITIAL_SECONDS:-30}"
+      NOTIFICATION_RETRY_MAX_SECONDS: "${NOTIFICATION_RETRY_MAX_SECONDS:-3600}"
+      DELIVERY_WORKER_NAME: "${DELIVERY_WORKER_NAME:-invoice-match-worker}"
+      NOTIFICATION_WEBHOOK_URL: "${NOTIFICATION_WEBHOOK_URL:-}"
+      NOTIFICATION_WEBHOOK_TOKEN: "${NOTIFICATION_WEBHOOK_TOKEN:-}"
+      NOTIFICATION_WEBHOOK_SECRET: "${NOTIFICATION_WEBHOOK_SECRET:-}"
+      NOTIFICATION_WORKER_NAME: "${NOTIFICATION_WORKER_NAME:-scheduler}"
+      QBO_CLIENT_ID: "${QBO_CLIENT_ID:-}"
+      QBO_CLIENT_SECRET: "${QBO_CLIENT_SECRET:-}"
+      QBO_REALM_ID: "${QBO_REALM_ID:-}"
+      QBO_REFRESH_TOKEN: "${QBO_REFRESH_TOKEN:-}"
+      QBO_TOKEN_ENCRYPTION_KEY: "${QBO_TOKEN_ENCRYPTION_KEY:-}"
+      QBO_ENVIRONMENT: "${QBO_ENVIRONMENT:-sandbox}"
+      QBO_VENDOR_ID_MAP: "${QBO_VENDOR_ID_MAP:-{}}"
+      QBO_ITEM_ID_MAP: "${QBO_ITEM_ID_MAP:-{}}"
+      QBO_TAX_CODE_MAP: "${QBO_TAX_CODE_MAP:-{}}"
+      QBO_AP_ACCOUNT_ID: "${QBO_AP_ACCOUNT_ID:-}"
+      QBO_FREIGHT_ACCOUNT_ID: "${QBO_FREIGHT_ACCOUNT_ID:-}"
+      QBO_DISCOUNT_ACCOUNT_ID: "${QBO_DISCOUNT_ACCOUNT_ID:-}"
+      XERO_CLIENT_ID: "${XERO_CLIENT_ID:-}"
+      XERO_CLIENT_SECRET: "${XERO_CLIENT_SECRET:-}"
+      XERO_TENANT_ID: "${XERO_TENANT_ID:-}"
+      XERO_REFRESH_TOKEN: "${XERO_REFRESH_TOKEN:-}"
+      XERO_TOKEN_ENCRYPTION_KEY: "${XERO_TOKEN_ENCRYPTION_KEY:-}"
+      XERO_CONTACT_ID_MAP: "${XERO_CONTACT_ID_MAP:-{}}"
+      XERO_ITEM_CODE_MAP: "${XERO_ITEM_CODE_MAP:-{}}"
+      XERO_TAX_TYPE_MAP: "${XERO_TAX_TYPE_MAP:-{}}"
+      XERO_EXPENSE_ACCOUNT_CODE: "${XERO_EXPENSE_ACCOUNT_CODE:-}"
+    volumes:
+      - ${AP_ADAPTER_DIRECTORY:-./ap-adapter-data}:/var/lib/invoice-match/ap-adapter-data
+    depends_on:
+      api:
         condition: service_healthy
 
   db:
