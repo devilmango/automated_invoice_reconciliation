@@ -394,7 +394,7 @@ def worker(
                 heartbeat.poll_interval_seconds = interval
                 heartbeat.last_started_at = now
                 heartbeat.last_succeeded_at = now
-                failures = ap.get("failed", 0) + ap.get("dead_lettered", 0) \
+                failures = ap.get("failed", 0) + ap.get("dead_lettered", 0) + ap.get("blocked", 0) \
                     + notifications.get("failed", 0) + notifications.get("dead_lettered", 0) \
                     + accounting_status.get("failed", 0)
                 heartbeat.last_error = f"{failures} delivery attempt(s) failed or dead-lettered" if failures else None

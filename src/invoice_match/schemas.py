@@ -280,6 +280,7 @@ class ReviewerAPOutboxItem(StrictModel):
     accounting_status: str = "UNKNOWN"
     accounting_status_detail: dict = Field(default_factory=dict)
     accounting_status_checked_at: str | None = None
+    mapping_issues: list[dict] = Field(default_factory=list)
 
 
 class APExportAcknowledgement(StrictModel):
@@ -328,6 +329,16 @@ class DocumentCaptureAuditEntry(StrictModel):
 class AccountingConnectionUpsert(StrictModel):
     configuration: dict
     enabled: bool = True
+
+
+class AccountingMappingUpdate(StrictModel):
+    mappings: dict[str, str]
+
+    @model_validator(mode="after")
+    def validate_mapping_entries(self):
+        if any(not key.strip() or not value.strip() for key, value in self.mappings.items()):
+            raise ValueError("Mapping source keys and provider identifiers cannot be blank")
+        return self
 
 
 class PaymentAdviceAllocation(StrictModel):

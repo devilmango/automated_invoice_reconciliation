@@ -389,6 +389,14 @@ curl http://127.0.0.1:8000/admin/accounting-connections \
 
 The list response contains provider/account metadata and configured field names, never secret values. `DELETE /admin/accounting-connections/{quickbooks|xero}` disables a connection while preserving its encrypted configuration and audit history. A configured company connection takes precedence over `AP_DELIVERY_ADAPTER` when the worker or an admin retries an export. `/reviewer/ap-outbox/{match_id}/sync-status` (admin) checks an acknowledged invoice with an external reference against QuickBooks or Xero and records status changes in the match audit log. The current status and last check time appear in reviewer AP outbox responses. Status lookup is not available for filesystem or generic HTTP adapters.
 
+Admins maintain connector mappings through `GET /admin/accounting-connections/{provider}/mappings` and `PUT /admin/accounting-connections/{provider}/mappings/{supplier|item|tax|currency}`. Each PUT replaces the selected category with a JSON object, for example `{"mappings":{"ABC Supplies":"vendor-37"}}`. The keys are normalized by the connector for matching. `DELETE /admin/accounting-connections/{provider}/mappings/{category}/{source_key}` removes one entry. Mapping changes are encrypted with the connection and audited. Currency mappings are optional; an unmapped currency is passed through unchanged unless a currency map has been configured, in which case the preflight flags missing entries.
+
+Reviewer AP outbox rows include `mapping_issues`, and `GET /reviewer/ap-outbox/{match_id}/mapping-check` provides a focused check before an export retry. The API blocks manual retries when required supplier, item, or tax mappings are absent and records the block in the match audit trail. The operations page exposes the mapping editor to admins and shows missing mappings beside the affected export.
+
+### Dead-letter review and replay
+
+The operations page lists `PENDING`, `ACKNOWLEDGED`, and `DEAD` exports. Select **Dead letter** to focus failed exports that exhausted automatic retries. **Attempt history** shows retry requests, failures, acknowledgements, mapping blocks, and external-reference changes. Only an admin can replay a pending or dead-lettered export; replay keeps the match ID as the idempotency key and records a new event. A reviewer can inspect history but receives an authorization error if they try to replay. The reviewer API can filter directly with `GET /reviewer/ap-outbox?state=DEAD`, and event history is available at `GET /reviewer/ap-outbox/{match_id}/history`.
+
 Payment systems can send remittances to `POST /integrations/payments/remittances`; the company integration token scopes the payment and external ID. Replays with the same external ID and the same vendor/currency/amount return the existing payment. The matcher allocates a uniquely identified invoice payment, supports a uniquely identifiable short payment, and matches a unique exact sum across a small set of invoices. Ambiguous or inconsistent remittances remain `NEEDS_REVIEW` for the reviewer queue at `GET /reviewer/payments`. A reviewer with the `approver` role can allocate a payment explicitly with `POST /reviewer/payments/{payment_id}/allocate`, supplying invoice match IDs and amounts. Allocations enforce vendor, currency, acknowledgement, remaining-balance, and payment-total boundaries and write payment and invoice audit events. Payment history is available at `/reviewer/payments/{payment_id}/events`.
 
 Example remittance payload:
@@ -498,7 +506,13 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
 | `GET` | `/reviewer/captures` | Browser-based capture review inbox |
 | `GET` | `/reviewer/operations` | Operations reporting and AP export reconciliation dashboard |
+| `GET` | `/reviewer/ap-outbox?state=DEAD` | Filter dead-letter AP exports and surface mapping preflight warnings |
+| `GET` | `/reviewer/ap-outbox/{match_id}/history` | Inspect AP retry and reconciliation history (reviewer token required) |
+| `GET` | `/reviewer/ap-outbox/{match_id}/mapping-check` | Check provider mapping readiness before delivery (reviewer token required) |
 | `POST` | `/admin/procurement/sync` | Synchronize POs and receipts from the configured provider (admin token required) |
+| `GET` | `/admin/accounting-connections/{provider}/mappings` | Read company accounting mappings (admin token required) |
+| `PUT` | `/admin/accounting-connections/{provider}/mappings/{category}` | Replace supplier, item, tax, or currency map (admin token required) |
+| `DELETE` | `/admin/accounting-connections/{provider}/mappings/{category}/{source_key}` | Remove one accounting mapping (admin token required) |
 | `GET` | `/integrations/procurement/purchase-orders/{po_number}` | Read a synchronized PO and receipt snapshot (integration token required) |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
@@ -662,6 +676,7 @@ The Compose file uses development credentials. Change credentials and manage the
 | `QBO_VENDOR_ID_MAP` | `{}` | JSON supplier-name to QuickBooks Vendor ID mapping |
 | `QBO_ITEM_ID_MAP` | `{}` | JSON SKU to QuickBooks Item ID mapping |
 | `QBO_TAX_CODE_MAP` | `{}` | JSON invoice tax-code to QuickBooks TaxCode ID mapping |
+| `QBO_CURRENCY_MAP` | `{}` | Optional JSON invoice currency to QuickBooks currency code map |
 | `QBO_AP_ACCOUNT_ID` | unset | Explicit accounts-payable account ID for companies with multiple AP accounts |
 | `QBO_FREIGHT_ACCOUNT_ID` / `QBO_DISCOUNT_ACCOUNT_ID` | unset | Existing expense account IDs for invoices carrying those amounts |
 | `QBO_TIMEOUT_SECONDS` / `QBO_MINOR_VERSION` | `20` / provider default | QuickBooks request timeout and optional API minor version |
@@ -671,6 +686,7 @@ The Compose file uses development credentials. Change credentials and manage the
 | `XERO_TENANT_ID` / `XERO_REFRESH_TOKEN` | unset | Connected Xero organisation and initial refresh token |
 | `XERO_TOKEN_ENCRYPTION_KEY` | unset | Fernet key used to encrypt Xero OAuth tokens at rest |
 | `XERO_CONTACT_ID_MAP` / `XERO_ITEM_CODE_MAP` / `XERO_TAX_TYPE_MAP` | `{}` | JSON supplier, SKU, and tax mappings for Xero |
+| `XERO_CURRENCY_MAP` | `{}` | Optional JSON invoice currency to Xero currency code map |
 | `XERO_EXPENSE_ACCOUNT_CODE` | unset | Optional Xero expense account code for invoice lines |
 | `DELIVERY_WORKER_NAME` | `invoice-match-worker` | Worker heartbeat identity |
 

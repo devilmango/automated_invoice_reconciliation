@@ -33,6 +33,7 @@ class XeroAdapter:
                  contact_map: dict[str, str] | None = None,
                  item_map: dict[str, str] | None = None,
                  tax_type_map: dict[str, str] | None = None,
+                 currency_map: dict[str, str] | None = None,
                  expense_account_code: str | None = None, timeout: float = 20,
                  session_factory: Callable[[], Session] | None = None, opener=urlopen):
         if not all((client_id, client_secret, tenant_id, encryption_key)):
@@ -50,6 +51,7 @@ class XeroAdapter:
         self.contact_map = self._normalize_map(contact_map or {})
         self.item_map = self._normalize_map(item_map or {})
         self.tax_type_map = self._normalize_map(tax_type_map or {})
+        self.currency_map = self._normalize_map(currency_map or {})
         self.expense_account_code = expense_account_code
         self.timeout, self.opener = timeout, opener
 
@@ -73,6 +75,7 @@ class XeroAdapter:
             contact_map=read_map("XERO_CONTACT_ID_MAP"),
             item_map=read_map("XERO_ITEM_CODE_MAP"),
             tax_type_map=read_map("XERO_TAX_TYPE_MAP"),
+            currency_map=read_map("XERO_CURRENCY_MAP"),
             expense_account_code=os.getenv("XERO_EXPENSE_ACCOUNT_CODE"),
             timeout=float(os.getenv("XERO_TIMEOUT_SECONDS", "20")),
             session_factory=session_factory,
@@ -85,6 +88,7 @@ class XeroAdapter:
             tenant_id=config["tenant_id"], encryption_key=config["token_encryption_key"],
             refresh_token=config["refresh_token"], contact_map=config.get("contact_map", {}),
             item_map=config.get("item_map", {}), tax_type_map=config.get("tax_type_map", {}),
+            currency_map=config.get("currency_map", {}),
             expense_account_code=config.get("expense_account_code"),
             timeout=float(config.get("timeout", 20)), session_factory=session_factory,
         )
@@ -213,7 +217,10 @@ class XeroAdapter:
             "Type": "ACCPAY", "Contact": {"ContactID": contact_id},
             "InvoiceNumber": invoice_number,
             "Reference": f"{payload.get('purchase_order_number', '')} {marker}"[:255],
-            "CurrencyCode": payload.get("currency", "USD"),
+            "CurrencyCode": self.currency_map.get(
+                str(payload.get("currency") or "USD").casefold(),
+                str(payload.get("currency") or "USD").upper(),
+            ),
             "LineAmountTypes": "Exclusive", "LineItems": lines,
         }
         data = self._api("Invoices", method="POST", data={"Invoices": [invoice]},

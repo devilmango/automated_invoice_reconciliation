@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .adapters.base import PayablesDeliveryAdapter
+from .accounting_connections import check_payload_mappings
 from .database import APOutboxRecord, AuditEvent
 
 MAX_AP_ATTEMPTS = 8
@@ -20,6 +21,23 @@ def deliver_match(session: Session, adapter: PayablesDeliveryAdapter, match_id: 
         raise LookupError("AP outbox item not found")
     if record.state not in {"PENDING", "DEAD"}:
         raise ValueError("AP outbox item is already acknowledged")
+    issues = check_payload_mappings(adapter, record.payload)
+    if issues:
+        record.state = "DEAD"
+        record.last_error = "Missing accounting mappings: " + ", ".join(
+            f"{issue['category']} {issue['source']}" for issue in issues
+        )
+        record.next_attempt_at = None
+        session.add(AuditEvent(match_id=match_id, event_type="AP_EXPORT_BLOCKED_MISSING_MAPPING",
+            actor=f"adapter:{adapter.name}", details={"issues": issues}))
+        session.commit()
+        return {
+            "match_id": record.match_id, "state": record.state,
+            "attempt_count": record.attempt_count, "last_error": record.last_error,
+            "external_reference": record.external_reference,
+            "created_at": record.created_at.isoformat(), "acknowledged_at": None,
+            "payload": record.payload,
+        }
     record.state = "PENDING"
     record.attempt_count += 1
     session.commit()
@@ -81,7 +99,7 @@ def deliver_pending(
     """Deliver due AP entries with bounded exponential retry and a dead-letter state."""
     current = now or datetime.now(timezone.utc)
     summary = {"adapter": adapter.name, "acknowledged": 0, "failed": 0,
-               "dead_lettered": 0, "items": []}
+               "dead_lettered": 0, "blocked": 0, "items": []}
     while len(summary["items"]) < limit:
         record = session.scalar(
             select(APOutboxRecord).where(
@@ -92,6 +110,22 @@ def deliver_pending(
         )
         if record is None:
             break
+        issues = check_payload_mappings(adapter, record.payload)
+        if issues:
+            record.state = "DEAD"
+            record.last_error = "Missing accounting mappings: " + ", ".join(
+                f"{issue['category']} {issue['source']}" for issue in issues
+            )
+            record.next_attempt_at = None
+            session.add(AuditEvent(match_id=record.match_id,
+                event_type="AP_EXPORT_BLOCKED_MISSING_MAPPING", actor=f"adapter:{adapter.name}",
+                details={"issues": issues}))
+            summary["blocked"] += 1
+            summary["items"].append({"match_id": record.match_id, "state": "DEAD",
+                                     "error": record.last_error, "blocked": True,
+                                     "issues": issues})
+            session.commit()
+            continue
         record.attempt_count += 1
         try:
             reference = adapter.submit_invoice(record.payload, idempotency_key=record.match_id)

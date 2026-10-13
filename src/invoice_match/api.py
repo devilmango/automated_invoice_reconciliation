@@ -70,10 +70,13 @@ from .schemas import (
     SupplierInvoice,
     VerifyCapturedInvoice,
     AccountingConnectionUpsert,
+    AccountingMappingUpdate,
     RemittancePaymentCreate,
     ManualPaymentAllocationRequest,
 )
-from .accounting_connections import encrypt_configuration, public_connection, validate_configuration
+from .accounting_connections import (check_payload_mappings, decrypt_configuration,
+                                     encrypt_configuration, mapping_field, public_connection,
+                                     validate_configuration)
 from .payment_reconciliation import manually_allocate, payment_result, reconcile_payment
 from .accounting_status import refresh_accounting_status
 
@@ -1136,6 +1139,10 @@ def reviewer_ap_outbox(
     if state != "ALL":
         query = query.where(APOutboxRecord.state == state)
     rows = session.execute(query.order_by(APOutboxRecord.created_at.desc()).limit(limit)).all()
+    try:
+        adapter = create_adapter_for_company(session.info.get("company_id", "default"))
+    except (ValueError, RuntimeError):
+        adapter = None
     return [ReviewerAPOutboxItem(
         match_id=item.match_id,
         state=item.state,
@@ -1152,6 +1159,7 @@ def reviewer_ap_outbox(
         accounting_status=item.accounting_status,
         accounting_status_detail=item.accounting_status_detail,
         accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
+        mapping_issues=check_payload_mappings(adapter, item.payload) if adapter else [],
     ) for item, match in rows]
 
 
@@ -1172,6 +1180,16 @@ def retry_ap_outbox(
         adapter_name = adapter.name
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=f"AP delivery adapter is unavailable: {exc}") from exc
+    mapping_issues = check_payload_mappings(adapter, item.payload)
+    if mapping_issues:
+        session.add(AuditEvent(match_id=match_id, event_type="AP_EXPORT_BLOCKED_MISSING_MAPPING",
+            actor=admin.name, details={"issues": mapping_issues}))
+        session.commit()
+        raise HTTPException(status_code=409, detail={
+            "code": "ACCOUNTING_MAPPINGS_MISSING",
+            "message": "Complete the listed accounting mappings before retrying this export.",
+            "issues": mapping_issues,
+        })
     session.add(AuditEvent(
         match_id=match_id,
         event_type="AP_EXPORT_RETRY_REQUESTED",
@@ -1327,6 +1345,129 @@ def accounting_connection_events(
     return [{"id": event.id, "provider": event.provider, "event_type": event.event_type,
              "actor": event.actor, "details": event.details, "created_at": _timestamp(event.created_at)}
             for event in events]
+
+
+@app.get("/admin/accounting-connections/{provider}/mappings")
+def get_accounting_mappings(
+    provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    record = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    try:
+        config = decrypt_configuration(record.encrypted_config)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    categories = {category: config.get(field, {}) for category, field in (
+        ("supplier", mapping_field(provider, "supplier")),
+        ("item", mapping_field(provider, "item")),
+        ("tax", mapping_field(provider, "tax")),
+        ("currency", mapping_field(provider, "currency")),
+    )}
+    return {"provider": provider, "enabled": record.enabled, "mappings": categories}
+
+
+@app.put("/admin/accounting-connections/{provider}/mappings/{category}")
+def replace_accounting_mapping(
+    provider: str, category: str, body: AccountingMappingUpdate,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider, category = provider.casefold(), category.casefold()
+    try:
+        field = mapping_field(provider, category)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    record = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    try:
+        config = decrypt_configuration(record.encrypted_config)
+        config[field] = {" ".join(key.strip().split()): value.strip()
+                         for key, value in body.mappings.items()}
+        validate_configuration(provider, config)
+        record.encrypted_config = encrypt_configuration(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    record.updated_by = admin.name
+    record.updated_at = datetime.now(timezone.utc)
+    session.add(AccountingConnectionEventRecord(provider=provider,
+        event_type="ACCOUNTING_MAPPING_REPLACED", actor=admin.name,
+        details={"category": category, "mapping_count": len(body.mappings)}))
+    session.commit()
+    return {"provider": provider, "category": category, "mapping_count": len(body.mappings)}
+
+
+@app.delete("/admin/accounting-connections/{provider}/mappings/{category}/{source_key}")
+def delete_accounting_mapping(
+    provider: str, category: str, source_key: str,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider, category = provider.casefold(), category.casefold()
+    try:
+        field = mapping_field(provider, category)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    record = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    try:
+        config = decrypt_configuration(record.encrypted_config)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    mapping = config.get(field, {})
+    normalized_key = " ".join(source_key.casefold().split())
+    key = next((candidate for candidate in mapping if " ".join(candidate.casefold().split()) == normalized_key), None)
+    if key is None:
+        raise HTTPException(status_code=404, detail="Mapping not found")
+    del mapping[key]
+    config[field] = mapping
+    record.encrypted_config = encrypt_configuration(config)
+    record.updated_by = admin.name
+    record.updated_at = datetime.now(timezone.utc)
+    session.add(AccountingConnectionEventRecord(provider=provider,
+        event_type="ACCOUNTING_MAPPING_DELETED", actor=admin.name,
+        details={"category": category}))
+    session.commit()
+    return {"provider": provider, "category": category, "deleted": True}
+
+
+@app.get("/reviewer/ap-outbox/{match_id}/mapping-check")
+def ap_outbox_mapping_check(
+    match_id: str, session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    item = session.get(APOutboxRecord, match_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="AP outbox item not found")
+    try:
+        adapter = create_adapter_for_company(session.info.get("company_id", "default"))
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=f"AP delivery adapter is unavailable: {exc}") from exc
+    issues = check_payload_mappings(adapter, item.payload)
+    return {"match_id": match_id, "provider": adapter.name, "ready": not issues,
+            "issues": issues}
+
+
+@app.get("/reviewer/ap-outbox/{match_id}/history")
+def ap_outbox_retry_history(
+    match_id: str, session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    if session.get(APOutboxRecord, match_id) is None:
+        raise HTTPException(status_code=404, detail="AP outbox item not found")
+    events = session.scalars(select(AuditEvent).where(
+        AuditEvent.match_id == match_id,
+        AuditEvent.event_type.in_({"AP_EXPORT_RETRY_REQUESTED", "AP_EXPORT_FAILED",
+                                   "AP_EXPORT_ACKNOWLEDGED", "AP_EXPORT_REFERENCE_RECONCILED",
+                                   "AP_EXPORT_BLOCKED_MISSING_MAPPING"}),
+    ).order_by(AuditEvent.created_at.desc()).limit(100)).all()
+    return [{"event_type": event.event_type, "actor": event.actor,
+             "details": event.details, "created_at": _timestamp(event.created_at)} for event in events]
 
 
 @app.post("/reviewer/ap-outbox/{match_id}/sync-status", response_model=ReviewerAPOutboxItem)

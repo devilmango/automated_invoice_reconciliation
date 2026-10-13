@@ -52,6 +52,7 @@ class QuickBooksOnlineAdapter:
         ap_account_id: str | None = None,
         freight_account_id: str | None = None,
         discount_account_id: str | None = None,
+        currency_map: dict[str, str] | None = None,
         minor_version: str | None = None,
         timeout: float = 20.0,
         session_factory: Callable[[], Session] | None = None,
@@ -80,6 +81,7 @@ class QuickBooksOnlineAdapter:
         self.vendor_map = self._normalize_map(vendor_map or {})
         self.item_map = self._normalize_map(item_map or {})
         self.tax_code_map = self._normalize_map(tax_code_map or {})
+        self.currency_map = self._normalize_map(currency_map or {})
         self.ap_account_id = ap_account_id
         self.freight_account_id = freight_account_id
         self.discount_account_id = discount_account_id
@@ -111,6 +113,7 @@ class QuickBooksOnlineAdapter:
             vendor_map=read_map("QBO_VENDOR_ID_MAP"),
             item_map=read_map("QBO_ITEM_ID_MAP"),
             tax_code_map=read_map("QBO_TAX_CODE_MAP"),
+            currency_map=read_map("QBO_CURRENCY_MAP"),
             ap_account_id=os.getenv("QBO_AP_ACCOUNT_ID"),
             freight_account_id=os.getenv("QBO_FREIGHT_ACCOUNT_ID"),
             discount_account_id=os.getenv("QBO_DISCOUNT_ACCOUNT_ID"),
@@ -126,6 +129,7 @@ class QuickBooksOnlineAdapter:
             refresh_token=config["refresh_token"], environment=config.get("environment", "sandbox"),
             vendor_map=config.get("vendor_map", {}), item_map=config.get("item_map", {}),
             tax_code_map=config.get("tax_code_map", {}), ap_account_id=config.get("ap_account_id"),
+            currency_map=config.get("currency_map", {}),
             freight_account_id=config.get("freight_account_id"),
             discount_account_id=config.get("discount_account_id"),
             timeout=float(config.get("timeout", 20)), minor_version=config.get("minor_version"),
@@ -213,7 +217,10 @@ class QuickBooksOnlineAdapter:
             "VendorRef": {"value": vendor_id},
             "DocNumber": invoice_number,
             "PrivateNote": f"{marker}; PO {payload.get('purchase_order_number', '')}",
-            "CurrencyRef": {"value": str(payload.get("currency") or "USD").upper()},
+            "CurrencyRef": {"value": self.currency_map.get(
+                str(payload.get("currency") or "USD").casefold(),
+                str(payload.get("currency") or "USD").upper(),
+            )},
             "Line": lines,
         }
         if self.ap_account_id:

@@ -37,6 +37,7 @@ services:
       QBO_VENDOR_ID_MAP: "${QBO_VENDOR_ID_MAP:-{}}"
       QBO_ITEM_ID_MAP: "${QBO_ITEM_ID_MAP:-{}}"
       QBO_TAX_CODE_MAP: "${QBO_TAX_CODE_MAP:-{}}"
+      QBO_CURRENCY_MAP: "${QBO_CURRENCY_MAP:-{}}"
       QBO_AP_ACCOUNT_ID: "${QBO_AP_ACCOUNT_ID:-}"
       QBO_FREIGHT_ACCOUNT_ID: "${QBO_FREIGHT_ACCOUNT_ID:-}"
       QBO_DISCOUNT_ACCOUNT_ID: "${QBO_DISCOUNT_ACCOUNT_ID:-}"
@@ -48,6 +49,7 @@ services:
       XERO_CONTACT_ID_MAP: "${XERO_CONTACT_ID_MAP:-{}}"
       XERO_ITEM_CODE_MAP: "${XERO_ITEM_CODE_MAP:-{}}"
       XERO_TAX_TYPE_MAP: "${XERO_TAX_TYPE_MAP:-{}}"
+      XERO_CURRENCY_MAP: "${XERO_CURRENCY_MAP:-{}}"
       XERO_EXPENSE_ACCOUNT_CODE: "${XERO_EXPENSE_ACCOUNT_CODE:-}"
     volumes:
       - ./config:/app/config:ro
@@ -93,6 +95,7 @@ services:
       QBO_VENDOR_ID_MAP: "${QBO_VENDOR_ID_MAP:-{}}"
       QBO_ITEM_ID_MAP: "${QBO_ITEM_ID_MAP:-{}}"
       QBO_TAX_CODE_MAP: "${QBO_TAX_CODE_MAP:-{}}"
+      QBO_CURRENCY_MAP: "${QBO_CURRENCY_MAP:-{}}"
       QBO_AP_ACCOUNT_ID: "${QBO_AP_ACCOUNT_ID:-}"
       QBO_FREIGHT_ACCOUNT_ID: "${QBO_FREIGHT_ACCOUNT_ID:-}"
       QBO_DISCOUNT_ACCOUNT_ID: "${QBO_DISCOUNT_ACCOUNT_ID:-}"
@@ -104,6 +107,7 @@ services:
       XERO_CONTACT_ID_MAP: "${XERO_CONTACT_ID_MAP:-{}}"
       XERO_ITEM_CODE_MAP: "${XERO_ITEM_CODE_MAP:-{}}"
       XERO_TAX_TYPE_MAP: "${XERO_TAX_TYPE_MAP:-{}}"
+      XERO_CURRENCY_MAP: "${XERO_CURRENCY_MAP:-{}}"
       XERO_EXPENSE_ACCOUNT_CODE: "${XERO_EXPENSE_ACCOUNT_CODE:-}"
     volumes:
       - ${AP_ADAPTER_DIRECTORY:-./ap-adapter-data}:/var/lib/invoice-match/ap-adapter-data
