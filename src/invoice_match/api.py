@@ -39,6 +39,8 @@ from .database import (
     SessionLocal,
     WorkerHeartbeatRecord,
     AccountingMasterDataRecord,
+    MappingSuggestionDecisionRecord,
+    MasterDataSyncScheduleRecord,
     CreditNoteApplicationRecord,
     CreditApplicationOutboxRecord,
     BankStatementBatchRecord,
@@ -83,6 +85,8 @@ from .schemas import (
     CreditNoteApplication,
     Bai2TransactionCodeUpdate,
     BankReconciliationDecision,
+    MappingSuggestionDecision,
+    MasterDataSyncScheduleUpdate,
 )
 from .accounting_connections import (check_payload_mappings, decrypt_configuration,
                                      encrypt_configuration, mapping_field, public_connection,
@@ -1418,13 +1422,36 @@ def sync_accounting_masters(
     ))
     if connection is None:
         raise HTTPException(status_code=404, detail="Enabled accounting connection not found")
+    schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.provider == provider))
+    now = datetime.now(timezone.utc)
+    if schedule is None:
+        schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=provider)
+        session.add(schedule)
+    schedule.last_started_at = now
     try:
         adapter = create_adapter(provider, company_id=session.info.get("company_id", "default"))
-        if adapter.name != provider or not callable(getattr(adapter, "fetch_master_data", None)):
-            raise ValueError(f"The {provider} adapter does not support master-data sync")
-        references = adapter.fetch_master_data()
-    except (ValueError, RuntimeError) as exc:
+        with session.begin_nested():
+            counts = _apply_master_data_sync(session, provider, adapter, admin.name)
+    except Exception as exc:
+        schedule.last_error = str(exc)[:1000]
+        schedule.next_run_at = now + timedelta(minutes=5) if schedule.enabled else None
+        session.add(AccountingConnectionEventRecord(provider=provider,
+            event_type="ACCOUNTING_MASTER_DATA_SYNC_FAILED", actor=admin.name,
+            details={"error": str(exc)[:1000]}))
+        session.commit()
         raise HTTPException(status_code=502, detail=f"Accounting master-data sync failed: {exc}") from exc
+    schedule.last_success_at = now
+    schedule.last_error = None
+    schedule.next_run_at = now + timedelta(minutes=schedule.interval_minutes) if schedule.enabled else None
+    session.commit()
+    return {"provider": provider, "synced_at": _timestamp(now), "counts": counts}
+
+
+def _apply_master_data_sync(session: Session, provider: str, adapter, actor: str) -> dict[str, int]:
+    if adapter.name != provider or not callable(getattr(adapter, "fetch_master_data", None)):
+        raise ValueError(f"The {provider} adapter does not support master-data sync")
+    references = adapter.fetch_master_data()
     now, counts = datetime.now(timezone.utc), {}
     for category, items in references.items():
         if category not in {"supplier", "item", "tax", "currency"}:
@@ -1450,9 +1477,8 @@ def sync_accounting_masters(
                 record.active, record.source_data, record.synced_at = bool(item.get("active", True)), item.get("source_data") or {}, now
             counts[category] = counts.get(category, 0) + 1
     session.add(AccountingConnectionEventRecord(provider=provider, event_type="ACCOUNTING_MASTER_DATA_SYNCED",
-        actor=admin.name, details={"counts": counts}))
-    session.commit()
-    return {"provider": provider, "synced_at": _timestamp(now), "counts": counts}
+        actor=actor, details={"counts": counts}))
+    return counts
 
 
 @app.get("/admin/accounting-connections/{provider}/master-data")
@@ -1513,7 +1539,149 @@ def accounting_mapping_suggestions(
                     "suggested_name": row.name, "suggested_code": row.code,
                     "suggested_source_id": row.source_id, "confidence": round(score, 3),
                     "apply_automatically": False})
+    decisions = session.scalars(select(MappingSuggestionDecisionRecord).where(
+        MappingSuggestionDecisionRecord.provider == provider)).all()
+    reviewed = {(item.category, item.source_label, item.suggested_source_id): item for item in decisions}
+    for suggestion in suggestions:
+        decision = reviewed.get((suggestion["category"], suggestion["source_label"],
+                                 suggestion["suggested_source_id"]))
+        suggestion["review_status"] = ({"DISMISS": "DISMISSED"}.get(decision.decision, decision.decision)
+                                       if decision else "PENDING")
+        suggestion["reviewed_by"] = decision.actor if decision else None
+        suggestion["reviewed_at"] = _timestamp(decision.created_at) if decision else None
     return suggestions
+
+
+@app.post("/admin/accounting-connections/{provider}/mapping-suggestions/review")
+def review_accounting_mapping_suggestion(
+    provider: str, body: MappingSuggestionDecision,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    connection = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider))
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    current_suggestions = accounting_mapping_suggestions(provider, session, admin)
+    suggestion = next((item for item in current_suggestions
+        if item["category"] == body.category and item["source_label"] == body.source_label
+        and item["suggested_source_id"] == body.suggested_source_id), None)
+    # An accepted mapping no longer appears in the live suggestions. Treat an identical
+    # repeat decision as idempotent, while rejecting decisions for stale candidates.
+    previous = session.scalar(select(MappingSuggestionDecisionRecord).where(
+        MappingSuggestionDecisionRecord.provider == provider,
+        MappingSuggestionDecisionRecord.category == body.category,
+        MappingSuggestionDecisionRecord.source_label == body.source_label,
+        MappingSuggestionDecisionRecord.suggested_source_id == body.suggested_source_id))
+    if previous is not None:
+        if previous.decision == body.decision:
+            return {"provider": provider, "decision": previous.decision, "idempotent": True}
+        raise HTTPException(status_code=409, detail="This mapping suggestion has already been reviewed")
+    if suggestion is None or suggestion["review_status"] != "PENDING":
+        raise HTTPException(status_code=409, detail="Mapping suggestion is no longer pending")
+
+    details = {"category": body.category, "source_label": body.source_label,
+               "suggested_source_id": body.suggested_source_id}
+    if body.decision == "ACCEPT":
+        try:
+            field = mapping_field(provider, body.category)
+            config = decrypt_configuration(connection.encrypted_config)
+            mappings = config.get(field, {})
+            normalized = " ".join(body.source_label.casefold().split())
+            if any(" ".join(key.casefold().split()) == normalized for key in mappings):
+                raise HTTPException(status_code=409, detail="A mapping already exists for this source label")
+            mappings[" ".join(body.source_label.strip().split())] = body.suggested_source_id
+            config[field] = mappings
+            validate_configuration(provider, config)
+            connection.encrypted_config = encrypt_configuration(config)
+            connection.updated_by = admin.name
+            connection.updated_at = datetime.now(timezone.utc)
+            details["mapping_change"] = {"before": None, "after": body.suggested_source_id}
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        event_type = "ACCOUNTING_MAPPING_SUGGESTION_ACCEPTED"
+    else:
+        event_type = "ACCOUNTING_MAPPING_SUGGESTION_DISMISSED"
+    session.add(MappingSuggestionDecisionRecord(id=str(uuid4()), provider=provider,
+        category=body.category, source_label=body.source_label,
+        suggested_source_id=body.suggested_source_id, decision=body.decision, actor=admin.name))
+    session.add(AccountingConnectionEventRecord(provider=provider, event_type=event_type,
+        actor=admin.name, details=details))
+    session.commit()
+    return {"provider": provider, "decision": body.decision, "idempotent": False}
+
+
+def _master_sync_status(schedule: MasterDataSyncScheduleRecord, now: datetime) -> str:
+    last_success = _utc(schedule.last_success_at)
+    next_run = _utc(schedule.next_run_at)
+    if schedule.last_error:
+        return "FAILED"
+    if last_success is not None and now - last_success > timedelta(minutes=schedule.stale_after_minutes):
+        return "STALE"
+    if not schedule.enabled:
+        return "DISABLED"
+    if last_success is None:
+        return "NEVER_SYNCED"
+    if next_run and next_run <= now:
+        return "OVERDUE"
+    return "CURRENT"
+
+
+@app.get("/admin/accounting-connections/sync-status")
+def accounting_master_sync_status(
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    now = datetime.now(timezone.utc)
+    connections = session.scalars(select(AccountingConnectionRecord).order_by(
+        AccountingConnectionRecord.provider)).all()
+    results = []
+    for connection in connections:
+        schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+            MasterDataSyncScheduleRecord.provider == connection.provider))
+        if schedule is None:
+            schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=connection.provider,
+                enabled=False, interval_minutes=1440, stale_after_minutes=2880)
+            session.add(schedule)
+            session.flush()
+        results.append({"provider": connection.provider, "connection_enabled": connection.enabled,
+            "enabled": schedule.enabled, "interval_minutes": schedule.interval_minutes,
+            "stale_after_minutes": schedule.stale_after_minutes,
+            "sync_status": _master_sync_status(schedule, now),
+            "last_started_at": _timestamp(schedule.last_started_at),
+            "last_success_at": _timestamp(schedule.last_success_at),
+            "next_run_at": _timestamp(schedule.next_run_at), "last_error": schedule.last_error})
+    session.commit()
+    return results
+
+
+@app.put("/admin/accounting-connections/{provider}/sync-schedule")
+def update_accounting_master_sync_schedule(
+    provider: str, body: MasterDataSyncScheduleUpdate,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    connection = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider))
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.provider == provider))
+    if schedule is None:
+        schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=provider)
+        session.add(schedule)
+    schedule.enabled = body.enabled
+    schedule.interval_minutes = body.interval_minutes
+    schedule.stale_after_minutes = body.stale_after_minutes
+    schedule.next_run_at = datetime.now(timezone.utc) if body.enabled else None
+    session.add(AccountingConnectionEventRecord(provider=provider,
+        event_type="ACCOUNTING_MASTER_DATA_SCHEDULE_UPDATED", actor=admin.name,
+        details={"enabled": body.enabled, "interval_minutes": body.interval_minutes,
+                 "stale_after_minutes": body.stale_after_minutes}))
+    session.commit()
+    return {"provider": provider, "enabled": schedule.enabled,
+            "interval_minutes": schedule.interval_minutes,
+            "stale_after_minutes": schedule.stale_after_minutes,
+            "next_run_at": _timestamp(schedule.next_run_at)}
 
 
 @app.get("/admin/accounting-connections/{provider}/mappings")

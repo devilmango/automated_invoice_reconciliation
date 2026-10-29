@@ -369,6 +369,40 @@ class AccountingMasterDataRecord(CompanyScoped, Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class MappingSuggestionDecisionRecord(CompanyScoped, Base):
+    __tablename__ = "mapping_suggestion_decisions"
+    __table_args__ = (Index(
+        "uq_mapping_suggestion_decision", "company_id", "provider", "category",
+        "source_label", "suggested_source_id", unique=True,
+    ),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    category: Mapped[str] = mapped_column(String(24), index=True)
+    source_label: Mapped[str] = mapped_column(String(255))
+    suggested_source_id: Mapped[str] = mapped_column(String(160))
+    decision: Mapped[str] = mapped_column(String(16))
+    actor: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MasterDataSyncScheduleRecord(CompanyScoped, Base):
+    __tablename__ = "master_data_sync_schedules"
+    __table_args__ = (Index(
+        "uq_master_data_sync_schedule", "company_id", "provider", unique=True,
+    ),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    interval_minutes: Mapped[int] = mapped_column(Integer, default=1440)
+    stale_after_minutes: Mapped[int] = mapped_column(Integer, default=2880)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
 class CreditNoteApplicationRecord(CompanyScoped, Base):
     __tablename__ = "credit_note_applications"
     __table_args__ = (Index("uq_credit_application_pair", "company_id", "credit_match_id", "invoice_match_id", unique=True),)

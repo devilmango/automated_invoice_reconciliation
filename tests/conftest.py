@@ -58,6 +58,8 @@ def clear_database(apply_database_migrations):
         connection.exec_driver_sql("DELETE FROM bank_statement_batches")
         connection.exec_driver_sql("DELETE FROM bank_account_configurations")
         connection.exec_driver_sql("DELETE FROM credit_note_applications")
+        connection.exec_driver_sql("DELETE FROM mapping_suggestion_decisions")
+        connection.exec_driver_sql("DELETE FROM master_data_sync_schedules")
         connection.exec_driver_sql("DELETE FROM accounting_master_data")
         connection.exec_driver_sql("DELETE FROM accounting_connection_events")
         connection.exec_driver_sql("DELETE FROM accounting_connections")

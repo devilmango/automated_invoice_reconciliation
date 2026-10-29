@@ -344,6 +344,19 @@ class AccountingMappingUpdate(StrictModel):
         return self
 
 
+class MappingSuggestionDecision(StrictModel):
+    category: Literal["supplier", "item", "tax"]
+    source_label: str = Field(min_length=1, max_length=255)
+    suggested_source_id: str = Field(min_length=1, max_length=160)
+    decision: Literal["ACCEPT", "DISMISS"]
+
+
+class MasterDataSyncScheduleUpdate(StrictModel):
+    enabled: bool
+    interval_minutes: int = Field(ge=5, le=525600)
+    stale_after_minutes: int = Field(ge=5, le=525600)
+
+
 class PaymentAdviceAllocation(StrictModel):
     invoice_reference: str = Field(min_length=1, max_length=255)
     amount: Decimal = Field(gt=0)
