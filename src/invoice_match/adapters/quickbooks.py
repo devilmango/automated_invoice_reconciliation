@@ -22,9 +22,10 @@ _SANDBOX_API = "https://sandbox-quickbooks.api.intuit.com"
 
 
 class QuickBooksAPIError(RuntimeError):
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, retry_after: str | None = None):
         super().__init__(f"QuickBooks API returned HTTP {status}: {detail}")
         self.status = status
+        self.retry_after = retry_after
 
 
 class QuickBooksOnlineAdapter:
@@ -145,8 +146,9 @@ class QuickBooksOnlineAdapter:
         return float(Decimal(str(value)))
 
     def submit_invoice(self, payload: dict, *, idempotency_key: str) -> str:
-        if payload.get("document_type", "INVOICE") != "INVOICE":
-            raise ValueError("QuickBooks Bill export currently supports invoices, not credit notes")
+        is_credit = payload.get("document_type", "INVOICE") == "CREDIT_NOTE"
+        entity, response_key, entity_label = (("vendorcredit", "VendorCredit", "VendorCredit")
+                                               if is_credit else ("bill", "Bill", "Bill"))
         invoice_number = str(payload.get("supplier_invoice_number") or "").strip()
         supplier = " ".join(str(payload.get("supplier") or "").casefold().split())
         vendor_id = self.vendor_map.get(supplier)
@@ -156,13 +158,13 @@ class QuickBooksOnlineAdapter:
             raise ValueError(f"No QBO vendor mapping configured for supplier {payload.get('supplier')!r}")
 
         marker = f"invoice-match-id:{idempotency_key}"
-        existing = self._find_bill(invoice_number)
+        existing = self._find_vendor_credit(invoice_number) if is_credit else self._find_bill(invoice_number)
         if existing is not None:
             note = str(existing.get("PrivateNote") or "")
             if marker in note:
                 self._validate_bill_total(existing, payload)
                 return str(existing["Id"])
-            raise ValueError(f"QuickBooks already has a Bill with DocNumber {invoice_number!r}")
+            raise ValueError(f"QuickBooks already has a {entity_label} with DocNumber {invoice_number!r}")
 
         lines = []
         for line in payload.get("lines", []):
@@ -186,7 +188,7 @@ class QuickBooksOnlineAdapter:
                 detail["TaxCodeRef"] = {"value": tax_id}
             bill_line = {
                 "DetailType": "ItemBasedExpenseLineDetail",
-                "Amount": self._decimal_number(amount),
+                "Amount": self._decimal_number(abs(amount) if is_credit else amount),
                 "ItemBasedExpenseLineDetail": detail,
             }
             if line.get("description"):
@@ -202,13 +204,14 @@ class QuickBooksOnlineAdapter:
         if freight:
             if not self.freight_account_id:
                 raise ValueError("QBO_FREIGHT_ACCOUNT_ID is required for invoices with freight")
-            lines.append(self._account_line("Freight", self._decimal_number(freight),
+            lines.append(self._account_line("Freight", self._decimal_number(abs(freight) if is_credit else freight),
                                             self.freight_account_id))
         discount = Decimal(str(payload.get("discount_amount") or "0"))
         if discount:
             if not self.discount_account_id:
                 raise ValueError("QBO_DISCOUNT_ACCOUNT_ID is required for invoices with document discounts")
-            lines.append(self._account_line("Invoice discount", -self._decimal_number(discount),
+            lines.append(self._account_line("Invoice discount", -self._decimal_number(discount) if is_credit
+                                            else -self._decimal_number(discount),
                                             self.discount_account_id))
         if not lines:
             raise ValueError("QuickBooks Bill export requires at least one line")
@@ -226,10 +229,10 @@ class QuickBooksOnlineAdapter:
         if self.ap_account_id:
             bill["APAccountRef"] = {"value": self.ap_account_id}
         params = {"requestid": idempotency_key}
-        response = self._request("POST", "bill", params=params, body=bill)
-        result = response.get("Bill") if isinstance(response, dict) else None
+        response = self._request("POST", entity, params=params, body=bill)
+        result = response.get(response_key) if isinstance(response, dict) else None
         if not isinstance(result, dict) or not result.get("Id"):
-            raise RuntimeError("QuickBooks returned no Bill ID after create")
+            raise RuntimeError(f"QuickBooks returned no {response_key} ID after create")
         self._validate_bill_total(result, payload)
         return str(result["Id"])
 
@@ -250,15 +253,85 @@ class QuickBooksOnlineAdapter:
                 "currency": (bill.get("CurrencyRef") or {}).get("value"),
                 "document_number": bill.get("DocNumber"), "provider_status": bill.get("TxnStatus")}
 
+    def apply_credit_note(self, credit_reference: str, invoice_reference: str, amount: Decimal,
+                          *, idempotency_key: str) -> str | None:
+        """Apply an exported VendorCredit to an exported Bill without cash movement."""
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("Credit allocation amount must be positive")
+        credit_response = self._request("GET", f"vendorcredit/{credit_reference}")
+        invoice_response = self._request("GET", f"bill/{invoice_reference}")
+        credit = credit_response.get("VendorCredit")
+        bill = invoice_response.get("Bill")
+        if not isinstance(credit, dict) or not isinstance(bill, dict):
+            raise ValueError("QuickBooks credit note and bill must exist before allocation")
+        credit_vendor = str((credit.get("VendorRef") or {}).get("value") or "")
+        bill_vendor = str((bill.get("VendorRef") or {}).get("value") or "")
+        if not credit_vendor or credit_vendor != bill_vendor:
+            raise ValueError("QuickBooks credit and bill must belong to the same supplier")
+        if (credit.get("CurrencyRef") or {}).get("value") != (bill.get("CurrencyRef") or {}).get("value"):
+            raise ValueError("QuickBooks credit and bill currencies do not match")
+        if Decimal(str(credit.get("Balance") or 0)) < amount:
+            raise ValueError("QuickBooks VendorCredit does not have enough remaining credit")
+        if Decimal(str(bill.get("Balance") or 0)) < amount:
+            raise ValueError("QuickBooks bill has no sufficient remaining balance")
+        payment = {
+            "VendorRef": {"value": credit_vendor},
+            "PayType": "Check",
+            # Credit-only BillPayments have no cash total or bank account. The paired
+            # Bill and VendorCredit links let QBO consume AP balances without initiating
+            # a payout or inventing a cash disbursement.
+            "CheckPayment": {"PrintStatus": "NotSet"},
+            "TotalAmt": 0,
+            "PrivateNote": f"invoice-match-credit-application:{idempotency_key}"[:4000],
+            "Line": [
+                {"Amount": float(amount), "LinkedTxn": [{"TxnId": invoice_reference, "TxnType": "Bill"}]},
+                {"Amount": float(amount), "LinkedTxn": [{"TxnId": credit_reference, "TxnType": "VendorCredit"}]},
+            ],
+        }
+        response = self._request("POST", "billpayment", params={"requestid": idempotency_key}, body=payment)
+        result = response.get("BillPayment") if isinstance(response, dict) else None
+        if not isinstance(result, dict) or not result.get("Id"):
+            raise RuntimeError("QuickBooks returned no BillPayment ID after credit allocation")
+        return str(result["Id"])
+
+    def fetch_master_data(self) -> dict[str, list[dict]]:
+        """Fetch mapping reference data in bounded pages from QBO."""
+        entities = {"supplier": ("Vendor", "Name", "DisplayName"),
+                    "item": ("Item", "Name", "Sku"),
+                    "tax": ("TaxCode", "Name", "Name"),
+                    "currency": ("Currency", "Name", "Code")}
+        result = {}
+        for category, (entity, name_key, code_key) in entities.items():
+            rows, start = [], 1
+            while True:
+                query = f"select * from {entity} startposition {start} maxresults 100"
+                data = self._request("GET", "query", params={"query": query})
+                response = data.get("QueryResponse", {}) if isinstance(data, dict) else {}
+                page = response.get(entity, []) if isinstance(response, dict) else []
+                if isinstance(page, dict):
+                    page = [page]
+                for item in page:
+                    source_id = item.get("Id")
+                    name = item.get(name_key) or item.get("DisplayName") or item.get(code_key)
+                    if source_id and name:
+                        rows.append({"source_id": str(source_id), "name": str(name),
+                            "code": str(item.get(code_key)) if item.get(code_key) else None,
+                            "active": bool(item.get("Active", True)), "source_data": item})
+                if len(page) < 100:
+                    break
+                start += len(page)
+            result[category] = rows
+        return result
+
     @staticmethod
     def _validate_bill_total(bill: dict, payload: dict) -> None:
         if bill.get("TotalAmt") is None or payload.get("total_amount") is None:
             raise RuntimeError("QuickBooks Bill response did not include a total for reconciliation")
         actual = Decimal(str(bill["TotalAmt"]))
-        expected = Decimal(str(payload["total_amount"]))
+        expected = abs(Decimal(str(payload["total_amount"])))
         if abs(actual - expected) > Decimal("0.01"):
             raise RuntimeError(
-                f"QuickBooks Bill total {actual} differs from approved invoice total {expected}; "
+                f"QuickBooks payable total {actual} differs from approved document total {expected}; "
                 "check currency, tax-code, freight, and discount mappings"
             )
 
@@ -280,6 +353,16 @@ class QuickBooksOnlineAdapter:
         if isinstance(bills, dict):
             bills = [bills]
         return bills[0] if bills else None
+
+    def _find_vendor_credit(self, credit_number: str) -> dict | None:
+        safe_number = credit_number.replace("\\", "\\\\").replace("'", "\\'")
+        query = f"select * from VendorCredit where DocNumber = '{safe_number}'"
+        response = self._request("GET", "query", params={"query": query})
+        query_response = response.get("QueryResponse", {}) if isinstance(response, dict) else {}
+        credits = query_response.get("VendorCredit", []) if isinstance(query_response, dict) else []
+        if isinstance(credits, dict):
+            credits = [credits]
+        return credits[0] if credits else None
 
     def _access_token(self, *, force_refresh: bool = False) -> str:
         with self.session_factory() as session:
@@ -335,7 +418,7 @@ class QuickBooksOnlineAdapter:
                 data = json.loads(response.read())
         except HTTPError as exc:
             detail = exc.read(1000).decode("utf-8", errors="replace")
-            raise QuickBooksAPIError(exc.code, detail) from exc
+            raise QuickBooksAPIError(exc.code, detail, exc.headers.get("Retry-After")) from exc
         except URLError as exc:
             raise RuntimeError(f"QuickBooks OAuth token refresh failed: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
@@ -371,7 +454,7 @@ class QuickBooksOnlineAdapter:
                 detail = exc.read(2000).decode("utf-8", errors="replace")
                 if exc.code == 401 and attempt == 0:
                     continue
-                raise QuickBooksAPIError(exc.code, detail) from exc
+                raise QuickBooksAPIError(exc.code, detail, exc.headers.get("Retry-After")) from exc
             except URLError as exc:
                 raise RuntimeError(f"QuickBooks request failed: {exc.reason}") from exc
             if not raw:

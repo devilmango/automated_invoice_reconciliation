@@ -241,6 +241,7 @@ def deliver(
     from .adapters import create_adapter
     from .database import SessionLocal
     from .delivery import deliver_pending
+    from .credit_sync import sync_credit_applications
     from .accounting_status import refresh_due_accounting_statuses
 
     try:
@@ -368,6 +369,10 @@ def worker(
                 accounting_status = refresh_due_accounting_statuses(
                     session, provider, limit=limit, actor=worker_name,
                 )
+                credit_applications = sync_credit_applications(
+                    session, provider, limit=limit, max_attempts=ap_attempts,
+                    initial_retry_seconds=ap_initial, max_retry_seconds=ap_max,
+                )
                 notifications = {"delivered": 0, "failed": 0, "dead_lettered": 0}
                 if notification_adapter:
                     escalated = escalate_overdue(
@@ -396,11 +401,13 @@ def worker(
                 heartbeat.last_succeeded_at = now
                 failures = ap.get("failed", 0) + ap.get("dead_lettered", 0) + ap.get("blocked", 0) \
                     + notifications.get("failed", 0) + notifications.get("dead_lettered", 0) \
-                    + accounting_status.get("failed", 0)
+                    + accounting_status.get("failed", 0) + credit_applications.get("failed", 0) \
+                    + credit_applications.get("dead_lettered", 0)
                 heartbeat.last_error = f"{failures} delivery attempt(s) failed or dead-lettered" if failures else None
                 session.commit()
                 cycle.append({"company_id": company_id, "ap": ap,
-                              "accounting_status": accounting_status, "notifications": notifications,
+                              "accounting_status": accounting_status,
+                              "credit_applications": credit_applications, "notifications": notifications,
                               "health": "DEGRADED" if failures else "HEALTHY"})
         typer.echo(json.dumps({"companies": cycle}, indent=2))
         if once:

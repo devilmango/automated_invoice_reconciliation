@@ -7,7 +7,7 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .database import (APOutboxRecord, AuditEvent, MatchRecord, PaymentAllocationRecord,
+from .database import (APOutboxRecord, AuditEvent, CreditNoteApplicationRecord, MatchRecord, PaymentAllocationRecord,
                       PaymentReconciliationEventRecord, RemittancePaymentRecord)
 
 
@@ -19,7 +19,11 @@ def _outstanding(session: Session, outbox: APOutboxRecord) -> Decimal:
     allocated = session.scalar(select(func.sum(PaymentAllocationRecord.amount)).where(
         PaymentAllocationRecord.match_id == outbox.match_id
     ))
-    return max(Decimal(str(outbox.payload.get("total_amount") or 0)) - Decimal(str(allocated or 0)), Decimal(0))
+    credited = session.scalar(select(func.sum(CreditNoteApplicationRecord.amount)).where(
+        CreditNoteApplicationRecord.invoice_match_id == outbox.match_id
+    ))
+    return max(Decimal(str(outbox.payload.get("total_amount") or 0))
+               - Decimal(str(allocated or 0)) - Decimal(str(credited or 0)), Decimal(0))
 
 
 def _candidates(session: Session, payment: RemittancePaymentRecord):
@@ -129,6 +133,12 @@ def payment_result(session: Session, payment: RemittancePaymentRecord) -> dict:
         "id": payment.id, "external_id": payment.external_id, "vendor": payment.vendor,
         "currency": payment.currency, "amount": payment.amount, "reference": payment.reference,
         "payment_date": payment.payment_date, "status": payment.status,
+        "bank_account_id": payment.bank_account_id,
+        "bank_transaction_id": payment.bank_transaction_id,
+        "bank_statement_batch_id": payment.bank_statement_batch_id,
+        "matched_remittance_id": payment.matched_remittance_id,
+        "match_type": "REMITTANCE" if payment.matched_remittance_id else
+                      "INVOICE_ALLOCATION" if payment.allocated_amount else None,
         "allocated_amount": payment.allocated_amount,
         "unallocated_amount": payment.amount - payment.allocated_amount,
         "created_at": payment.created_at,

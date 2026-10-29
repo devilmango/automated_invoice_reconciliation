@@ -280,6 +280,9 @@ class ReviewerAPOutboxItem(StrictModel):
     accounting_status: str = "UNKNOWN"
     accounting_status_detail: dict = Field(default_factory=dict)
     accounting_status_checked_at: str | None = None
+    accounting_status_attempt_count: int = 0
+    accounting_status_next_retry_at: str | None = None
+    accounting_status_error: str | None = None
     mapping_issues: list[dict] = Field(default_factory=list)
 
 
@@ -379,3 +382,65 @@ class ManualPaymentAllocationRequest(StrictModel):
         if len({item.match_id for item in self.allocations}) != len(self.allocations):
             raise ValueError("Each invoice may appear once in an allocation request")
         return self
+
+
+class BankStatementImport(StrictModel):
+    statement_id: str = Field(min_length=1, max_length=160)
+    account_id: str = Field(default="default", min_length=1, max_length=160)
+    format: Literal["csv", "ofx", "bai2"]
+    content: str = Field(min_length=1, max_length=5_000_000)
+    opening_balance: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    closing_balance: Decimal | None = Field(default=None, max_digits=18, decimal_places=4)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+
+    @model_validator(mode="after")
+    def normalize_statement_fields(self):
+        self.account_id = self.account_id.strip()
+        if not self.account_id:
+            raise ValueError("Bank account ID cannot be empty")
+        if self.currency:
+            self.currency = self.currency.upper()
+        return self
+
+
+class Bai2TransactionCodeUpdate(StrictModel):
+    transaction_codes: dict[str, Literal["DEBIT", "CREDIT", "SKIP"]] = Field(max_length=500)
+
+    @model_validator(mode="after")
+    def validate_codes(self):
+        normalized = {}
+        for code, direction in self.transaction_codes.items():
+            value = code.strip()
+            if not value.isdigit() or len(value) > 3:
+                raise ValueError("BAI2 transaction codes must be one to three digits")
+            normalized[str(int(value))] = direction
+        self.transaction_codes = normalized
+        return self
+
+
+class BankReconciliationDecision(StrictModel):
+    action: Literal["confirm", "split", "reject", "link_payment"]
+    allocations: list[ManualPaymentAllocation] = Field(default_factory=list, max_length=100)
+    payment_match_id: str | None = Field(default=None, max_length=36)
+
+    @model_validator(mode="after")
+    def validate_decision(self):
+        if self.action == "reject" and (self.allocations or self.payment_match_id):
+            raise ValueError("Rejected decisions cannot include allocations")
+        if self.action == "confirm" and (len(self.allocations) != 1 or self.payment_match_id):
+            raise ValueError("Confirm requires exactly one invoice allocation")
+        if self.action == "split" and len(self.allocations) < 2:
+            raise ValueError("Split requires at least two invoice allocations")
+        if self.action == "link_payment" and (not self.payment_match_id or self.allocations):
+            raise ValueError("Link payment requires a payment_match_id and no invoice allocations")
+        if self.action != "link_payment" and self.payment_match_id:
+            raise ValueError("payment_match_id is only valid for a link_payment decision")
+        if len({item.match_id for item in self.allocations}) != len(self.allocations):
+            raise ValueError("Each invoice may appear once in an allocation request")
+        return self
+
+
+class CreditNoteApplication(StrictModel):
+    invoice_match_id: str = Field(min_length=1, max_length=36)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=4)
+    note: str | None = Field(default=None, max_length=1000)

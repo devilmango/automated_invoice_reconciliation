@@ -2,12 +2,40 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from cryptography.fernet import Fernet
 from sqlalchemy import select
 
 from invoice_match.adapters.xero import XeroAdapter
 from invoice_match.database import ProcurementRecord, SessionLocal, XeroCredentialRecord
+
+
+def test_xero_applies_credit_note_to_vendor_invoice_with_request_idempotency(clear_database):
+    adapter = XeroAdapter(
+        client_id="client", client_secret="secret", tenant_id="tenant-1",
+        encryption_key=Fernet.generate_key().decode(), refresh_token="refresh-old",
+        contact_map={"ABC Supplies": "contact-1"}, item_map={"A100": "A100"},
+        session_factory=SessionLocal,
+    )
+    calls = []
+
+    def api(path, *, method="GET", data=None, query=None, idempotency_key=None):
+        calls.append((path, method, data, idempotency_key))
+        if path == "CreditNotes/credit-1":
+            return {"CreditNotes": [{"Type": "ACCPAYCREDIT", "Status": "AUTHORISED",
+                "Contact": {"ContactID": "contact-1"}, "CurrencyCode": "USD",
+                "RemainingCredit": 20, "Allocations": []}]}
+        if path == "Invoices/bill-1":
+            return {"Invoices": [{"Type": "ACCPAY", "Contact": {"ContactID": "contact-1"},
+                                   "CurrencyCode": "USD", "AmountDue": 50}]}
+        return {"Allocations": [{"AllocationID": "allocation-1"}]}
+
+    adapter._api = api
+    assert adapter.apply_credit_note("credit-1", "bill-1", Decimal("12.50"),
+                                     idempotency_key="credit-application-1") == "allocation-1"
+    assert calls[-1] == ("CreditNotes/credit-1/Allocations", "PUT",
+        {"Amount": 12.5, "Invoice": {"InvoiceID": "bill-1"}}, "credit-application-1")
 
 
 def test_company_scoped_sessions_hide_other_companies(clear_database):
@@ -77,6 +105,45 @@ def test_xero_refreshes_tokens_and_submits_idempotent_ap_invoice(clear_database)
         credential = session.scalar(select(XeroCredentialRecord))
         assert credential is not None
         assert credential.encrypted_refresh_token != "refresh-new"
+
+
+def test_xero_exports_credit_notes_as_authorised_ap_credit_notes(clear_database):
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.body = json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return self.body
+
+    def opener(request, timeout):
+        calls.append(request)
+        if request.full_url.endswith("/connect/token"):
+            return Response({"access_token": "access", "refresh_token": "refresh", "expires_in": 1800})
+        if request.method == "GET":
+            return Response({"CreditNotes": []})
+        return Response({"CreditNotes": [{"CreditNoteID": "credit-42", "HasErrors": False}]})
+
+    adapter = XeroAdapter(client_id="client", client_secret="secret", tenant_id="tenant-1",
+        encryption_key=Fernet.generate_key().decode(), refresh_token="refresh-old",
+        contact_map={"ABC Supplies": "contact-1"}, item_map={"A100": "A100"},
+        session_factory=SessionLocal, opener=opener)
+    reference = adapter.submit_invoice({"document_type": "CREDIT_NOTE", "supplier_invoice_number": "CN-42",
+        "supplier": "ABC Supplies", "purchase_order_number": "PO-42", "currency": "USD",
+        "total_amount": "-10.00", "lines": [{"sku": "A100", "description": "Paper",
+        "quantity": "2", "unit_price": "5", "discount_rate": "0"}]}, idempotency_key="credit-match-42")
+    assert reference == "credit-42"
+    credit = json.loads(calls[2].data)["CreditNotes"][0]
+    assert credit["Type"] == "ACCPAYCREDIT"
+    assert credit["CreditNoteNumber"] == "CN-42"
+    assert credit["Status"] == "AUTHORISED"
 
 
 def test_api_scopes_match_reads_and_idempotency_to_token_company(client, monkeypatch):

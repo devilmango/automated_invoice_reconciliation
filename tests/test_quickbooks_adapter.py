@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from urllib.parse import parse_qs
 
 from cryptography.fernet import Fernet
@@ -81,6 +82,33 @@ def test_quickbooks_retry_returns_existing_bill_with_own_idempotency_marker():
     assert adapter.submit_invoice(payable_payload(), idempotency_key="match-123") == "qbo-bill-existing"
 
 
+def test_quickbooks_applies_vendor_credit_to_bill_as_credit_only_billpayment():
+    adapter = make_adapter()
+    calls = []
+
+    def request(method, path, *, params=None, body=None):
+        calls.append((method, path, params, body))
+        if path == "vendorcredit/credit-1":
+            return {"VendorCredit": {"VendorRef": {"value": "vendor-7"},
+                                      "CurrencyRef": {"value": "USD"}, "Balance": 20}}
+        if path == "bill/bill-1":
+            return {"Bill": {"VendorRef": {"value": "vendor-7"},
+                              "CurrencyRef": {"value": "USD"}, "Balance": 50}}
+        return {"BillPayment": {"Id": "payment-credit-1"}}
+
+    adapter._request = request
+    result = adapter.apply_credit_note("credit-1", "bill-1", Decimal("12.50"),
+                                       idempotency_key="credit-application-1")
+    assert result == "payment-credit-1"
+    method, path, params, body = calls[-1]
+    assert (method, path, params) == ("POST", "billpayment", {"requestid": "credit-application-1"})
+    assert body["TotalAmt"] == 0
+    assert body["Line"] == [
+        {"Amount": 12.5, "LinkedTxn": [{"TxnId": "bill-1", "TxnType": "Bill"}]},
+        {"Amount": 12.5, "LinkedTxn": [{"TxnId": "credit-1", "TxnType": "VendorCredit"}]},
+    ]
+
+
 def test_quickbooks_duplicate_invoice_from_another_match_is_rejected():
     adapter = make_adapter()
     adapter._find_bill = lambda invoice_number: {
@@ -94,7 +122,7 @@ def test_quickbooks_duplicate_invoice_from_another_match_is_rejected():
         raise AssertionError("provider duplicate should be rejected")
 
 
-def test_quickbooks_rejects_unmapped_tax_and_unsupported_credit_notes():
+def test_quickbooks_rejects_unmapped_tax():
     adapter = make_adapter()
     adapter._find_bill = lambda invoice_number: None
     missing_tax = payable_payload()
@@ -106,14 +134,17 @@ def test_quickbooks_rejects_unmapped_tax_and_unsupported_credit_notes():
     else:
         raise AssertionError("unmapped tax code should be rejected")
 
+
+
+def test_quickbooks_exports_credit_notes_as_vendor_credits():
+    adapter = make_adapter()
+    adapter._find_vendor_credit = lambda credit_number: None
+    adapter._request = lambda method, path, *, params=None, body=None: {
+        "VendorCredit": {"Id": "qbo-credit-11", "TotalAmt": 48.6}}
     credit_note = payable_payload()
-    credit_note["document_type"] = "CREDIT_NOTE"
-    try:
-        adapter.submit_invoice(credit_note, idempotency_key="match-credit")
-    except ValueError as exc:
-        assert "credit notes" in str(exc)
-    else:
-        raise AssertionError("credit note support should fail explicitly")
+    credit_note.update(document_type="CREDIT_NOTE", total_amount="-48.60",
+                       lines=[{**credit_note["lines"][0], "line_net": "-45.00", "line_tax": "-3.60"}])
+    assert adapter.submit_invoice(credit_note, idempotency_key="match-credit") == "qbo-credit-11"
 
 
 class FakeResponse:

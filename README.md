@@ -21,8 +21,13 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 - **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
 - **Scheduled procurement sync:** Synchronize purchase orders and their receipts into the database using filesystem or generic REST adapters; reruns update the stored snapshot.
 - **Invoice inbox intake:** Poll a mounted directory of PDF, EML, and text invoices, submit each capture for OCR-assisted review, and archive accepted/duplicate files while leaving transient failures ready for retry.
-- **Accounting exports:** Create mapped QuickBooks Bills or Xero Accounts Payable invoices with encrypted, refreshable OAuth tokens and provider-side duplicate checks.
-- **Durable delivery workers:** Poll AP and notification outboxes, retry with configurable exponential backoff, dead-letter exhausted deliveries, and report worker health.
+- **Accounting exports:** Create mapped QuickBooks Bills/VendorCredits or Xero AP invoices/credit notes with encrypted, refreshable OAuth tokens and provider-side duplicate checks.
+- **Bank statement reconciliation:** Import CSV, OFX, or supported BAI2 activity with account-scoped transaction identity, statement balances, bank-specific transaction codes, and guided reviewer decisions.
+- **Accounting master-data sync:** Refresh supplier, item, tax, and currency reference data from QuickBooks or Xero; review fuzzy mapping suggestions before applying mappings.
+- **Credit note workflow:** Export approved supplier credits and apply them to linked, open invoices with balance checks, approver identity, and audit events.
+- **OIDC reviewer login:** Add organization SSO with Authorization Code + PKCE, RS256 ID-token validation, company claim scoping, and explicit group-to-role mapping.
+- **Accounting status resilience:** Back off failed status lookups with persisted retry schedules and visible attempt/error information.
+- **Durable delivery workers:** Poll AP, notification, and credit-application outboxes, retry with configurable exponential backoff, dead-letter exhausted deliveries, and report worker health.
 - **PDF/email capture:** Extract candidate invoice fields with confidence and require human verification before matching.
 - **Capture review inbox:** Preview source documents, inspect field confidence and extraction notes, correct invoice fields, and verify with a distinct approver.
 - **Vendor extraction profiles:** Configure supplier aliases, custom invoice labels, date formats, default currencies, and SKU aliases in YAML.
@@ -393,6 +398,55 @@ Admins maintain connector mappings through `GET /admin/accounting-connections/{p
 
 Reviewer AP outbox rows include `mapping_issues`, and `GET /reviewer/ap-outbox/{match_id}/mapping-check` provides a focused check before an export retry. The API blocks manual retries when required supplier, item, or tax mappings are absent and records the block in the match audit trail. The operations page exposes the mapping editor to admins and shows missing mappings beside the affected export.
 
+Admins can refresh the available supplier/item/tax/currency references with `POST /admin/accounting-connections/{provider}/sync-masters`, then inspect them at `GET /admin/accounting-connections/{provider}/master-data`. `GET /admin/accounting-connections/{provider}/mapping-suggestions` ranks likely mapping candidates against invoice labels. Suggestions are advisory and never update the encrypted mapping configuration automatically. A failed status lookup records the attempt and error, then schedules another attempt after 60 seconds, doubling to a 24-hour ceiling. HTTP 429 responses use the provider's `Retry-After` value when present, with a five-minute minimum when it is absent. Reviewer AP outbox rows expose `accounting_status_attempt_count`, `accounting_status_next_retry_at`, and `accounting_status_error`; worker polling skips rows until their retry time. An admin can trigger an immediate check with `POST /reviewer/ap-outbox/{match_id}/sync-status`.
+
+### Import bank statements
+
+The integration endpoint accepts a statement ID, bank account ID, one of `csv`, `ofx`, or `bai2`, and the source file content as text. It also stores optional opening and closing balances and statement currency in a durable batch record. CSV expects a header plus a stable transaction ID (`transaction_id`, `fitid`, or `id`), a date, and either a signed `amount` or `debit`/`credit` columns. Common OFX `STMTTRN` fields and BAI2 group header (`02`), account identifier (`03`), and transaction detail (`16`) records are supported. BAI2 detail amounts use the bank's implied currency precision; detail codes 400–699 default to debits. Banks can customize transaction codes with an admin-managed account mapping. The BAI2 record layout is based on the [Goldman Sachs BAI File Guide](https://developer.gs.com/docs/services/transaction-banking/bai-file/).
+
+```bash
+curl --request POST http://127.0.0.1:8000/integrations/bank-statements/import \
+  --header 'Authorization: Bearer <integration-token>' \
+  --header 'Content-Type: application/json' \
+  --data @- <<'JSON'
+{"statement_id":"OPERATING-2026-10-12","account_id":"OPERATING-1","opening_balance":"12000.00","closing_balance":"11050.00","currency":"USD","format":"csv","content":"transaction_id,date,amount,vendor,reference,currency\nBANK-881,2026-10-12,-950.00,ABC Supplies,INV-10041,USD\n"}
+JSON
+```
+
+Outgoing debit entries enter the bank review queue without automatic allocation. The reviewer page at `/reviewer/bank-reconciliation` ranks open invoices and existing payment advice and shows reference, supplier, amount, and date evidence. Approvers can confirm one invoice, split an amount across invoices, link matching payment advice, or reject suggestions; each decision is recorded in the payment audit history. Incoming credits are skipped because this queue represents money paid to suppliers. Company, bank account ID, and transaction ID form the transaction identity, so accounts may safely reuse transaction IDs. An exact statement replay is idempotent; reusing a statement ID with changed content or balances returns `409 BANK_STATEMENT_ID_REUSED`, while reusing a transaction ID in the same account with changed details returns `409 BANK_TRANSACTION_ID_REUSED`.
+
+Admins configure bank-specific BAI2 codes by mapping each code to `DEBIT`, `CREDIT`, or `SKIP`:
+
+```bash
+curl --request PUT http://127.0.0.1:8000/admin/bank-accounts/OPERATING-1/bai2-codes \
+  --header 'Authorization: Bearer <admin-token>' --header 'Content-Type: application/json' \
+  --data '{"transaction_codes":{"495":"CREDIT","100":"DEBIT","890":"SKIP"}}'
+```
+
+Inspect persisted statement batches and balances at `GET /reviewer/bank-statements`. Browse queued transactions at `GET /reviewer/bank-transactions`; use `/reviewer/bank-transactions/{payment_id}/candidates` for ranked explanations and `/reviewer/bank-transactions/{payment_id}/decision` to record a reviewer decision.
+
+### Credit note approvals and application
+
+Credit notes require `document_type: "CREDIT_NOTE"` and `credit_note_for` containing the original invoice number (or match ID). Their input line amounts are positive; AP adapters reverse the sign when exporting. QuickBooks uses VendorCredit records and Xero uses authorized `ACCPAYCREDIT` credit notes. To apply a credit, the credit note must be approved and both credit and invoice must already be acknowledged by the accounting adapter. An approver can post `{"invoice_match_id":"<invoice-match-id>","amount":"25.00","note":"Approved supplier credit"}` to `POST /reviewer/credit-notes/{credit_match_id}/apply`. The API enforces the original document link, supplier, currency, credit balance, and invoice open balance, then writes a durable provider-sync job. Supply an `Idempotency-Key` header to safely replay the application request. The worker applies queued credits to Xero and QuickBooks with provider idempotency keys, retry backoff, and dead-letter states. Reviewers can inspect each attempt at `/reviewer/credit-notes/{credit_match_id}/applications`; admins can retry pending or dead-lettered jobs at `POST /admin/credit-applications/{sync_id}/retry`. Each application is audited against both documents and reduces the invoice balance used by payment reconciliation.
+
+### Organization SSO (OIDC)
+
+Register `OIDC_REDIRECT_URI` as the identity provider callback (`/auth/oidc/callback`). Configure the issuer discovery URL, client ID, optional client secret, and a random session-signing secret of at least 32 bytes. Reviewer roles are granted only through the JSON group map; unknown groups receive no access. Set `OIDC_COOKIE_SECURE=true` behind HTTPS in production.
+
+```dotenv
+OIDC_ISSUER=https://id.example.com
+OIDC_CLIENT_ID=invoice-match
+OIDC_CLIENT_SECRET=<client-secret>
+OIDC_REDIRECT_URI=https://finance.example.com/auth/oidc/callback
+OIDC_SESSION_SECRET=<random-secret-at-least-32-bytes>
+OIDC_ROLE_CLAIM=groups
+OIDC_ROLE_MAP={"finance-reviewers":["reviewer"],"finance-approvers":["reviewer","approver"],"finance-admins":["reviewer","approver","admin"]}
+OIDC_COMPANY_CLAIM=company_id
+OIDC_COOKIE_SECURE=true
+```
+
+The reviewer pages provide a **Sign in with SSO** link. Login uses Authorization Code + PKCE, validates issuer, audience, nonce, expiry, and the RS256 signature against the issuer JWKS, then issues a short-lived HTTP-only SameSite=Lax cookie. The session company claim scopes database reads and writes just like bearer-token company IDs. Set `OIDC_SESSION_TTL_SECONDS` to adjust the default one-hour session lifetime. Existing reviewer bearer tokens remain supported for API clients and local setups.
+
 ### Dead-letter review and replay
 
 The operations page lists `PENDING`, `ACKNOWLEDGED`, and `DEAD` exports. Select **Dead letter** to focus failed exports that exhausted automatic retries. **Attempt history** shows retry requests, failures, acknowledgements, mapping blocks, and external-reference changes. Only an admin can replay a pending or dead-lettered export; replay keeps the match ID as the idempotency key and records a new event. A reviewer can inspect history but receives an authorization error if they try to replay. The reviewer API can filter directly with `GET /reviewer/ap-outbox?state=DEAD`, and event history is available at `GET /reviewer/ap-outbox/{match_id}/history`.
@@ -427,7 +481,7 @@ Each authenticated request is scoped to the company bound to its bearer token. T
 
 ### Run durable background delivery
 
-Run the worker as a separate process to poll AP and notification outboxes. The Docker Compose configuration starts it alongside the API and database:
+Run the worker as a separate process to poll AP, notification, and credit application outboxes. The Docker Compose configuration starts it alongside the API and database:
 
 ```bash
 docker compose up --build
@@ -477,13 +531,13 @@ alembic upgrade head
 invoice-match deliver --adapter quickbooks --limit 100
 ```
 
-The connector queries by supplier invoice number before creating a Bill and stores the invoice-match ID in the QuickBooks private note. A retry for the same match returns the existing Bill instead of creating a duplicate; a Bill with that invoice number belonging to another match is rejected. A stable QBO `requestid` is also sent. Current connector scope is Bill export only: `match-ap` still needs an inbound-capable adapter for PO and receipt retrieval, and QuickBooks credit notes, PO-line linking, and account-specific tax behavior need explicit provider support before use. Test mappings and tax treatment in the QBO sandbox before enabling production delivery.
+The connector queries by supplier invoice number before creating a Bill and stores the invoice-match ID in the QuickBooks private note. A retry for the same match returns the existing Bill instead of creating a duplicate; a Bill with that invoice number belonging to another match is rejected. A stable QBO `requestid` is also sent. Approved credit notes are exported as VendorCredit records using the same mapping and idempotency checks. `match-ap` still needs an inbound-capable adapter for PO and receipt retrieval, and PO-line linking and account-specific tax behavior need explicit provider support before use. Test mappings and tax treatment in the QBO sandbox before enabling production delivery.
 
 ### Export approved invoices to Xero
 
-Select `xero` as `AP_DELIVERY_ADAPTER`. Complete Xero OAuth authorization with `offline_access`, the Accounting API scope, and the initial tenant consent before starting delivery. Configure the client credentials, tenant ID, refresh token, and a Fernet key. The adapter rotates refresh tokens and stores them encrypted in `xero_credentials`; keep the encryption key in a secret manager. Xero refresh tokens rotate and are time-limited, so the worker must stay online to refresh before expiration. Xero's API supports `ACCPAY` invoices, `InvoiceNumbers` lookup, OAuth refresh, and `Idempotency-Key`; the adapter checks the invoice number/reference marker before creation and sends the stable match ID as the POST idempotency key. See the [Xero invoices API](https://developer.xero.com/documentation/api/accounting/invoices), [OAuth token guide](https://developer.xero.com/documentation/guides/oauth2/token-types/), and [idempotency guide](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/).
+Select `xero` as `AP_DELIVERY_ADAPTER`. Complete Xero OAuth authorization with `offline_access`, the Accounting API scope, and the initial tenant consent before starting delivery. Configure the client credentials, tenant ID, refresh token, and a Fernet key. The adapter rotates refresh tokens and stores them encrypted in `xero_credentials`; keep the encryption key in a secret manager. Xero refresh tokens rotate and are time-limited, so the worker must stay online to refresh before expiration. Xero's API supports `ACCPAY` invoices and `ACCPAYCREDIT` supplier credit notes, OAuth refresh, and `Idempotency-Key`; the adapter checks the document number/reference marker before creation and sends the stable match ID as the POST idempotency key. See the [Xero invoices API](https://developer.xero.com/documentation/api/accounting/invoices), [credit notes API](https://developer.xero.com/documentation/api/accounting/creditnotes/), [OAuth token guide](https://developer.xero.com/documentation/guides/oauth2/token-types/), and [idempotency guide](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/).
 
-Map each supplier to an existing Xero ContactID and each SKU to an existing ItemCode. Tax codes map to Xero tax types; an optional account code can be configured for expense lines. The adapter exports invoices only, not credit notes, and does not host the interactive OAuth consent flow. Validate account, tax, rounding, and mapping behavior in a Xero test organisation before enabling production delivery.
+Map each supplier to an existing Xero ContactID and each SKU to an existing ItemCode. Tax codes map to Xero tax types; an optional account code can be configured for expense lines. The adapter does not host the interactive accounting-provider OAuth consent flow. Validate account, tax, rounding, and mapping behavior in a Xero test organisation before enabling production delivery.
 
 ```dotenv
 AP_DELIVERY_ADAPTER=xero
@@ -506,9 +560,16 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `GET` | `/reviewer` | Browser-based reviewer queue and decision dashboard |
 | `GET` | `/reviewer/captures` | Browser-based capture review inbox |
 | `GET` | `/reviewer/operations` | Operations reporting and AP export reconciliation dashboard |
+| `GET` | `/reviewer/bank-reconciliation` | Guided bank transaction review and allocation decisions |
+| `GET` | `/auth/oidc/login` | Start reviewer OIDC login with PKCE (when OIDC is configured) |
+| `GET` | `/auth/oidc/me` | Return signed-in reviewer identity, roles, and company |
+| `POST` | `/auth/oidc/logout` | Clear the reviewer OIDC browser session |
 | `GET` | `/reviewer/ap-outbox?state=DEAD` | Filter dead-letter AP exports and surface mapping preflight warnings |
 | `GET` | `/reviewer/ap-outbox/{match_id}/history` | Inspect AP retry and reconciliation history (reviewer token required) |
 | `GET` | `/reviewer/ap-outbox/{match_id}/mapping-check` | Check provider mapping readiness before delivery (reviewer token required) |
+| `POST` | `/admin/accounting-connections/{provider}/sync-masters` | Refresh supplier, item, tax, and currency references (admin token required) |
+| `GET` | `/admin/accounting-connections/{provider}/master-data` | List synchronized accounting references (admin token required) |
+| `GET` | `/admin/accounting-connections/{provider}/mapping-suggestions` | Get advisory mapping candidates (admin token required) |
 | `POST` | `/admin/procurement/sync` | Synchronize POs and receipts from the configured provider (admin token required) |
 | `GET` | `/admin/accounting-connections/{provider}/mappings` | Read company accounting mappings (admin token required) |
 | `PUT` | `/admin/accounting-connections/{provider}/mappings/{category}` | Replace supplier, item, tax, or currency map (admin token required) |
@@ -544,6 +605,15 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `POST` | `/reviewer/ap-outbox/{match_id}/retry` | Retry one pending export through `AP_DELIVERY_ADAPTER` (admin token required) |
 | `POST` | `/reviewer/ap-outbox/{match_id}/reconcile` | Save an external reference for an acknowledged export (admin token required) |
 | `GET` | `/reviewer/reports/operations` | Match, approval, exception, vendor, and export metrics (reviewer token required) |
+| `POST` | `/integrations/bank-statements/import` | Import supported CSV, OFX, or BAI2 bank activity (integration token required) |
+| `GET` | `/reviewer/bank-transactions` | List imported outgoing bank transactions (reviewer token required) |
+| `GET` | `/reviewer/bank-transactions/{payment_id}/candidates` | List ranked invoice matches with evidence (reviewer token required) |
+| `POST` | `/reviewer/bank-transactions/{payment_id}/decision` | Confirm, split, or reject suggested allocations (approver token required) |
+| `GET` | `/reviewer/bank-statements` | List statement batches and opening/closing balances (reviewer token required) |
+| `PUT` | `/admin/bank-accounts/{account_id}/bai2-codes` | Configure bank-specific BAI2 debit/credit/skip codes (admin token required) |
+| `GET` | `/reviewer/credit-notes` | Inspect exported credit balances and application totals (reviewer token required) |
+| `POST` | `/reviewer/credit-notes/{credit_match_id}/apply` | Apply approved credit to a linked open invoice (approver token required) |
+| `POST` | `/admin/credit-applications/{sync_id}/retry` | Retry a failed provider credit allocation (admin token required) |
 
 Interactive API documentation is available at `/docs` and `/redoc` while the service is running.
 
@@ -700,7 +770,7 @@ alembic upgrade head
 invoice-match serve
 ```
 
-Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, notification delivery state in `notification_outbox`, encrypted QuickBooks and Xero OAuth tokens in their credential tables, and worker liveness in `worker_heartbeats`. Migration `0007_company_delivery_xero` adds per-company data boundaries and retry scheduling; pre-existing data is assigned to `default`.
+Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, credit allocation delivery state in `credit_application_outbox`, statement metadata in `bank_statement_batches`, notification delivery state in `notification_outbox`, encrypted QuickBooks and Xero OAuth tokens in their credential tables, and worker liveness in `worker_heartbeats`. Migration `0007_company_delivery_xero` adds per-company data boundaries and retry scheduling; pre-existing data is assigned to `default`.
 
 ## Project layout
 

@@ -13,7 +13,7 @@
 <body>
   <header class="bar"><strong>INVOICE MATCH · CAPTURE REVIEW</strong><nav><a href="/reviewer">← Exception queue</a> · <a href="/reviewer/operations">Operations →</a></nav></header>
   <main class="wrap">
-    <section class="intro"><div><div class="eyebrow">Human verification · OCR review</div><h1>Captured invoices</h1><p>Review source files and extraction confidence, correct invoice fields, then verify before matching.</p></div><form class="connect" id="authForm"><label for="token" class="hidden">Reviewer bearer token</label><input id="token" type="password" autocomplete="off" placeholder="Reviewer bearer token" required><button type="submit">Connect</button></form></section>
+    <section class="intro"><div><div class="eyebrow">Human verification · OCR review</div><h1>Captured invoices</h1><p>Review source files and extraction confidence, correct invoice fields, then verify before matching.</p></div><form class="connect" id="authForm"><label for="token" class="hidden">Reviewer bearer token</label><input id="token" type="password" autocomplete="off" placeholder="Reviewer bearer token"><button type="submit">Connect</button><a href="/auth/oidc/login?return_to=%2Freviewer%2Fcaptures">Sign in with SSO</a></form></section>
     <div class="notice" id="notice" role="status" aria-live="polite"></div>
     <section class="grid">
       <div class="panel"><div class="head"><h2>Needs review</h2><span class="muted" id="count">Connect to load</span></div><div class="search"><label for="search" class="hidden">Search captured invoices</label><input id="search" type="search" placeholder="Search filename, vendor, invoice number"></div><div class="list" id="list"><div class="blank">Enter a reviewer token to load pending captures.</div></div></div>
@@ -22,23 +22,23 @@
   </main>
   <script>
     const $ = id => document.getElementById(id);
-    let token = sessionStorage.getItem('invoiceMatchReviewerToken') || '';
+    let token = sessionStorage.getItem('invoiceMatchReviewerToken') || ''; let cookieSession = true;
     let documents = [];
     let selected = '';
     let sourceUrl = '';
     let searchTimer;
-    if (token) { $('token').value = token; loadList(); }
+    if (token) { $('token').value = token; loadList(); } else if (cookieSession) loadList();
     $('authForm').addEventListener('submit', async event => { event.preventDefault(); token = $('token').value.trim(); if (!token) return; sessionStorage.setItem('invoiceMatchReviewerToken', token); await loadList(); });
     $('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(renderList, 200); });
     function notice(message) { $('notice').textContent = message; $('notice').classList.toggle('show', Boolean(message)); }
     async function api(path, options = {}) {
-      const response = await fetch(path, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers } });
+      const response = await fetch(path, { ...options, headers: { ...(token ? {Authorization: `Bearer ${token}`} : {}), ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers } });
       let body; try { body = await response.json(); } catch { body = null; }
-      if (!response.ok) { if (response.status === 401) { token=''; $('token').value=''; sessionStorage.removeItem('invoiceMatchReviewerToken'); } throw new Error(typeof body?.detail === 'string' ? body.detail : body?.detail?.code || `Request failed (${response.status})`); }
+      if (!response.ok) { if (response.status === 401) { token=''; cookieSession=false; $('token').value=''; sessionStorage.removeItem('invoiceMatchReviewerToken'); } throw new Error(typeof body?.detail === 'string' ? body.detail : body?.detail?.code || `Request failed (${response.status})`); }
       return body;
     }
     async function loadSource(id, contentType) {
-      const response = await fetch(`/documents/${id}/source`, {headers:{Authorization:`Bearer ${token}`}});
+      const response = await fetch(`/documents/${id}/source`, {headers:token?{Authorization:`Bearer ${token}`}:{}});
       if (!response.ok) throw new Error(`Could not load source preview (${response.status})`);
       if (sourceUrl) URL.revokeObjectURL(sourceUrl);
       const blob = await response.blob(); sourceUrl = URL.createObjectURL(blob);
@@ -47,7 +47,7 @@
       else { const pre=document.createElement('pre'); pre.textContent=await blob.text(); preview.append(pre); }
     }
     async function loadList() {
-      if (!token) return;
+      if (!token && !cookieSession) return;
       try { documents=await api('/documents?status=REVIEW_REQUIRED&limit=1000'); $('count').textContent=`${documents.length} pending`; renderList(); if (selected && documents.some(doc=>doc.document_id===selected)) await loadDetail(selected); else if (!documents.length) { selected=''; $('detail').innerHTML='<div class="head"><h2>Invoice review</h2><span class="muted">Queue clear</span></div><div class="blank">No captured invoices need review.</div>'; } notice(''); }
       catch(error) { notice(error.message); }
     }

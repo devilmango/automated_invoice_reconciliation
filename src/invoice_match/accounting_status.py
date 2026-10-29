@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -14,11 +15,42 @@ def refresh_accounting_status(session: Session, adapter, item: APOutboxRecord, *
         raise ValueError(f"{adapter.name} does not support accounting status lookups")
     if item.state != "ACKNOWLEDGED" or not item.external_reference:
         raise ValueError("Invoice must be acknowledged and have an external reference")
-    details = fetch_status(item.external_reference)
+    try:
+        details = fetch_status(item.external_reference)
+    except Exception as exc:
+        item.accounting_status_attempt_count += 1
+        item.accounting_status_error = str(exc)[:1000]
+        delay = min(3600 * 24, 60 * (2 ** min(max(item.accounting_status_attempt_count - 1, 0), 10)))
+        status_code = getattr(exc, "status", None)
+        retry_after = getattr(exc, "retry_after", None)
+        if status_code == 429 and not retry_after:
+            delay = max(delay, 300)
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        if retry_after:
+            try:
+                retry_at = max(retry_at, datetime.now(timezone.utc) + timedelta(seconds=max(0, int(retry_after))))
+            except (TypeError, ValueError):
+                try:
+                    header_time = parsedate_to_datetime(str(retry_after))
+                    if header_time.tzinfo is None:
+                        header_time = header_time.replace(tzinfo=timezone.utc)
+                    retry_at = max(retry_at, header_time.astimezone(timezone.utc))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        item.accounting_status_next_retry_at = retry_at
+        session.add(AuditEvent(match_id=item.match_id, event_type="AP_ACCOUNTING_STATUS_SYNC_FAILED",
+            actor=actor, details={"attempt": item.accounting_status_attempt_count,
+                                  "retry_at": item.accounting_status_next_retry_at.isoformat(),
+                                  "error": item.accounting_status_error,
+                                  "provider_status": status_code}))
+        raise
     previous = item.accounting_status
     item.accounting_status = details.get("status", "UNKNOWN")
     item.accounting_status_detail = details
     item.accounting_status_checked_at = datetime.now(timezone.utc)
+    item.accounting_status_attempt_count += 1
+    item.accounting_status_next_retry_at = None
+    item.accounting_status_error = None
     changed = item.accounting_status != previous
     if changed:
         session.add(AuditEvent(match_id=item.match_id, event_type="AP_ACCOUNTING_STATUS_UPDATED",
@@ -32,9 +64,12 @@ def refresh_due_accounting_statuses(session: Session, adapter, *, limit: int = 1
                                     minimum_interval: int = 900) -> dict:
     if not hasattr(adapter, "fetch_invoice_status"):
         return {"checked": 0, "changed": 0, "failed": 0}
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=minimum_interval)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=minimum_interval)
     items = session.scalars(select(APOutboxRecord).where(
         APOutboxRecord.state == "ACKNOWLEDGED", APOutboxRecord.external_reference.is_not(None),
+        or_(APOutboxRecord.accounting_status_next_retry_at.is_(None),
+            APOutboxRecord.accounting_status_next_retry_at <= now),
         or_(APOutboxRecord.accounting_status_checked_at.is_(None),
             APOutboxRecord.accounting_status_checked_at <= cutoff),
     ).order_by(APOutboxRecord.accounting_status_checked_at.asc().nullsfirst()).limit(limit)).all()
@@ -43,7 +78,7 @@ def refresh_due_accounting_statuses(session: Session, adapter, *, limit: int = 1
         try:
             summary["changed"] += int(refresh_accounting_status(session, adapter, item, actor=actor))
             summary["checked"] += 1
-        except (RuntimeError, ValueError):
+        except Exception:
             summary["failed"] += 1
     session.commit()
     return summary

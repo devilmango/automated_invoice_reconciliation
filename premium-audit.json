@@ -1,0 +1,95 @@
+{
+  "findings": [
+    {
+      "category": "unresolved",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 17,
+      "message": "Native date/time input is used without an explicit ownership decision.",
+      "remediation": "Record Date as native or reuse the typed/authored canonical owner.",
+      "ruleId": "ownership.native-date-undecided",
+      "severity": "error"
+    },
+    {
+      "category": "unresolved",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 23,
+      "message": "Native select is used without an explicit ownership decision.",
+      "remediation": "Record Select/Listbox as native or reuse the authored canonical owner.",
+      "ruleId": "ownership.native-select-undecided",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 17,
+      "message": "Enabled literal button has no detectable action or submit behavior.",
+      "remediation": "Connect the button to a real action, make it a submit button, or disable/remove it.",
+      "ruleId": "affordance.actionless-button",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 25,
+      "message": "Enabled literal button has no detectable action or submit behavior.",
+      "remediation": "Connect the button to a real action, make it a submit button, or disable/remove it.",
+      "ruleId": "affordance.actionless-button",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 25,
+      "message": "Enabled literal button has no detectable action or submit behavior.",
+      "remediation": "Connect the button to a real action, make it a submit button, or disable/remove it.",
+      "ruleId": "affordance.actionless-button",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer-captures.html",
+      "line": 16,
+      "message": "Application-owned form does not declare its validation owner.",
+      "remediation": "Add noValidate/novalidate and implement the canonical validation contract.",
+      "ruleId": "form.novalidate-missing",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 15,
+      "message": "Application-owned form does not declare its validation owner.",
+      "remediation": "Add noValidate/novalidate and implement the canonical validation contract.",
+      "ruleId": "form.novalidate-missing",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer.html",
+      "line": 28,
+      "message": "Application-owned form does not declare its validation owner.",
+      "remediation": "Add noValidate/novalidate and implement the canonical validation contract.",
+      "ruleId": "form.novalidate-missing",
+      "severity": "error"
+    },
+    {
+      "category": "violation",
+      "file": "src/invoice_match/static/reviewer-operations.html",
+      "line": 25,
+      "message": "Literal product textarea does not show evidence of the canonical resize-none rule.",
+      "remediation": "Use the shared Textarea owner or apply resize-none/resize: none with adequate height or auto-grow behavior.",
+      "ruleId": "form.textarea-resize-missing",
+      "severity": "error"
+    }
+  ],
+  "mode": "strict",
+  "projectRoot": "/Users/sukriti/work/git_repo/public_git_projects/automated_invoice_reconciliation",
+  "schemaVersion": 1,
+  "summary": {
+    "errors": 9,
+    "total": 9,
+    "unresolved": 2,
+    "violations": 7,
+    "warnings": 0
+  }
+}

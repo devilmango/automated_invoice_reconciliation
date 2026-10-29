@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -24,6 +24,7 @@ from .database import (
     AccountingConnectionEventRecord,
     AccountingConnectionRecord,
     APOutboxRecord,
+    PaymentAllocationRecord,
     AuditEvent,
     CapturedDocumentRecord,
     DocumentCaptureEvent,
@@ -37,6 +38,11 @@ from .database import (
     RuleVersionRecord,
     SessionLocal,
     WorkerHeartbeatRecord,
+    AccountingMasterDataRecord,
+    CreditNoteApplicationRecord,
+    CreditApplicationOutboxRecord,
+    BankStatementBatchRecord,
+    BankAccountConfigurationRecord,
 )
 from .document_capture import extract_document
 from .integration_auth import require_integration
@@ -73,12 +79,19 @@ from .schemas import (
     AccountingMappingUpdate,
     RemittancePaymentCreate,
     ManualPaymentAllocationRequest,
+    BankStatementImport,
+    CreditNoteApplication,
+    Bai2TransactionCodeUpdate,
+    BankReconciliationDecision,
 )
 from .accounting_connections import (check_payload_mappings, decrypt_configuration,
                                      encrypt_configuration, mapping_field, public_connection,
                                      validate_configuration)
+from .payment_reconciliation import _candidates as _payment_candidates
 from .payment_reconciliation import manually_allocate, payment_result, reconcile_payment
 from .accounting_status import refresh_accounting_status
+from .bank_statement import parse_statement
+from .credit_sync import retry_credit_application, sync_credit_applications as _sync_credit_applications
 
 app = FastAPI(
     title="invoice-match",
@@ -89,11 +102,13 @@ app = FastAPI(
 
 def get_session(request: Request):
     from .integration_auth import company_for_token
+    from .oidc_auth import principal_from_cookie
 
     authorization = request.headers.get("authorization", "")
     token = authorization.split(None, 1)[1] if authorization.lower().startswith("bearer ") else None
+    oidc_principal = principal_from_cookie(request) if not token else None
     with SessionLocal() as session:
-        session.info["company_id"] = company_for_token(token)
+        session.info["company_id"] = oidc_principal["company_id"] if oidc_principal else company_for_token(token)
         yield session
 
 
@@ -423,6 +438,44 @@ def reviewer_dashboard():
     return FileResponse(Path(__file__).parent / "static" / "reviewer.html")
 
 
+@app.get("/auth/oidc/login", include_in_schema=False)
+def oidc_login(return_to: str = "/reviewer"):
+    from .oidc_auth import begin_login, cookie_options, state_cookie_name
+
+    url, state_cookie = begin_login(return_to)
+    response = RedirectResponse(url, status_code=302)
+    response.set_cookie(state_cookie_name(), state_cookie, max_age=600, **cookie_options())
+    return response
+
+
+@app.get("/auth/oidc/callback", include_in_schema=False)
+def oidc_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+    from .oidc_auth import cookie_name, cookie_options, finish_login, session_ttl, state_cookie_name
+
+    if error or not code or not state:
+        raise HTTPException(status_code=401, detail="OIDC provider did not complete reviewer login")
+    token, return_to = finish_login(code, state, request.cookies.get(state_cookie_name()))
+    response = RedirectResponse(return_to + ("&" if "?" in return_to else "?") + "sso=1", status_code=303)
+    response.set_cookie(cookie_name(), token, max_age=session_ttl(),
+                        **cookie_options())
+    response.delete_cookie(state_cookie_name(), path="/")
+    return response
+
+
+@app.post("/auth/oidc/logout", include_in_schema=False)
+def oidc_logout():
+    from .oidc_auth import cookie_name
+
+    response = RedirectResponse("/reviewer", status_code=303)
+    response.delete_cookie(cookie_name(), path="/")
+    return response
+
+
+@app.get("/auth/oidc/me", include_in_schema=False)
+def oidc_identity(principal: Principal = Depends(require_reviewer)):
+    return {"name": principal.name, "roles": sorted(principal.roles), "company_id": principal.company_id}
+
+
 @app.get("/reviewer/captures", include_in_schema=False)
 def reviewer_capture_inbox():
     return FileResponse(Path(__file__).parent / "static" / "reviewer-captures.html")
@@ -431,6 +484,11 @@ def reviewer_capture_inbox():
 @app.get("/reviewer/operations", include_in_schema=False)
 def reviewer_operations_dashboard():
     return FileResponse(Path(__file__).parent / "static" / "reviewer-operations.html")
+
+
+@app.get("/reviewer/bank-reconciliation", include_in_schema=False)
+def reviewer_bank_reconciliation_dashboard():
+    return FileResponse(Path(__file__).parent / "static" / "reviewer-bank-reconciliation.html")
 
 
 @app.post("/admin/procurement/sync")
@@ -1159,6 +1217,9 @@ def reviewer_ap_outbox(
         accounting_status=item.accounting_status,
         accounting_status_detail=item.accounting_status_detail,
         accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
+        accounting_status_attempt_count=item.accounting_status_attempt_count,
+        accounting_status_next_retry_at=_timestamp(item.accounting_status_next_retry_at),
+        accounting_status_error=item.accounting_status_error,
         mapping_issues=check_payload_mappings(adapter, item.payload) if adapter else [],
     ) for item, match in rows]
 
@@ -1347,6 +1408,114 @@ def accounting_connection_events(
             for event in events]
 
 
+@app.post("/admin/accounting-connections/{provider}/sync-masters")
+def sync_accounting_masters(
+    provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    connection = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider, AccountingConnectionRecord.enabled.is_(True)
+    ))
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Enabled accounting connection not found")
+    try:
+        adapter = create_adapter(provider, company_id=session.info.get("company_id", "default"))
+        if adapter.name != provider or not callable(getattr(adapter, "fetch_master_data", None)):
+            raise ValueError(f"The {provider} adapter does not support master-data sync")
+        references = adapter.fetch_master_data()
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=502, detail=f"Accounting master-data sync failed: {exc}") from exc
+    now, counts = datetime.now(timezone.utc), {}
+    for category, items in references.items():
+        if category not in {"supplier", "item", "tax", "currency"}:
+            continue
+        current = session.scalars(select(AccountingMasterDataRecord).where(
+            AccountingMasterDataRecord.provider == provider,
+            AccountingMasterDataRecord.category == category,
+        )).all()
+        by_source = {row.source_id: row for row in current}
+        for row in current:
+            row.active = False
+        for item in items:
+            source_id = str(item["source_id"])
+            record = by_source.get(source_id)
+            if record is None:
+                record = AccountingMasterDataRecord(id=str(uuid4()), provider=provider,
+                    category=category, source_id=source_id, name=str(item["name"])[:255],
+                    code=item.get("code"), active=bool(item.get("active", True)),
+                    source_data=item.get("source_data") or {}, synced_at=now)
+                session.add(record)
+            else:
+                record.name, record.code = str(item["name"])[:255], item.get("code")
+                record.active, record.source_data, record.synced_at = bool(item.get("active", True)), item.get("source_data") or {}, now
+            counts[category] = counts.get(category, 0) + 1
+    session.add(AccountingConnectionEventRecord(provider=provider, event_type="ACCOUNTING_MASTER_DATA_SYNCED",
+        actor=admin.name, details={"counts": counts}))
+    session.commit()
+    return {"provider": provider, "synced_at": _timestamp(now), "counts": counts}
+
+
+@app.get("/admin/accounting-connections/{provider}/master-data")
+def accounting_master_data(
+    provider: str, category: str = Query(default="ALL", pattern="^(ALL|supplier|item|tax|currency)$"),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    query = select(AccountingMasterDataRecord).where(
+        AccountingMasterDataRecord.provider == provider.casefold())
+    if category != "ALL":
+        query = query.where(AccountingMasterDataRecord.category == category)
+    query = query.order_by(AccountingMasterDataRecord.category, AccountingMasterDataRecord.name)
+    return [{"provider": row.provider, "category": row.category, "source_id": row.source_id,
+             "name": row.name, "code": row.code, "active": row.active,
+             "synced_at": _timestamp(row.synced_at)} for row in session.scalars(query).all()]
+
+
+@app.get("/admin/accounting-connections/{provider}/mapping-suggestions")
+def accounting_mapping_suggestions(
+    provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    connection = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider))
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    config = decrypt_configuration(connection.encrypted_config)
+    source_to_field = {"supplier": mapping_field(provider, "supplier"),
+                       "item": mapping_field(provider, "item"), "tax": mapping_field(provider, "tax")}
+    existing = {category: {" ".join(key.casefold().split()) for key in config.get(field, {})}
+                for category, field in source_to_field.items()}
+    sources: dict[str, set[str]] = {category: set() for category in source_to_field}
+    for match in session.scalars(select(MatchRecord)).all():
+        invoice = match.input_data.get("invoice", {})
+        if invoice.get("vendor"):
+            sources["supplier"].add(str(invoice["vendor"]))
+        for line in invoice.get("items", []):
+            if line.get("sku"):
+                sources["item"].add(str(line["sku"]))
+            if line.get("tax_code"):
+                sources["tax"].add(str(line["tax_code"]))
+    suggestions = []
+    for category, labels in sources.items():
+        candidates = session.scalars(select(AccountingMasterDataRecord).where(
+            AccountingMasterDataRecord.provider == provider,
+            AccountingMasterDataRecord.category == category,
+            AccountingMasterDataRecord.active.is_(True))).all()
+        for label in sorted(labels):
+            if " ".join(label.casefold().split()) in existing[category]:
+                continue
+            norm = " ".join(label.casefold().split())
+            ranked = sorted(((max(SequenceMatcher(None, norm, " ".join((row.name + " " + (row.code or "")).casefold().split())).ratio(),
+                                      SequenceMatcher(None, norm, " ".join((row.code or "").casefold().split())).ratio()), row)
+                             for row in candidates), key=lambda part: (part[0], part[1].source_id), reverse=True)
+            if ranked and ranked[0][0] >= 0.72:
+                score, row = ranked[0]
+                suggestions.append({"category": category, "source_label": label,
+                    "suggested_name": row.name, "suggested_code": row.code,
+                    "suggested_source_id": row.source_id, "confidence": round(score, 3),
+                    "apply_automatically": False})
+    return suggestions
+
+
 @app.get("/admin/accounting-connections/{provider}/mappings")
 def get_accounting_mappings(
     provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
@@ -1464,7 +1633,8 @@ def ap_outbox_retry_history(
         AuditEvent.match_id == match_id,
         AuditEvent.event_type.in_({"AP_EXPORT_RETRY_REQUESTED", "AP_EXPORT_FAILED",
                                    "AP_EXPORT_ACKNOWLEDGED", "AP_EXPORT_REFERENCE_RECONCILED",
-                                   "AP_EXPORT_BLOCKED_MISSING_MAPPING"}),
+                                   "AP_EXPORT_BLOCKED_MISSING_MAPPING",
+                                   "AP_ACCOUNTING_STATUS_UPDATED", "AP_ACCOUNTING_STATUS_SYNC_FAILED"}),
     ).order_by(AuditEvent.created_at.desc()).limit(100)).all()
     return [{"event_type": event.event_type, "actor": event.actor,
              "details": event.details, "created_at": _timestamp(event.created_at)} for event in events]
@@ -1483,8 +1653,11 @@ def sync_accounting_status(
     try:
         adapter = create_adapter_for_company(session.info.get("company_id", "default"))
         refresh_accounting_status(session, adapter, item, actor=admin.name)
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(status_code=502, detail=f"Accounting status lookup failed: {exc}") from exc
+    except Exception as exc:
+        session.commit()
+        raise HTTPException(status_code=502, detail={"message": f"Accounting status lookup failed: {exc}",
+            "retry_at": _timestamp(item.accounting_status_next_retry_at),
+            "attempt_count": item.accounting_status_attempt_count}) from exc
     session.commit()
     return ReviewerAPOutboxItem(
         match_id=item.match_id, state=item.state, vendor=match.vendor, invoice_number=match.invoice_number,
@@ -1494,7 +1667,298 @@ def sync_accounting_status(
         last_error=item.last_error, external_reference=item.external_reference,
         accounting_status=item.accounting_status, accounting_status_detail=item.accounting_status_detail,
         accounting_status_checked_at=_timestamp(item.accounting_status_checked_at),
+        accounting_status_attempt_count=item.accounting_status_attempt_count,
+        accounting_status_next_retry_at=_timestamp(item.accounting_status_next_retry_at),
+        accounting_status_error=item.accounting_status_error,
     )
+
+
+@app.post("/integrations/bank-statements/import", status_code=201)
+def import_bank_statement(
+    body: BankStatementImport, session: Session = Depends(get_session),
+    integration: str = Depends(require_integration),
+):
+    content_hash = hashlib.sha256(body.content.encode("utf-8")).hexdigest()
+    batch = session.scalar(select(BankStatementBatchRecord).where(
+        BankStatementBatchRecord.bank_account_id == body.account_id,
+        BankStatementBatchRecord.statement_id == body.statement_id,
+    ))
+    if batch is not None:
+        if (batch.content_sha256 != content_hash or batch.format != body.format
+                or batch.opening_balance != body.opening_balance
+                or batch.closing_balance != body.closing_balance):
+            raise HTTPException(status_code=409, detail={"code": "BANK_STATEMENT_ID_REUSED"})
+        return {"statement_id": batch.statement_id, "account_id": batch.bank_account_id,
+                "format": batch.format, "transactions_seen": batch.transaction_count,
+                "imported": 0, "duplicates": batch.imported_count + batch.duplicate_count,
+                "non_debit_skipped": batch.skipped_count, "batch_id": batch.id,
+                "idempotent_replay": True, "payments": []}
+    configuration = session.scalar(select(BankAccountConfigurationRecord).where(
+        BankAccountConfigurationRecord.bank_account_id == body.account_id
+    ))
+    try:
+        transactions = parse_statement(body.format, body.content,
+            bai2_transaction_codes=configuration.bai2_transaction_codes if configuration else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    batch = BankStatementBatchRecord(id=str(uuid4()), bank_account_id=body.account_id,
+        statement_id=body.statement_id, format=body.format, content_sha256=content_hash,
+        opening_balance=body.opening_balance, closing_balance=body.closing_balance,
+        currency=body.currency or (transactions[0]["currency"] if transactions else None),
+        transaction_count=len(transactions), imported_count=0, duplicate_count=0, skipped_count=0)
+    session.add(batch)
+    session.flush()
+    imported, duplicates, skipped = [], 0, 0
+    for transaction in transactions:
+        # The existing remittance table intentionally models outgoing payments to suppliers.
+        if transaction["direction"] != "DEBIT":
+            skipped += 1
+            continue
+        external_id = f"bank:{body.account_id}:{transaction['external_id']}"
+        existing = session.scalar(select(RemittancePaymentRecord).where(
+            RemittancePaymentRecord.bank_account_id == body.account_id,
+            RemittancePaymentRecord.bank_transaction_id == transaction["external_id"]))
+        if existing is not None:
+            prior = existing.input_data.get("bank_transaction", {})
+            same = (Decimal(str(existing.amount)) == transaction["amount"]
+                    and existing.currency == transaction["currency"]
+                    and str(prior.get("reference") or "") == str(transaction["reference"] or ""))
+            if not same:
+                raise HTTPException(status_code=409, detail={
+                    "code": "BANK_TRANSACTION_ID_REUSED", "transaction_id": transaction["external_id"]})
+            duplicates += 1
+            continue
+        bank_transaction = {**transaction, "amount": str(transaction["amount"]),
+                            "payment_date": transaction["payment_date"].isoformat()}
+        input_data = {"source": "bank_statement", "statement_id": body.statement_id,
+                      "format": body.format, "bank_account_id": body.account_id,
+                      "bank_statement_batch_id": batch.id, "bank_transaction": bank_transaction}
+        payment = RemittancePaymentRecord(id=str(uuid4()), external_id=external_id,
+            vendor=transaction["vendor"], currency=transaction["currency"], amount=transaction["amount"],
+            reference=transaction["reference"], payment_date=transaction["payment_date"],
+            status="NEEDS_REVIEW", input_data=input_data, allocated_amount=Decimal(0),
+            bank_account_id=body.account_id, bank_transaction_id=transaction["external_id"],
+            bank_statement_batch_id=batch.id)
+        session.add(payment)
+        session.flush()
+        session.add(PaymentReconciliationEventRecord(payment_id=payment.id,
+            event_type="BANK_TRANSACTION_IMPORTED", actor=integration,
+            details={"statement_id": body.statement_id, "format": body.format,
+                     "transaction_id": transaction["external_id"],
+                     "description": transaction["description"], "bank_account_id": body.account_id}))
+        imported.append(payment)
+    batch.imported_count, batch.duplicate_count, batch.skipped_count = len(imported), duplicates, skipped
+    session.add(AccountingConnectionEventRecord(provider="bank", event_type="BANK_STATEMENT_IMPORTED",
+        actor=integration, details={"statement_id": body.statement_id, "bank_account_id": body.account_id,
+                                    "batch_id": batch.id, "format": body.format,
+                                    "imported": len(imported), "duplicates": duplicates,
+                                    "non_debit_skipped": skipped}))
+    session.commit()
+    return {"statement_id": body.statement_id, "account_id": body.account_id, "batch_id": batch.id,
+            "opening_balance": str(body.opening_balance) if body.opening_balance is not None else None,
+            "closing_balance": str(body.closing_balance) if body.closing_balance is not None else None,
+            "format": body.format,
+            "transactions_seen": len(transactions), "imported": len(imported),
+            "duplicates": duplicates, "non_debit_skipped": skipped,
+            "payments": [payment_result(session, payment) for payment in imported]}
+
+
+@app.get("/reviewer/bank-transactions")
+def reviewer_bank_transactions(
+    status: str = Query(default="ALL", pattern="^(NEEDS_REVIEW|MATCHED|PARTIALLY_MATCHED|ALL)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    query = select(RemittancePaymentRecord).where(
+        RemittancePaymentRecord.external_id.like("bank:%"))
+    if status != "ALL":
+        query = query.where(RemittancePaymentRecord.status == status)
+    rows = session.scalars(query.order_by(RemittancePaymentRecord.created_at.desc()).limit(limit)).all()
+    return [payment_result(session, row) for row in rows]
+
+
+@app.get("/reviewer/bank-transactions/{payment_id}/candidates")
+def bank_reconciliation_candidates(
+    payment_id: str, session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    payment = session.get(RemittancePaymentRecord, payment_id)
+    if payment is None or payment.bank_account_id is None:
+        raise HTTPException(status_code=404, detail="Bank transaction not found")
+    reference = " ".join(str(payment.reference or "").casefold().split())
+    candidates = []
+    for outbox, match, outstanding in _payment_candidates(session, payment):
+        reasons = [{"type": "vendor", "score": 30,
+                    "detail": f"Supplier matches {match.vendor}"}]
+        invoice_ref = " ".join(str(match.invoice_number or "").casefold().split())
+        external_ref = " ".join(str(outbox.external_reference or "").casefold().split())
+        if reference and reference in {invoice_ref, external_ref, match.id.casefold()}:
+            reasons.append({"type": "reference", "score": 50,
+                            "detail": f"Bank reference matches {match.invoice_number or outbox.external_reference or match.id}"})
+        elif reference and invoice_ref and (reference in invoice_ref or invoice_ref in reference):
+            reasons.append({"type": "reference", "score": 25,
+                            "detail": "Bank reference partially matches the invoice number"})
+        amount_gap = abs(outstanding - (payment.amount - Decimal(str(payment.allocated_amount or 0))))
+        if amount_gap == 0:
+            reasons.append({"type": "amount", "score": 35, "detail": "Outstanding invoice balance equals the unallocated bank amount"})
+        elif outstanding >= payment.amount - Decimal(str(payment.allocated_amount or 0)):
+            reasons.append({"type": "amount", "score": 15, "detail": "Invoice has enough outstanding balance for this payment"})
+        invoice = match.input_data.get("invoice", {})
+        invoice_date = invoice.get("invoice_date")
+        payment_date = payment.payment_date
+        try:
+            date_delta = abs((payment_date.date() - date.fromisoformat(str(invoice_date)[:10])).days)
+        except (ValueError, TypeError, AttributeError):
+            date_delta = None
+        if date_delta is not None and date_delta <= 45:
+            reasons.append({"type": "date", "score": max(5, 20 - date_delta // 3),
+                            "detail": f"Invoice date is {date_delta} day(s) from the bank transaction"})
+        candidates.append({"match_id": match.id, "invoice_number": match.invoice_number,
+            "vendor": match.vendor, "currency": payment.currency, "outstanding_amount": str(outstanding),
+            "score": sum(reason["score"] for reason in reasons), "reasons": reasons})
+    candidates.sort(key=lambda item: (-item["score"], item["invoice_number"] or ""))
+    payment_candidates = []
+    if payment.reference:
+        reference_key = " ".join(payment.reference.casefold().split())
+    else:
+        reference_key = ""
+    remittances = session.scalars(select(RemittancePaymentRecord).where(
+        RemittancePaymentRecord.bank_account_id.is_(None),
+        RemittancePaymentRecord.currency == payment.currency,
+    ).order_by(RemittancePaymentRecord.created_at.desc()).limit(1000)).all()
+    for remittance in remittances:
+        if " ".join(remittance.vendor.casefold().split()) != " ".join(payment.vendor.casefold().split()):
+            continue
+        if session.scalar(select(RemittancePaymentRecord.id).where(
+                RemittancePaymentRecord.matched_remittance_id == remittance.id).limit(1)):
+            continue
+        reasons = [{"type": "vendor", "score": 30,
+                    "detail": f"Supplier matches {remittance.vendor}"}]
+        remittance_refs = {" ".join(str(value or "").casefold().split())
+                           for value in (remittance.reference, remittance.external_id) if value}
+        if reference_key and reference_key in remittance_refs:
+            reasons.append({"type": "reference", "score": 50, "detail": "Bank reference matches payment advice"})
+        amount_gap = abs(Decimal(str(remittance.amount))
+                         - (Decimal(str(payment.amount)) - Decimal(str(payment.allocated_amount or 0))))
+        if amount_gap == 0:
+            reasons.append({"type": "amount", "score": 35, "detail": "Payment advice amount equals the unallocated bank amount"})
+        elif amount_gap <= Decimal("1.00"):
+            reasons.append({"type": "amount", "score": 10, "detail": f"Payment advice differs by {amount_gap} {payment.currency}"})
+        if payment.payment_date and remittance.payment_date:
+            date_gap = abs((payment.payment_date.date() - remittance.payment_date.date()).days)
+            if date_gap <= 45:
+                reasons.append({"type": "date", "score": max(5, 20 - date_gap // 3),
+                                "detail": f"Payment advice date is {date_gap} day(s) from bank transaction"})
+        payment_candidates.append({"payment_id": remittance.id, "external_id": remittance.external_id,
+            "reference": remittance.reference, "vendor": remittance.vendor,
+            "currency": remittance.currency, "amount": str(remittance.amount),
+            "status": remittance.status, "score": sum(reason["score"] for reason in reasons),
+            "reasons": reasons})
+    payment_candidates.sort(key=lambda item: (-item["score"], item["external_id"]))
+    return {"payment_id": payment.id, "bank_account_id": payment.bank_account_id,
+            "transaction_amount": str(payment.amount), "allocated_amount": str(payment.allocated_amount),
+            "candidates": candidates, "payment_candidates": payment_candidates}
+
+
+@app.post("/reviewer/bank-transactions/{payment_id}/decision")
+def decide_bank_reconciliation(
+    payment_id: str, body: BankReconciliationDecision, session: Session = Depends(get_session),
+    approver: Principal = Depends(require_approver),
+):
+    payment = session.get(RemittancePaymentRecord, payment_id)
+    if payment is None or payment.bank_account_id is None:
+        raise HTTPException(status_code=404, detail="Bank transaction not found")
+    if body.action == "reject":
+        payment.input_data = {**payment.input_data, "bank_reconciliation_decision": "REJECTED"}
+        session.add(PaymentReconciliationEventRecord(payment_id=payment.id,
+            event_type="BANK_MATCH_REJECTED", actor=approver.name,
+            details={"bank_account_id": payment.bank_account_id, "reference": payment.reference,
+                     "amount": str(payment.amount), "reason": "Reviewer rejected suggested allocations"}))
+        session.commit()
+        return payment_result(session, payment)
+    if body.action == "link_payment":
+        remittance = session.get(RemittancePaymentRecord, body.payment_match_id)
+        if remittance is None or remittance.bank_account_id is not None:
+            raise HTTPException(status_code=404, detail="Payment advice was not found")
+        if (" ".join(remittance.vendor.casefold().split()) != " ".join(payment.vendor.casefold().split())
+                or remittance.currency != payment.currency
+                or remittance.amount != payment.amount - Decimal(str(payment.allocated_amount or 0))):
+            raise HTTPException(status_code=409, detail="Payment advice does not match supplier, currency, and amount")
+        linked = session.scalar(select(RemittancePaymentRecord.id).where(
+            RemittancePaymentRecord.matched_remittance_id == remittance.id).limit(1))
+        if linked is not None:
+            raise HTTPException(status_code=409, detail="Payment advice is already linked to a bank transaction")
+        payment.matched_remittance_id = remittance.id
+        payment.status = "MATCHED"
+        payment.input_data = {**payment.input_data, "bank_reconciliation_decision": "PAYMENT_LINKED"}
+        session.add(PaymentReconciliationEventRecord(payment_id=payment.id,
+            event_type="BANK_PAYMENT_MATCH_CONFIRMED", actor=approver.name,
+            details={"bank_account_id": payment.bank_account_id,
+                "remittance_payment_id": remittance.id, "reference": payment.reference,
+                "amount": str(payment.amount), "score_source": "reviewer-confirmed"}))
+        session.commit()
+        return payment_result(session, payment)
+    try:
+        manually_allocate(session, payment,
+            [(item.match_id, item.amount) for item in body.allocations], actor=approver.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    event_type = "BANK_MATCH_CONFIRMED" if body.action == "confirm" else "BANK_MATCH_SPLIT_CONFIRMED"
+    session.add(PaymentReconciliationEventRecord(payment_id=payment.id, event_type=event_type,
+        actor=approver.name, details={"bank_account_id": payment.bank_account_id,
+            "allocations": [{"match_id": item.match_id, "amount": str(item.amount)}
+                            for item in body.allocations], "status": payment.status}))
+    session.commit()
+    return payment_result(session, payment)
+
+
+@app.get("/reviewer/bank-statements")
+def reviewer_bank_statements(
+    limit: int = Query(default=200, ge=1, le=1000),
+    session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    batches = session.scalars(select(BankStatementBatchRecord).order_by(
+        BankStatementBatchRecord.created_at.desc()).limit(limit)).all()
+    return [{"id": row.id, "statement_id": row.statement_id, "account_id": row.bank_account_id,
+             "format": row.format, "opening_balance": str(row.opening_balance) if row.opening_balance is not None else None,
+             "closing_balance": str(row.closing_balance) if row.closing_balance is not None else None,
+             "currency": row.currency, "transaction_count": row.transaction_count,
+             "imported_count": row.imported_count, "duplicate_count": row.duplicate_count,
+             "skipped_count": row.skipped_count, "created_at": _timestamp(row.created_at)} for row in batches]
+
+
+@app.put("/admin/bank-accounts/{account_id}/bai2-codes")
+def configure_bai2_codes(
+    account_id: str, body: Bai2TransactionCodeUpdate, session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    account_id = account_id.strip()
+    if not account_id:
+        raise HTTPException(status_code=422, detail="Bank account ID cannot be empty")
+    record = session.scalar(select(BankAccountConfigurationRecord).where(
+        BankAccountConfigurationRecord.bank_account_id == account_id))
+    if record is None:
+        record = BankAccountConfigurationRecord(id=str(uuid4()), bank_account_id=account_id,
+            bai2_transaction_codes=body.transaction_codes, updated_by=admin.name)
+        session.add(record)
+    else:
+        record.bai2_transaction_codes = body.transaction_codes
+        record.updated_by = admin.name
+        record.updated_at = datetime.now(timezone.utc)
+    session.add(AccountingConnectionEventRecord(provider="bank", event_type="BAI2_CODES_UPDATED",
+        actor=admin.name, details={"bank_account_id": account_id,
+                                  "transaction_codes": body.transaction_codes}))
+    session.commit()
+    return {"account_id": account_id, "transaction_codes": record.bai2_transaction_codes,
+            "updated_by": record.updated_by, "updated_at": _timestamp(record.updated_at)}
+
+
+@app.get("/admin/bank-accounts/{account_id}/bai2-codes")
+def get_bai2_codes(
+    account_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    record = session.scalar(select(BankAccountConfigurationRecord).where(
+        BankAccountConfigurationRecord.bank_account_id == account_id))
+    return {"account_id": account_id, "transaction_codes": record.bai2_transaction_codes if record else {}}
 
 
 @app.post("/integrations/payments/remittances", status_code=201)
@@ -1522,6 +1986,207 @@ def ingest_remittance_payment(
     session.commit()
     session.refresh(payment)
     return payment_result(session, payment)
+
+
+def _applied_credit_total(session: Session, match_id: str) -> Decimal:
+    value = session.scalar(select(func.sum(CreditNoteApplicationRecord.amount)).where(
+        CreditNoteApplicationRecord.invoice_match_id == match_id))
+    return Decimal(str(value or 0))
+
+
+def _credit_applied_total(session: Session, match_id: str) -> Decimal:
+    value = session.scalar(select(func.sum(CreditNoteApplicationRecord.amount)).where(
+        CreditNoteApplicationRecord.credit_match_id == match_id))
+    return Decimal(str(value or 0))
+
+
+@app.get("/reviewer/credit-notes")
+def reviewer_credit_notes(
+    session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    rows = session.execute(select(MatchRecord, APOutboxRecord).join(
+        APOutboxRecord, APOutboxRecord.match_id == MatchRecord.id
+    ).where(APOutboxRecord.state == "ACKNOWLEDGED")).all()
+    result = []
+    for match, outbox in rows:
+        invoice = match.input_data.get("invoice", {})
+        if invoice.get("document_type") != "CREDIT_NOTE":
+            continue
+        face = abs(Decimal(str(outbox.payload.get("total_amount") or 0)))
+        applied = _credit_applied_total(session, match.id)
+        result.append({"match_id": match.id, "credit_note_number": match.invoice_number,
+            "vendor": match.vendor, "currency": outbox.payload.get("currency", "USD"),
+            "credit_note_for": invoice.get("credit_note_for"), "total_amount": str(face),
+            "applied_amount": str(applied), "remaining_amount": str(max(face - applied, Decimal(0))),
+            "approval_status": match.approval_status, "accounting_status": outbox.accounting_status})
+    return result
+
+
+@app.post("/reviewer/credit-notes/{credit_match_id}/apply")
+def apply_credit_note(
+    credit_match_id: str, body: CreditNoteApplication, session: Session = Depends(get_session),
+    approver: Principal = Depends(require_approver),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=128),
+):
+    credit, invoice = session.get(MatchRecord, credit_match_id), session.get(MatchRecord, body.invoice_match_id)
+    credit_outbox = session.get(APOutboxRecord, credit_match_id)
+    invoice_outbox = session.get(APOutboxRecord, body.invoice_match_id)
+    if not all((credit, invoice, credit_outbox, invoice_outbox)):
+        raise HTTPException(status_code=404, detail="Credit note or invoice was not found")
+    source_credit = credit.input_data.get("invoice", {})
+    source_invoice = invoice.input_data.get("invoice", {})
+    if source_credit.get("document_type") != "CREDIT_NOTE":
+        raise HTTPException(status_code=409, detail="The selected document is not a credit note")
+    if source_invoice.get("document_type", "INVOICE") != "INVOICE":
+        raise HTTPException(status_code=409, detail="Credits can only be applied to supplier invoices")
+    if credit.approval_status != "APPROVED":
+        raise HTTPException(status_code=409, detail="Credit note requires approval before application")
+    if credit_outbox.state != "ACKNOWLEDGED" or invoice_outbox.state != "ACKNOWLEDGED":
+        raise HTTPException(status_code=409, detail="Both documents must be exported before applying a credit")
+    links_to = str(source_credit.get("credit_note_for") or "").strip().casefold()
+    if links_to not in {str(invoice.invoice_number or "").casefold(), invoice.id.casefold()}:
+        raise HTTPException(status_code=409, detail="Credit note is not linked to this invoice")
+    if credit.vendor_key != invoice.vendor_key:
+        raise HTTPException(status_code=409, detail="Credit note and invoice suppliers do not match")
+    credit_currency = str(credit_outbox.payload.get("currency") or "USD").upper()
+    invoice_currency = str(invoice_outbox.payload.get("currency") or "USD").upper()
+    if credit_currency != invoice_currency:
+        raise HTTPException(status_code=409, detail="Credit note and invoice currencies do not match")
+    if idempotency_key:
+        prior_sync = session.scalar(select(CreditApplicationOutboxRecord).where(
+            CreditApplicationOutboxRecord.idempotency_key == idempotency_key))
+        if prior_sync is not None:
+            prior_app = session.get(CreditNoteApplicationRecord, prior_sync.application_id)
+            if prior_app is None or (prior_app.credit_match_id, prior_app.invoice_match_id) != (credit.id, invoice.id):
+                raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_KEY_REUSED"})
+            if Decimal(str(prior_sync.amount)) != body.amount:
+                raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_KEY_REUSED"})
+            return {"credit_match_id": credit.id, "invoice_match_id": invoice.id,
+                "amount": str(prior_sync.amount), "currency": credit_currency,
+                "application_id": prior_app.id, "sync_id": prior_sync.id,
+                "sync_state": prior_sync.state, "idempotency_key": prior_sync.idempotency_key,
+                "replayed": True}
+    credit_remaining = abs(Decimal(str(credit_outbox.payload.get("total_amount") or 0))) - _credit_applied_total(session, credit.id)
+    allocated = session.scalar(select(func.sum(PaymentAllocationRecord.amount)).where(
+        PaymentAllocationRecord.match_id == invoice.id))
+    invoice_remaining = Decimal(str(invoice_outbox.payload.get("total_amount") or 0)) \
+        - Decimal(str(allocated or 0)) - _applied_credit_total(session, invoice.id)
+    if body.amount > credit_remaining or body.amount > invoice_remaining:
+        raise HTTPException(status_code=409, detail={"code": "CREDIT_APPLICATION_EXCEEDS_BALANCE",
+            "credit_remaining": str(max(credit_remaining, Decimal(0))),
+            "invoice_remaining": str(max(invoice_remaining, Decimal(0)))})
+    application = session.scalar(select(CreditNoteApplicationRecord).where(
+        CreditNoteApplicationRecord.credit_match_id == credit.id,
+        CreditNoteApplicationRecord.invoice_match_id == invoice.id))
+    if application is None:
+        application = CreditNoteApplicationRecord(id=str(uuid4()), credit_match_id=credit.id,
+            invoice_match_id=invoice.id, amount=body.amount, note=body.note, approved_by=approver.name)
+        session.add(application)
+    else:
+        application.amount = Decimal(str(application.amount)) + body.amount
+        application.note, application.approved_by = body.note, approver.name
+    details = {"credit_match_id": credit.id, "invoice_match_id": invoice.id,
+               "amount": str(body.amount), "currency": credit_currency,
+               "note": body.note, "application_id": application.id}
+    sync_item = CreditApplicationOutboxRecord(id=str(uuid4()), application_id=application.id,
+        amount=body.amount, idempotency_key=idempotency_key or str(uuid4()),
+        state="PENDING", attempt_count=0)
+    session.add(sync_item)
+    session.add(AuditEvent(match_id=credit.id, event_type="CREDIT_NOTE_APPLIED", actor=approver.name,
+                           details=details))
+    session.add(AuditEvent(match_id=invoice.id, event_type="CREDIT_NOTE_RECEIVED", actor=approver.name,
+                           details=details))
+    session.commit()
+    return {**details, "sync_state": sync_item.state, "sync_id": sync_item.id,
+            "idempotency_key": sync_item.idempotency_key, "replayed": False,
+            "credit_remaining": str(credit_remaining - body.amount),
+            "invoice_remaining": str(invoice_remaining - body.amount),
+            "approved_by": approver.name, "created_at": _timestamp(application.created_at)}
+
+
+@app.get("/reviewer/credit-notes/{credit_match_id}/applications")
+def credit_note_applications(
+    credit_match_id: str, session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    if session.get(MatchRecord, credit_match_id) is None:
+        raise HTTPException(status_code=404, detail="Credit note not found")
+    rows = session.scalars(select(CreditNoteApplicationRecord).where(
+        CreditNoteApplicationRecord.credit_match_id == credit_match_id
+    ).order_by(CreditNoteApplicationRecord.created_at)).all()
+    result = []
+    for row in rows:
+        sync_rows = session.scalars(select(CreditApplicationOutboxRecord).where(
+            CreditApplicationOutboxRecord.application_id == row.id
+        ).order_by(CreditApplicationOutboxRecord.created_at)).all()
+        latest = sync_rows[-1] if sync_rows else None
+        result.append({"id": row.id, "credit_match_id": row.credit_match_id,
+            "invoice_match_id": row.invoice_match_id, "amount": row.amount, "note": row.note,
+            "approved_by": row.approved_by, "created_at": _timestamp(row.created_at),
+            "sync_state": latest.state if latest else "NOT_QUEUED",
+            "attempt_count": sum(item.attempt_count for item in sync_rows),
+            "last_error": latest.last_error if latest else None,
+            "next_attempt_at": _timestamp(latest.next_attempt_at) if latest else None,
+            "sync_history": [{"id": item.id, "state": item.state, "amount": str(item.amount),
+                "attempt_count": item.attempt_count, "last_error": item.last_error,
+                "next_attempt_at": _timestamp(item.next_attempt_at),
+                "external_reference": item.external_reference,
+                "created_at": _timestamp(item.created_at),
+                "acknowledged_at": _timestamp(item.acknowledged_at)} for item in sync_rows]})
+    return result
+
+
+def sync_credit_applications(session: Session, adapter, *, limit: int = 100, max_attempts: int = 8,
+                             initial_retry_seconds: int = 30, max_retry_seconds: int = 3600) -> dict:
+    return _sync_credit_applications(session, adapter, limit=limit, max_attempts=max_attempts,
+        initial_retry_seconds=initial_retry_seconds, max_retry_seconds=max_retry_seconds)
+
+
+@app.post("/admin/credit-applications/{sync_id}/retry")
+def retry_credit_application_sync(
+    sync_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    item = session.get(CreditApplicationOutboxRecord, sync_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Credit application sync item not found")
+    prior_attempt_count = item.attempt_count
+    try:
+        retry_credit_application(item)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.add(AuditEvent(match_id=session.get(CreditNoteApplicationRecord, item.application_id).credit_match_id,
+        event_type="CREDIT_APPLICATION_SYNC_RETRIED", actor=admin.name,
+        details={"sync_id": item.id, "idempotency_key": item.idempotency_key,
+                 "previous_attempt_count": prior_attempt_count}))
+    session.commit()
+    return {"id": item.id, "state": item.state, "next_attempt_at": _timestamp(item.next_attempt_at)}
+
+
+@app.get("/reviewer/credit-applications")
+def reviewer_credit_applications(
+    state: str = Query(default="ALL", pattern="^(PENDING|ACKNOWLEDGED|DEAD|ALL)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    session: Session = Depends(get_session), reviewer: Principal = Depends(require_reviewer),
+):
+    query = select(CreditApplicationOutboxRecord, CreditNoteApplicationRecord).join(
+        CreditNoteApplicationRecord,
+        CreditNoteApplicationRecord.id == CreditApplicationOutboxRecord.application_id)
+    if state != "ALL":
+        query = query.where(CreditApplicationOutboxRecord.state == state)
+    rows = session.execute(query.order_by(CreditApplicationOutboxRecord.created_at.desc()).limit(limit)).all()
+    result = []
+    for item, application in rows:
+        credit, invoice = session.get(MatchRecord, application.credit_match_id), session.get(
+            MatchRecord, application.invoice_match_id)
+        result.append({"id": item.id, "state": item.state, "attempt_count": item.attempt_count,
+            "last_error": item.last_error, "next_attempt_at": _timestamp(item.next_attempt_at),
+            "external_reference": item.external_reference, "amount": str(item.amount),
+            "currency": (session.get(APOutboxRecord, application.credit_match_id).payload.get("currency")
+                         if session.get(APOutboxRecord, application.credit_match_id) else "USD"),
+            "credit_match_id": application.credit_match_id, "credit_note_number": credit.invoice_number,
+            "invoice_match_id": application.invoice_match_id, "invoice_number": invoice.invoice_number,
+            "approved_by": application.approved_by, "created_at": _timestamp(item.created_at),
+            "acknowledged_at": _timestamp(item.acknowledged_at)})
+    return result
 
 
 @app.get("/reviewer/payments")

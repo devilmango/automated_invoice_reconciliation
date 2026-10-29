@@ -22,6 +22,11 @@ _API_URL = "https://api.xero.com/api.xro/2.0/"
 class XeroAPIError(RuntimeError):
     """Raised for Xero API or token-refresh failures."""
 
+    def __init__(self, message: str, *, status: int | None = None, retry_after: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
 
 class XeroAdapter:
     """Create idempotent Xero accounts-payable invoices using refreshable OAuth tokens."""
@@ -153,7 +158,8 @@ class XeroAdapter:
                 raw = response.read(1_000_000)
         except HTTPError as exc:
             detail = exc.read(2000).decode("utf-8", errors="replace")
-            raise XeroAPIError(f"Xero API returned HTTP {exc.code}: {detail}") from exc
+            raise XeroAPIError(f"Xero API returned HTTP {exc.code}: {detail}", status=exc.code,
+                               retry_after=exc.headers.get("Retry-After")) from exc
         except URLError as exc:
             raise XeroAPIError(f"Xero request failed: {exc.reason}") from exc
         try:
@@ -181,19 +187,19 @@ class XeroAdapter:
         return None
 
     def submit_invoice(self, payload: dict, *, idempotency_key: str) -> str:
-        if payload.get("document_type", "INVOICE") != "INVOICE":
-            raise ValueError("Xero export currently supports invoices, not credit notes")
+        is_credit = payload.get("document_type", "INVOICE") == "CREDIT_NOTE"
+        endpoint, response_key = ("CreditNotes", "CreditNoteID") if is_credit else ("Invoices", "InvoiceID")
         invoice_number = str(payload.get("supplier_invoice_number") or "").strip()
         supplier = " ".join(str(payload.get("supplier") or "").casefold().split())
         contact_id = self.contact_map.get(supplier)
         if not invoice_number or not contact_id:
             raise ValueError("Xero export requires an invoice number and configured supplier ContactID")
         marker = f"invoice-match-id:{idempotency_key}"
-        existing = self._find_invoice(invoice_number)
+        existing = self._find_credit_note(invoice_number) if is_credit else self._find_invoice(invoice_number)
         if existing:
             if marker not in str(existing.get("Reference") or ""):
-                raise ValueError(f"Xero already has an AP invoice numbered {invoice_number!r}")
-            return str(existing.get("InvoiceID") or "")
+                raise ValueError(f"Xero already has an AP document numbered {invoice_number!r}")
+            return str(existing.get(response_key) or "")
         lines = []
         for line in payload.get("lines", []):
             sku = " ".join(str(line.get("sku") or "").casefold().split())
@@ -214,8 +220,8 @@ class XeroAdapter:
                 row["AccountCode"] = self.expense_account_code
             lines.append(row)
         invoice = {
-            "Type": "ACCPAY", "Contact": {"ContactID": contact_id},
-            "InvoiceNumber": invoice_number,
+            "Type": "ACCPAYCREDIT" if is_credit else "ACCPAY", "Contact": {"ContactID": contact_id},
+            "CreditNoteNumber" if is_credit else "InvoiceNumber": invoice_number,
             "Reference": f"{payload.get('purchase_order_number', '')} {marker}"[:255],
             "CurrencyCode": self.currency_map.get(
                 str(payload.get("currency") or "USD").casefold(),
@@ -223,12 +229,24 @@ class XeroAdapter:
             ),
             "LineAmountTypes": "Exclusive", "LineItems": lines,
         }
-        data = self._api("Invoices", method="POST", data={"Invoices": [invoice]},
+        if is_credit:
+            invoice["Status"] = "AUTHORISED"
+        collection_key = "CreditNotes" if is_credit else "Invoices"
+        data = self._api(endpoint, method="POST", data={collection_key: [invoice]},
                          idempotency_key=idempotency_key)
-        invoices = data.get("Invoices") or []
+        invoices = data.get(collection_key) or []
         if not invoices or invoices[0].get("HasErrors"):
-            raise XeroAPIError(f"Xero did not create invoice {invoice_number!r}: {data}")
-        return str(invoices[0].get("InvoiceID") or "")
+            raise XeroAPIError(f"Xero did not create AP document {invoice_number!r}: {data}")
+        return str(invoices[0].get(response_key) or "")
+
+    def _find_credit_note(self, credit_number: str) -> dict | None:
+        escaped = credit_number.replace("'", "\\'")
+        data = self._api("CreditNotes", query={"where": f'CreditNoteNumber=="{escaped}"'})
+        for credit in data.get("CreditNotes", []):
+            if (credit.get("Type") == "ACCPAYCREDIT"
+                    and credit.get("CreditNoteNumber") == credit_number):
+                return credit
+        return None
 
     def fetch_invoice_status(self, external_reference: str) -> dict:
         data = self._api(f"Invoices/{external_reference}")
@@ -251,3 +269,74 @@ class XeroAdapter:
                 "total_amount": str(invoice.get("Total")), "amount_paid": str(amount_paid),
                 "amount_due": str(amount_due), "currency": invoice.get("CurrencyCode"),
                 "document_number": invoice.get("InvoiceNumber")}
+
+    def apply_credit_note(self, credit_reference: str, invoice_reference: str, amount: Decimal,
+                          *, idempotency_key: str) -> str | None:
+        """Allocate an authorised AP credit note to an AP invoice in Xero."""
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("Credit allocation amount must be positive")
+        data = self._api(f"CreditNotes/{credit_reference}")
+        credits = data.get("CreditNotes") or []
+        credit = next((item for item in credits if item.get("Type") == "ACCPAYCREDIT"), None)
+        if credit is None or str(credit.get("Status", "")).upper() != "AUTHORISED":
+            raise ValueError("Xero credit note must exist and be authorised before allocation")
+        invoice_data = self._api(f"Invoices/{invoice_reference}")
+        invoices = invoice_data.get("Invoices") or []
+        invoice = next((item for item in invoices if item.get("Type") == "ACCPAY"), None)
+        if invoice is None:
+            raise ValueError("Xero AP invoice was not found")
+        if (credit.get("Contact") or {}).get("ContactID") != (invoice.get("Contact") or {}).get("ContactID"):
+            raise ValueError("Xero credit and invoice must belong to the same contact")
+        if str(credit.get("CurrencyCode") or "").upper() != str(invoice.get("CurrencyCode") or "").upper():
+            raise ValueError("Xero credit and invoice currencies do not match")
+        if Decimal(str(credit.get("RemainingCredit") or 0)) < amount:
+            raise ValueError("Xero credit note does not have enough remaining credit")
+        if Decimal(str(invoice.get("AmountDue") or 0)) <= 0:
+            raise ValueError("Xero invoice has no remaining balance")
+        # Every local queue item represents an incremental allocation. Xero's request
+        # idempotency key protects retries, including a timeout after provider success.
+        response = self._api(f"CreditNotes/{credit_reference}/Allocations", method="PUT",
+            data={"Amount": float(amount), "Invoice": {"InvoiceID": invoice_reference}},
+            idempotency_key=idempotency_key)
+        return str(response.get("Allocations", [{}])[0].get("AllocationID") or credit_reference)
+
+    def fetch_master_data(self) -> dict[str, list[dict]]:
+        """Fetch supplier, item, tax and currency references used by mapping setup."""
+        contacts, items, tax_rates = [], [], []
+        for page in range(1, 101):
+            data = self._api("Contacts", query={"page": page})
+            current = data.get("Contacts") or []
+            contacts.extend(current)
+            if len(current) < 100:
+                break
+        for page in range(1, 101):
+            data = self._api("Items", query={"page": page})
+            current = data.get("Items") or []
+            items.extend(current)
+            if len(current) < 100:
+                break
+        tax_data = self._api("TaxRates")
+        tax_rates = tax_data.get("TaxRates") or []
+        currency_data = self._api("Currencies")
+        currencies = currency_data.get("Currencies") or []
+
+        def normalize(rows, id_field, name_field, code_field=None, active_field=None):
+            result = []
+            for row in rows:
+                source_id, name = row.get(id_field), row.get(name_field)
+                if source_id and name:
+                    result.append({"source_id": str(source_id), "name": str(name),
+                        "code": str(row.get(code_field)) if code_field and row.get(code_field) else None,
+                        "active": not bool(row.get(active_field)) if active_field == "IsArchived"
+                                  else str(row.get(active_field, "ACTIVE")).upper() == "ACTIVE"
+                                  if active_field == "Status" else True,
+                        "source_data": row})
+            return result
+
+        suppliers = [row for row in contacts if row.get("IsSupplier", True)]
+        return {
+            "supplier": normalize(suppliers, "ContactID", "Name", "ContactNumber", "IsArchived"),
+            "item": normalize(items, "ItemID", "Name", "Code"),
+            "tax": normalize(tax_rates, "TaxType", "Name", "TaxType", "Status"),
+            "currency": normalize(currencies, "Code", "Description", "Code"),
+        }

@@ -24,8 +24,8 @@
   </header>
   <main>
     <section class="intro">
-      <div><div class="eyebrow">Accounts payable · Control desk</div><h1>Reviewer queue</h1><p>Investigate three-way match exceptions, compare the submitted documents, and record an auditable decision.</p><p><a href="/reviewer/captures">Open captured invoice inbox →</a> · <a href="/reviewer/operations">Operations and AP delivery →</a></p></div>
-      <form class="auth" id="authForm"><label class="small" for="token" style="position:absolute;clip:rect(0,0,0,0)">Reviewer bearer token</label><input id="token" class="control" type="password" autocomplete="off" placeholder="Reviewer bearer token" required><button type="submit">Connect</button></form>
+      <div><div class="eyebrow">Accounts payable · Control desk</div><h1>Reviewer queue</h1><p>Investigate three-way match exceptions, compare the submitted documents, and record an auditable decision.</p><p><a href="/reviewer/captures">Open captured invoice inbox →</a> · <a href="/reviewer/operations">Operations and AP delivery →</a> · <a href="/reviewer/bank-reconciliation">Bank reconciliation →</a></p></div>
+      <form class="auth" id="authForm"><label class="small" for="token" style="position:absolute;clip:rect(0,0,0,0)">Reviewer bearer token</label><input id="token" class="control" type="password" autocomplete="off" placeholder="Reviewer bearer token"><button type="submit">Connect</button><a href="/auth/oidc/login?return_to=%2Freviewer">Sign in with SSO</a></form>
     </section>
     <div class="notice" id="notice" role="status" aria-live="polite"></div>
     <section class="metrics" aria-label="Queue summary">
@@ -42,20 +42,20 @@
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    let token = sessionStorage.getItem('invoiceMatchReviewerToken') || '';
+    let token = sessionStorage.getItem('invoiceMatchReviewerToken') || ''; let cookieSession = true;
     let items = [];
     let selected = '';
     let searchTimer;
-    if (token) { $('token').value = token; connect(); }
+    if (token) { $('token').value = token; connect(); } else if (cookieSession) connect();
     $('authForm').addEventListener('submit', async (event) => { event.preventDefault(); token = $('token').value.trim(); if (!token) return; sessionStorage.setItem('invoiceMatchReviewerToken', token); await connect(); });
     $('search').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadQueue, 250); });
     $('overdue').addEventListener('change', loadQueue);
     $('escalated').addEventListener('change', loadQueue);
     function showNotice(message) { const n = $('notice'); n.textContent = message; n.classList.toggle('show', Boolean(message)); }
     async function api(path, options = {}) {
-      const response = await fetch(path, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers } });
+      const response = await fetch(path, { ...options, headers: { ...(token ? {Authorization: `Bearer ${token}`} : {}), ...(options.body ? {'Content-Type':'application/json'} : {}), ...options.headers } });
       let payload; try { payload = await response.json(); } catch { payload = null; }
-      if (!response.ok) { if (response.status === 401) { token = ''; $('token').value = ''; sessionStorage.removeItem('invoiceMatchReviewerToken'); $('statusDot').classList.remove('on'); $('connectionText').textContent = 'Token rejected'; } throw new Error(payload?.detail?.message || payload?.detail || `Request failed (${response.status})`); }
+      if (!response.ok) { if (response.status === 401) { token = ''; cookieSession=false; $('token').value = ''; sessionStorage.removeItem('invoiceMatchReviewerToken'); $('statusDot').classList.remove('on'); $('connectionText').textContent = 'Sign in required'; } throw new Error(payload?.detail?.message || payload?.detail || `Request failed (${response.status})`); }
       return payload;
     }
     async function connect() {
@@ -63,7 +63,7 @@
       catch (error) { showNotice(error.message); }
     }
     async function loadQueue() {
-      if (!token) return;
+      if (!token && !cookieSession) return;
       const params = new URLSearchParams({status:'OPEN', limit:'500'});
       const query = $('search').value.trim(); if (query) params.set('q', query);
       if ($('overdue').checked) params.set('overdue_only','true');

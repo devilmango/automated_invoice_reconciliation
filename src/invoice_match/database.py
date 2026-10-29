@@ -132,6 +132,9 @@ class APOutboxRecord(CompanyScoped, Base):
     accounting_status: Mapped[str] = mapped_column(String(32), default="UNKNOWN", index=True)
     accounting_status_detail: Mapped[dict] = mapped_column(JSON, default=dict)
     accounting_status_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accounting_status_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    accounting_status_next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    accounting_status_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
 
 class CapturedDocumentRecord(CompanyScoped, Base):
@@ -300,7 +303,11 @@ class AccountingConnectionEventRecord(CompanyScoped, Base):
 
 class RemittancePaymentRecord(CompanyScoped, Base):
     __tablename__ = "remittance_payments"
-    __table_args__ = (Index("uq_remittance_payment_company_external", "company_id", "external_id", unique=True),)
+    __table_args__ = (
+        Index("uq_remittance_payment_company_external", "company_id", "external_id", unique=True),
+        Index("uq_bank_payment_account_transaction", "company_id", "bank_account_id",
+              "bank_transaction_id", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     external_id: Mapped[str] = mapped_column(String(160))
@@ -312,6 +319,16 @@ class RemittancePaymentRecord(CompanyScoped, Base):
     status: Mapped[str] = mapped_column(String(24), default="NEEDS_REVIEW", index=True)
     input_data: Mapped[dict] = mapped_column(JSON)
     allocated_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    bank_account_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    bank_transaction_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    bank_statement_batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("bank_statement_batches.id", name="fk_remittance_bank_statement_batch"),
+        nullable=True, index=True
+    )
+    matched_remittance_id: Mapped[str | None] = mapped_column(
+        ForeignKey("remittance_payments.id", name="fk_bank_payment_matched_remittance"),
+        nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -335,3 +352,86 @@ class PaymentReconciliationEventRecord(CompanyScoped, Base):
     actor: Mapped[str] = mapped_column(String(255))
     details: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AccountingMasterDataRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_master_data"
+    __table_args__ = (Index("uq_accounting_master_data_source", "company_id", "provider", "category", "source_id", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    category: Mapped[str] = mapped_column(String(24), index=True)
+    source_id: Mapped[str] = mapped_column(String(160))
+    code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    name: Mapped[str] = mapped_column(String(255))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    source_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CreditNoteApplicationRecord(CompanyScoped, Base):
+    __tablename__ = "credit_note_applications"
+    __table_args__ = (Index("uq_credit_application_pair", "company_id", "credit_match_id", "invoice_match_id", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    credit_match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), index=True)
+    invoice_match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    approved_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CreditApplicationOutboxRecord(CompanyScoped, Base):
+    __tablename__ = "credit_application_outbox"
+    __table_args__ = (
+        Index("ix_credit_application_outbox_application", "company_id", "application_id"),
+        Index("uq_credit_application_outbox_idempotency", "company_id", "idempotency_key", unique=True),
+        Index("ix_credit_application_outbox_due", "state", "next_attempt_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    application_id: Mapped[str] = mapped_column(ForeignKey("credit_note_applications.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    state: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    external_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BankStatementBatchRecord(CompanyScoped, Base):
+    __tablename__ = "bank_statement_batches"
+    __table_args__ = (
+        Index("uq_bank_statement_batch", "company_id", "bank_account_id", "statement_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    bank_account_id: Mapped[str] = mapped_column(String(160), index=True)
+    statement_id: Mapped[str] = mapped_column(String(160))
+    format: Mapped[str] = mapped_column(String(12))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    opening_balance: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    closing_balance: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    transaction_count: Mapped[int] = mapped_column(Integer, default=0)
+    imported_count: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class BankAccountConfigurationRecord(CompanyScoped, Base):
+    __tablename__ = "bank_account_configurations"
+    __table_args__ = (
+        Index("uq_bank_account_configuration", "company_id", "bank_account_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    bank_account_id: Mapped[str] = mapped_column(String(160), index=True)
+    bai2_transaction_codes: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_by: Mapped[str] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

@@ -5,7 +5,7 @@ import os
 import secrets
 from dataclasses import dataclass
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 _bearer = HTTPBearer(auto_error=False)
@@ -65,8 +65,19 @@ def _invalid_configuration() -> None:
 
 
 def authenticate_reviewer(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> Principal:
+    if credentials is None:
+        from .oidc_auth import oidc_enabled, principal_from_cookie
+
+        session = principal_from_cookie(request)
+        if session:
+            return Principal(name=session["name"], roles=frozenset(session["roles"]),
+                             company_id=session["company_id"])
+        if oidc_enabled():
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Sign in with your organization account", headers={"WWW-Authenticate": "Bearer"})
     reviewers = _reviewers()
     if credentials is None or credentials.scheme.casefold() != "bearer":
         raise HTTPException(
