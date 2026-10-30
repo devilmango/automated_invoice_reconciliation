@@ -340,3 +340,13 @@ class XeroAdapter:
             "tax": normalize(tax_rates, "TaxType", "Name", "TaxType", "Status"),
             "currency": normalize(currencies, "Code", "Description", "Code"),
         }
+
+    def test_connection(self) -> dict:
+        """Validate OAuth access and the configured Xero tenant."""
+        data = self._api("Organisation")
+        organisations = data.get("Organisations") or []
+        if not organisations:
+            raise RuntimeError("Xero connection check returned no organisation")
+        organisation = organisations[0]
+        return {"account_id": str(organisation.get("OrganisationID") or self.tenant_id),
+                "account_name": organisation.get("Name")}

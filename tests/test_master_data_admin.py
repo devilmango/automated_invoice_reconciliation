@@ -61,6 +61,8 @@ def test_admin_can_accept_mapping_suggestion_and_audit_applied_mapping(client, a
     assert audit["details"]["source_label"] == "ABC Supplies"
     assert audit["details"]["suggested_source_id"] == "vendor-1"
     assert audit["details"]["mapping_change"] == {"before": None, "after": "vendor-1"}
+    revisions = client.get("/admin/accounting-connections/quickbooks/mapping-history", headers=admin_headers)
+    assert any(item["change_type"] == "SUGGESTION_ACCEPTED" for item in revisions.json())
 
 
 def test_admin_can_dismiss_mapping_suggestion_and_it_stays_dismissed(client, admin_headers, monkeypatch):

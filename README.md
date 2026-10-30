@@ -402,6 +402,10 @@ Admins can refresh the available supplier/item/tax/currency references with `POS
 
 Admins can configure each provider's recurring master-data refresh from the operations page or with `PUT /admin/accounting-connections/{provider}/sync-schedule` using `enabled`, `interval_minutes`, and `stale_after_minutes` (each interval must be at least five minutes). The existing `invoice-match worker` runs due provider syncs. `GET /admin/accounting-connections/sync-status` reports the schedule, last start, last success, next run, last error, and a status of `CURRENT`, `STALE`, `FAILED`, `NEVER_SYNCED`, `OVERDUE`, or `DISABLED`. Scheduled failures retry in five minutes and remain visible until a successful refresh clears the error. Manual refreshes also update last-success and error state. A failed invoice-status lookup records the attempt and error, then schedules another attempt after 60 seconds, doubling to a 24-hour ceiling. HTTP 429 responses use the provider's `Retry-After` value when present, with a five-minute minimum when it is absent. Reviewer AP outbox rows expose `accounting_status_attempt_count`, `accounting_status_next_retry_at`, and `accounting_status_error`; worker polling skips rows until their retry time. An admin can trigger an immediate check with `POST /reviewer/ap-outbox/{match_id}/sync-status`.
 
+`GET /admin/accounting-connections/{provider}/sync-history` returns recent run status, trigger, actor, duration, item counts, and per-category added/changed/deactivated totals. The operations page also shows unmapped vendor/SKU/tax labels, close competing suggestions, and configured mappings whose provider references are inactive or missing. Use **Test connection** to exercise the provider's OAuth/API path; connection authentication health is shown separately from master-data sync status. Failed syncs and freshness-window breaches enter the same retryable webhook outbox as reviewer alerts and include an operations-page link. Set `INVOICE_MATCH_ADMIN_URL` to the externally reachable operations page base URL when webhook consumers need an absolute link (the default is `/reviewer/operations`).
+
+Mapping changes made from the editor or suggestion queue are revisioned. `GET /admin/accounting-connections/{provider}/mapping-history` lists before/after values and actors. `POST /admin/accounting-connections/{provider}/mapping-history/{change_id}/rollback` restores the previous value only if the current value still matches that revision; rollback itself creates an audited revision.
+
 ### Import bank statements
 
 The integration endpoint accepts a statement ID, bank account ID, one of `csv`, `ofx`, or `bai2`, and the source file content as text. It also stores optional opening and closing balances and statement currency in a durable batch record. CSV expects a header plus a stable transaction ID (`transaction_id`, `fitid`, or `id`), a date, and either a signed `amount` or `debit`/`credit` columns. Common OFX `STMTTRN` fields and BAI2 group header (`02`), account identifier (`03`), and transaction detail (`16`) records are supported. BAI2 detail amounts use the bank's implied currency precision; detail codes 400–699 default to debits. Banks can customize transaction codes with an admin-managed account mapping. The BAI2 record layout is based on the [Goldman Sachs BAI File Guide](https://developer.gs.com/docs/services/transaction-banking/bai-file/).
@@ -573,12 +577,17 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `GET` | `/admin/accounting-connections/sync-status` | Review per-provider master-data freshness and sync failures (admin token required) |
 | `PUT` | `/admin/accounting-connections/{provider}/sync-schedule` | Configure provider sync enablement and freshness intervals (admin token required) |
 | `GET` | `/admin/accounting-connections/{provider}/master-data` | List synchronized accounting references (admin token required) |
+| `GET` | `/admin/accounting-connections/{provider}/sync-history` | Inspect sync counts, duration, diff summary, and failures (admin token required) |
+| `POST` | `/admin/accounting-connections/{provider}/test-connection` | Validate provider authentication and API access (admin token required) |
 | `GET` | `/admin/accounting-connections/{provider}/mapping-suggestions` | Get advisory mapping candidates (admin token required) |
+| `GET` | `/admin/accounting-connections/{provider}/mapping-coverage` | Report unmapped labels, ambiguous suggestions, and inactive references (admin token required) |
 | `POST` | `/admin/accounting-connections/{provider}/mapping-suggestions/review` | Accept or dismiss a candidate and audit the reviewer decision (admin token required) |
 | `POST` | `/admin/procurement/sync` | Synchronize POs and receipts from the configured provider (admin token required) |
 | `GET` | `/admin/accounting-connections/{provider}/mappings` | Read company accounting mappings (admin token required) |
 | `PUT` | `/admin/accounting-connections/{provider}/mappings/{category}` | Replace supplier, item, tax, or currency map (admin token required) |
 | `DELETE` | `/admin/accounting-connections/{provider}/mappings/{category}/{source_key}` | Remove one accounting mapping (admin token required) |
+| `GET` | `/admin/accounting-connections/{provider}/mapping-history` | Inspect mapping revisions (admin token required) |
+| `POST` | `/admin/accounting-connections/{provider}/mapping-history/{change_id}/rollback` | Restore a mapping revision with a conflict guard (admin token required) |
 | `GET` | `/integrations/procurement/purchase-orders/{po_number}` | Read a synchronized PO and receipt snapshot (integration token required) |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
@@ -741,6 +750,7 @@ The Compose file uses development credentials. Change credentials and manage the
 | `INVOICE_MATCH_INTEGRATION_TOKEN` | unset | Integration token used by `capture-inbox` |
 | `INVOICE_MATCH_CAPTURE_INBOX_DIRECTORY` | `./invoice-inbox` | Host folder mounted as the container's invoice inbox |
 | `NOTIFICATION_WEBHOOK_URL` | unset | HTTPS destination for scheduled reviewer notification delivery |
+| `INVOICE_MATCH_ADMIN_URL` | `/reviewer/operations` | Operations page link included with master-data sync alerts |
 | `NOTIFICATION_WEBHOOK_TOKEN` | unset | Optional bearer credential sent to the notification endpoint |
 | `NOTIFICATION_WEBHOOK_SECRET` | unset | Optional HMAC-SHA256 signing secret for webhook requests |
 | `QBO_CLIENT_ID` / `QBO_CLIENT_SECRET` | unset | Intuit OAuth application credentials |
@@ -775,7 +785,7 @@ alembic upgrade head
 invoice-match serve
 ```
 
-Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, credit allocation delivery state in `credit_application_outbox`, statement metadata in `bank_statement_batches`, mapping review decisions in `mapping_suggestion_decisions`, provider sync schedules and run state in `master_data_sync_schedules`, notification delivery state in `notification_outbox`, encrypted QuickBooks and Xero OAuth tokens in their credential tables, and worker liveness in `worker_heartbeats`. Migration `0007_company_delivery_xero` adds per-company data boundaries and retry scheduling; pre-existing data is assigned to `default`.
+Schema changes are managed with Alembic. Run `alembic upgrade head` before starting the API; Docker Compose applies pending migrations. Inspect state with `alembic current` and `alembic history`. If upgrading a database created by an earlier release using `create_all`, stop the API, run `alembic stamp 0001_initial` once, then run `alembic upgrade head`. Match inputs and results are in `matches`, review items in `exceptions`, events in `audit_events`, AP delivery state in `ap_outbox`, credit allocation delivery state in `credit_application_outbox`, statement metadata in `bank_statement_batches`, mapping review decisions in `mapping_suggestion_decisions`, mapping revisions in `accounting_mapping_changes`, provider sync schedules and run history in `master_data_sync_schedules` and `master_data_sync_runs`, provider connection checks in `accounting_connection_health`, notification delivery state in `notification_outbox`, encrypted QuickBooks and Xero OAuth tokens in their credential tables, and worker liveness in `worker_heartbeats`. Migration `0007_company_delivery_xero` adds per-company data boundaries and retry scheduling; pre-existing data is assigned to `default`.
 
 ## Project layout
 

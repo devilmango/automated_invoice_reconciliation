@@ -230,7 +230,8 @@ class NotificationOutboxRecord(CompanyScoped, Base):
     __table_args__ = (Index("ix_notification_outbox_dedupe_key", "company_id", "dedupe_key", unique=True),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), index=True)
+    match_id: Mapped[str | None] = mapped_column(ForeignKey("matches.id"), nullable=True, index=True)
+    provider: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     dedupe_key: Mapped[str] = mapped_column(String(255))
     event_type: Mapped[str] = mapped_column(String(40), index=True)
     channel: Mapped[str] = mapped_column(String(24), default="webhook")
@@ -401,6 +402,55 @@ class MasterDataSyncScheduleRecord(CompanyScoped, Base):
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+
+class MasterDataSyncRunRecord(CompanyScoped, Base):
+    __tablename__ = "master_data_sync_runs"
+    __table_args__ = (Index("ix_master_data_sync_runs_provider_started", "company_id", "provider", "started_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    trigger_type: Mapped[str] = mapped_column(String(16))
+    actor: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(16), default="RUNNING", index=True)
+    counts: Mapped[dict] = mapped_column(JSON, default=dict)
+    changes: Mapped[dict] = mapped_column(JSON, default=dict)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AccountingConnectionHealthRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_connection_health"
+    __table_args__ = (Index("uq_accounting_connection_health", "company_id", "provider", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    status: Mapped[str] = mapped_column(String(16))
+    failure_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    account_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    account_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AccountingMappingChangeRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_mapping_changes"
+    __table_args__ = (Index("ix_accounting_mapping_changes_provider_created", "company_id", "provider", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    category: Mapped[str] = mapped_column(String(24), index=True)
+    source_label: Mapped[str] = mapped_column(String(255))
+    previous_source_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    previous_source_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    new_source_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    new_source_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    change_type: Mapped[str] = mapped_column(String(24))
+    actor: Mapped[str] = mapped_column(String(255))
+    reverts_change_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class CreditNoteApplicationRecord(CompanyScoped, Base):

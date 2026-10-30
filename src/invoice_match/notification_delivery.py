@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .database import (
+    AccountingConnectionEventRecord,
     AuditEvent,
     ExceptionRecord,
     MatchRecord,
@@ -114,6 +115,24 @@ def queue_notification(
     return notification
 
 
+def queue_system_notification(
+    session: Session, *, provider: str, kind: str, payload: dict, dedupe_key: str,
+) -> NotificationOutboxRecord | None:
+    """Queue a provider-level alert through the same durable webhook outbox."""
+    key = dedupe_key[:255]
+    existing = session.scalar(select(NotificationOutboxRecord).where(
+        NotificationOutboxRecord.dedupe_key == key
+    ))
+    if existing is not None:
+        return None
+    notification = NotificationOutboxRecord(
+        id=str(uuid4()), match_id=None, provider=provider, dedupe_key=key,
+        event_type=kind, channel="webhook", payload=payload, state="PENDING", attempt_count=0,
+    )
+    session.add(notification)
+    return notification
+
+
 def queue_due_reminders(
     session: Session,
     *,
@@ -210,14 +229,17 @@ def deliver_pending_notifications(
                 delay_seconds = min(max_retry_seconds, initial_retry_seconds * (2 ** (record.attempt_count - 1)))
                 record.next_attempt_at = current + timedelta(seconds=delay_seconds)
                 summary["failed"] += 1
-            session.add(AuditEvent(
-                match_id=record.match_id,
-                event_type="NOTIFICATION_DELIVERY_FAILED",
-                actor=f"notification:{adapter.name}",
-                details={"notification_id": record.id, "event_type": record.event_type,
-                         "attempt": record.attempt_count, "state": record.state,
-                         "error": record.last_error},
-            ))
+            details = {"notification_id": record.id, "event_type": record.event_type,
+                       "attempt": record.attempt_count, "state": record.state,
+                       "error": record.last_error}
+            if record.match_id:
+                session.add(AuditEvent(match_id=record.match_id,
+                    event_type="NOTIFICATION_DELIVERY_FAILED", actor=f"notification:{adapter.name}",
+                    details=details))
+            else:
+                session.add(AccountingConnectionEventRecord(provider=record.provider or "unknown",
+                    event_type="ADMIN_ALERT_DELIVERY_FAILED", actor=f"notification:{adapter.name}",
+                    details=details))
             summary["items"].append({"notification_id": record.id, "state": record.state,
                                      "error": record.last_error})
         else:
@@ -226,13 +248,16 @@ def deliver_pending_notifications(
             record.delivered_at = current
             record.next_attempt_at = None
             record.last_error = None
-            session.add(AuditEvent(
-                match_id=record.match_id,
-                event_type="NOTIFICATION_DELIVERED",
-                actor=f"notification:{adapter.name}",
-                details={"notification_id": record.id, "event_type": record.event_type,
-                         "provider_reference": reference},
-            ))
+            details = {"notification_id": record.id, "event_type": record.event_type,
+                       "provider_reference": reference}
+            if record.match_id:
+                session.add(AuditEvent(match_id=record.match_id,
+                    event_type="NOTIFICATION_DELIVERED", actor=f"notification:{adapter.name}",
+                    details=details))
+            else:
+                session.add(AccountingConnectionEventRecord(provider=record.provider or "unknown",
+                    event_type="ADMIN_ALERT_DELIVERED", actor=f"notification:{adapter.name}",
+                    details=details))
             summary["delivered"] += 1
             summary["items"].append({"notification_id": record.id, "state": "DELIVERED",
                                      "provider_reference": reference})

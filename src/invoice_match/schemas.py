@@ -170,7 +170,8 @@ class RuleVersionAuditEntry(StrictModel):
 
 class NotificationOutboxItem(StrictModel):
     id: str
-    match_id: str
+    match_id: str | None
+    provider: str | None = None
     dedupe_key: str
     event_type: str
     channel: str

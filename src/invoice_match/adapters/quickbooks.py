@@ -323,6 +323,15 @@ class QuickBooksOnlineAdapter:
             result[category] = rows
         return result
 
+    def test_connection(self) -> dict:
+        """Validate OAuth access and access to this QuickBooks company."""
+        data = self._request("GET", f"companyinfo/{self.realm_id}")
+        company = data.get("CompanyInfo") if isinstance(data, dict) else None
+        if not isinstance(company, dict):
+            raise RuntimeError("QuickBooks connection check returned no company information")
+        return {"account_id": str(company.get("Id") or self.realm_id),
+                "account_name": company.get("CompanyName") or company.get("LegalName")}
+
     @staticmethod
     def _validate_bill_total(bill: dict, payload: dict) -> None:
         if bill.get("TotalAmt") is None or payload.get("total_amount") is None:
