@@ -78,6 +78,7 @@ def test_master_sync_history_records_run_duration_and_record_changes(client, adm
     assert run["status"] == "SUCCEEDED"
     assert run["duration_ms"] >= 0
     assert run["changes"]["supplier"] == {"added": 1, "changed": 1, "deactivated": 1}
+    assert {item["action"] for item in run["details"]["supplier"]} == {"ADDED", "CHANGED", "DEACTIVATED"}
     history = client.get("/admin/accounting-connections/quickbooks/sync-history", headers=admin_headers)
     assert history.status_code == 200 and history.json()[0]["id"] == run["id"]
 
@@ -163,6 +164,11 @@ def test_admin_can_inspect_and_rollback_mapping_change(client, admin_headers, mo
 
 def test_mapping_rollback_refuses_to_overwrite_a_newer_mapping(client, admin_headers, monkeypatch):
     seed_admin_data(monkeypatch)
+    with SessionLocal() as session:
+        session.add(AccountingMasterDataRecord(id="rollback-vendor-2", provider="quickbooks",
+            category="supplier", source_id="vendor-2", name="ABC Supply Alternate", active=True,
+            source_data={}, synced_at=datetime.now(timezone.utc)))
+        session.commit()
     client.put("/admin/accounting-connections/quickbooks/mappings/supplier",
         headers=admin_headers, json={"mappings": {"ABC Supplies": "vendor-1"}})
     history = client.get("/admin/accounting-connections/quickbooks/mapping-history", headers=admin_headers).json()
@@ -174,6 +180,99 @@ def test_mapping_rollback_refuses_to_overwrite_a_newer_mapping(client, admin_hea
         headers=admin_headers,
     )
     assert response.status_code == 409
+
+
+def test_sync_preview_shows_record_level_changes_without_applying_them(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match import api
+
+    class Adapter:
+        name = "quickbooks"
+
+        def fetch_master_data(self):
+            return {"supplier": [
+                {"source_id": "vendor-1", "name": "ABC Supplies Updated", "code": "ABC", "active": True},
+                {"source_id": "vendor-new", "name": "New Vendor", "active": True},
+            ]}
+
+    monkeypatch.setattr(api, "create_adapter", lambda provider, company_id: Adapter())
+    response = client.post("/admin/accounting-connections/quickbooks/sync-preview", headers=admin_headers)
+    assert response.status_code == 200
+    preview = response.json()
+    assert preview["applies_changes"] is False
+    assert preview["changes"]["supplier"] == {"added": 1, "changed": 1, "deactivated": 1}
+    assert {item["action"] for item in preview["details"]["supplier"]} == {
+        "ADDED", "CHANGED", "DEACTIVATED",
+    }
+    with SessionLocal() as session:
+        record = session.query(AccountingMasterDataRecord).filter_by(
+            provider="quickbooks", source_id="vendor-1").one()
+        assert record.name == "ABC Supplies"
+        assert session.query(AccountingMasterDataRecord).filter_by(source_id="vendor-new").count() == 0
+
+
+def test_mapping_validation_rejects_unknown_inactive_and_duplicate_targets(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    invalid = client.put("/admin/accounting-connections/quickbooks/mappings/supplier",
+        headers=admin_headers, json={"mappings": {"Missing": "does-not-exist"}})
+    assert invalid.status_code == 422
+    inactive = client.put("/admin/accounting-connections/quickbooks/mappings/supplier",
+        headers=admin_headers, json={"mappings": {"Retired": "inactive-vendor"}})
+    assert inactive.status_code == 422
+    duplicate = client.put("/admin/accounting-connections/quickbooks/mappings/supplier",
+        headers=admin_headers, json={"mappings": {"ABC": "vendor-1", "ABC alias": "vendor-1"}})
+    assert duplicate.status_code == 422
+    report = client.get("/admin/accounting-connections/quickbooks/mapping-coverage",
+        headers=admin_headers)
+    assert report.status_code == 200
+    assert any(item["type"] == "UNKNOWN_OR_INACTIVE_TARGET"
+        for item in report.json()["mapping_conflicts"])
+
+
+def test_scheduled_provider_connection_check_persists_auth_failure_and_reconnect_state(monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import AccountingConnectionHealthRecord, MasterDataSyncScheduleRecord
+    from invoice_match.master_data_sync import check_due_provider_connections
+
+    with SessionLocal() as session:
+        schedule = MasterDataSyncScheduleRecord(id="connection-check-due", provider="quickbooks",
+            enabled=False, interval_minutes=60, stale_after_minutes=120,
+            connection_check_enabled=True, connection_check_interval_minutes=30,
+            next_connection_check_at=datetime.now(timezone.utc) - timedelta(minutes=1))
+        session.add(schedule)
+        session.commit()
+
+        class Adapter:
+            def test_connection(self):
+                raise RuntimeError("OAuth refresh failed: invalid_grant")
+
+        result = check_due_provider_connections(session, company_id="default",
+            adapter_factory=lambda provider, company: Adapter(), actor="worker")
+        assert result == {"checked": 0, "failed": 1}
+        session.refresh(schedule)
+        health = session.query(AccountingConnectionHealthRecord).filter_by(provider="quickbooks").one()
+        assert health.failure_type == "AUTHENTICATION"
+        assert schedule.last_connection_check_at is not None
+        assert schedule.next_connection_check_at > schedule.last_connection_check_at
+
+
+def test_worker_schedules_checks_for_enabled_connections_without_admin_setup(monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import AccountingConnectionHealthRecord, MasterDataSyncScheduleRecord
+    from invoice_match.master_data_sync import check_due_provider_connections
+
+    class Adapter:
+        def test_connection(self):
+            return {"account_id": "qbo-123", "account_name": "ABC Books"}
+
+    with SessionLocal() as session:
+        result = check_due_provider_connections(session, company_id="default",
+            adapter_factory=lambda provider, company: Adapter(), actor="worker")
+        assert result == {"checked": 1, "failed": 0}
+        schedule = session.query(MasterDataSyncScheduleRecord).filter_by(provider="quickbooks").one()
+        health = session.query(AccountingConnectionHealthRecord).filter_by(provider="quickbooks").one()
+        assert schedule.last_connection_check_at is not None
+        assert health.account_id == "qbo-123"
 
 
 def test_stale_provider_sync_queues_a_deduplicated_webhook_alert(monkeypatch):

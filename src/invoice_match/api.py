@@ -1434,14 +1434,38 @@ def sync_accounting_masters(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Accounting master-data sync failed: {exc}") from exc
     return {"provider": provider, "synced_at": _timestamp(run.finished_at),
-            "counts": run.counts, "changes": run.changes, "run": master_data_sync_run_result(run)}
+            "counts": run.counts, "changes": run.changes, "details": run.details,
+            "run": master_data_sync_run_result(run)}
+
+
+@app.post("/admin/accounting-connections/{provider}/sync-preview")
+def preview_accounting_master_sync(
+    provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    """Fetch provider master data and show its proposed diff without persisting changes."""
+    provider = provider.casefold()
+    connection = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider, AccountingConnectionRecord.enabled.is_(True)))
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Enabled accounting connection not found")
+    try:
+        adapter = create_adapter(provider, company_id=session.info.get("company_id", "default"))
+        if adapter.name != provider or not callable(getattr(adapter, "fetch_master_data", None)):
+            raise ValueError(f"The {provider} adapter does not support master-data sync")
+        references = adapter.fetch_master_data()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Accounting master-data preview failed: {exc}") from exc
+    counts, changes, details = _master_data_diff(session, provider, references)
+    return {"provider": provider, "previewed_at": _timestamp(datetime.now(timezone.utc)),
+            "applies_changes": False, "counts": counts, "changes": changes, "details": details}
 
 
 def _apply_master_data_sync(session: Session, provider: str, adapter, actor: str) -> tuple[dict, dict]:
     if adapter.name != provider or not callable(getattr(adapter, "fetch_master_data", None)):
         raise ValueError(f"The {provider} adapter does not support master-data sync")
     references = adapter.fetch_master_data()
-    now, counts, changes = datetime.now(timezone.utc), {}, {}
+    counts, changes, details = _master_data_diff(session, provider, references)
+    now = datetime.now(timezone.utc)
     for category, items in references.items():
         if category not in {"supplier", "item", "tax", "currency"}:
             continue
@@ -1451,16 +1475,13 @@ def _apply_master_data_sync(session: Session, provider: str, adapter, actor: str
         )).all()
         by_source = {row.source_id: row for row in current}
         incoming_ids = {str(item["source_id"]) for item in items}
-        category_changes = {"added": 0, "changed": 0, "deactivated": 0}
         for row in current:
             if row.active and row.source_id not in incoming_ids:
                 row.active = False
-                category_changes["deactivated"] += 1
         for item in items:
             source_id = str(item["source_id"])
             record = by_source.get(source_id)
             if record is None:
-                category_changes["added"] += 1
                 record = AccountingMasterDataRecord(id=str(uuid4()), provider=provider,
                     category=category, source_id=source_id, name=str(item["name"])[:255],
                     code=item.get("code"), active=bool(item.get("active", True)),
@@ -1470,24 +1491,63 @@ def _apply_master_data_sync(session: Session, provider: str, adapter, actor: str
                 new_name = str(item["name"])[:255]
                 new_source_data = item.get("source_data") or {}
                 new_active = bool(item.get("active", True))
-                if record.active and not new_active:
-                    category_changes["deactivated"] += 1
-                elif (record.name != new_name or record.code != item.get("code") or
-                      record.active != new_active or record.source_data != new_source_data):
-                    category_changes["changed"] += 1
                 record.name, record.code = new_name, item.get("code")
                 record.active, record.source_data, record.synced_at = new_active, new_source_data, now
-            counts[category] = counts.get(category, 0) + 1
-        changes[category] = category_changes
     session.add(AccountingConnectionEventRecord(provider=provider, event_type="ACCOUNTING_MASTER_DATA_SYNCED",
-        actor=actor, details={"counts": counts, "changes": changes}))
-    return counts, changes
+        actor=actor, details={"counts": counts, "changes": changes, "details": details}))
+    return counts, changes, details
+
+
+def _master_data_diff(session: Session, provider: str, references: dict) -> tuple[dict, dict, dict]:
+    """Calculate a side-effect-free record-level diff against the last provider snapshot."""
+    counts, changes, details = {}, {}, {}
+    for category, items in references.items():
+        if category not in {"supplier", "item", "tax", "currency"}:
+            continue
+        current = session.scalars(select(AccountingMasterDataRecord).where(
+            AccountingMasterDataRecord.provider == provider,
+            AccountingMasterDataRecord.category == category)).all()
+        by_source = {row.source_id: row for row in current}
+        incoming_ids = {str(item["source_id"]) for item in items}
+        category_changes = {"added": 0, "changed": 0, "deactivated": 0}
+        category_details = []
+        for row in current:
+            if row.active and row.source_id not in incoming_ids:
+                category_changes["deactivated"] += 1
+                category_details.append({"action": "DEACTIVATED", "source_id": row.source_id,
+                    "before": {"name": row.name, "code": row.code, "active": True},
+                    "after": {"name": row.name, "code": row.code, "active": False}})
+        for item in items:
+            source_id = str(item["source_id"])
+            name = str(item["name"])[:255]
+            code = item.get("code")
+            active = bool(item.get("active", True))
+            record = by_source.get(source_id)
+            if record is None:
+                category_changes["added"] += 1
+                category_details.append({"action": "ADDED", "source_id": source_id,
+                    "before": None, "after": {"name": name, "code": code, "active": active}})
+            elif record.active and not active:
+                category_changes["deactivated"] += 1
+                category_details.append({"action": "DEACTIVATED", "source_id": source_id,
+                    "before": {"name": record.name, "code": record.code, "active": record.active},
+                    "after": {"name": name, "code": code, "active": active}})
+            elif (record.name != name or record.code != code or record.active != active or
+                  record.source_data != (item.get("source_data") or {})):
+                category_changes["changed"] += 1
+                category_details.append({"action": "CHANGED", "source_id": source_id,
+                    "before": {"name": record.name, "code": record.code, "active": record.active},
+                    "after": {"name": name, "code": code, "active": active}})
+        counts[category] = len(items)
+        changes[category] = category_changes
+        details[category] = category_details
+    return counts, changes, details
 
 
 def master_data_sync_run_result(run: MasterDataSyncRunRecord) -> dict:
     return {"id": run.id, "provider": run.provider, "trigger_type": run.trigger_type,
             "actor": run.actor, "status": run.status, "counts": run.counts,
-            "changes": run.changes, "duration_ms": run.duration_ms, "error": run.error,
+            "changes": run.changes, "details": run.details, "duration_ms": run.duration_ms, "error": run.error,
             "started_at": _timestamp(run.started_at), "finished_at": _timestamp(run.finished_at)}
 
 
@@ -1612,7 +1672,7 @@ def accounting_mapping_coverage(
         AccountingMasterDataRecord.active.is_(True))).all()} for category in fields}
     suggestions = accounting_mapping_suggestions(provider, session, admin)
     suggestion_by_key = {(row["category"], row["source_label"]): row for row in suggestions}
-    unmapped, inactive_mappings, ambiguous = [], [], []
+    unmapped, inactive_mappings, ambiguous, mapping_conflicts = [], [], [], []
     for category, source_labels in labels.items():
         mappings = config.get(fields[category], {})
         normalized_mappings = {" ".join(key.casefold().split()): (key, value)
@@ -1634,15 +1694,18 @@ def accounting_mapping_coverage(
             if source_id not in active_ids[category]:
                 inactive_mappings.append({"category": category, "source_label": source_key,
                                           "provider_source_id": source_id})
+        mapping_conflicts.extend({"category": category, **issue}
+            for issue in _mapping_validation_issues(session, provider, category, mappings))
     label_count = sum(len(values) for values in labels.values())
     mapped_count = label_count - len(unmapped)
     return {"provider": provider,
         "summary": {"labels": label_count, "mapped": mapped_count,
                     "coverage_percent": round(mapped_count / label_count * 100, 1) if label_count else 100.0,
                     "unmapped": len(unmapped), "inactive_mappings": len(inactive_mappings),
-                    "ambiguous_suggestions": len(ambiguous)},
+                    "ambiguous_suggestions": len(ambiguous),
+                    "mapping_conflicts": len(mapping_conflicts)},
         "unmapped": unmapped, "inactive_mappings": inactive_mappings,
-        "ambiguous_suggestions": ambiguous}
+        "ambiguous_suggestions": ambiguous, "mapping_conflicts": mapping_conflicts}
 
 
 @app.post("/admin/accounting-connections/{provider}/mapping-suggestions/review")
@@ -1683,6 +1746,11 @@ def review_accounting_mapping_suggestion(
             normalized = " ".join(body.source_label.casefold().split())
             if any(" ".join(key.casefold().split()) == normalized for key in mappings):
                 raise HTTPException(status_code=409, detail="A mapping already exists for this source label")
+            issues = _mapping_validation_issues(session, provider, body.category,
+                {body.source_label: body.suggested_source_id})
+            if issues:
+                raise HTTPException(status_code=422, detail={"message": "Suggested provider target is not valid",
+                                                              "issues": issues})
             before = dict(mappings)
             mappings[" ".join(body.source_label.strip().split())] = body.suggested_source_id
             config[field] = mappings
@@ -1736,7 +1804,9 @@ def accounting_master_sync_status(
             MasterDataSyncScheduleRecord.provider == connection.provider))
         if schedule is None:
             schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=connection.provider,
-                enabled=False, interval_minutes=1440, stale_after_minutes=2880)
+                enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+                connection_check_enabled=True, connection_check_interval_minutes=60,
+                next_connection_check_at=now)
             session.add(schedule)
             session.flush()
         health = session.scalar(select(AccountingConnectionHealthRecord).where(
@@ -1744,13 +1814,20 @@ def accounting_master_sync_status(
         results.append({"provider": connection.provider, "connection_enabled": connection.enabled,
             "enabled": schedule.enabled, "interval_minutes": schedule.interval_minutes,
             "stale_after_minutes": schedule.stale_after_minutes,
+            "connection_check_enabled": schedule.connection_check_enabled,
+            "connection_check_interval_minutes": schedule.connection_check_interval_minutes,
+            "last_connection_check_at": _timestamp(schedule.last_connection_check_at),
+            "next_connection_check_at": _timestamp(schedule.next_connection_check_at),
             "sync_status": _master_sync_status(schedule, now),
             "last_started_at": _timestamp(schedule.last_started_at),
             "last_success_at": _timestamp(schedule.last_success_at),
             "next_run_at": _timestamp(schedule.next_run_at), "last_error": schedule.last_error,
             "connection_health": ({"status": health.status, "failure_type": health.failure_type,
                 "account_name": health.account_name, "account_id": health.account_id,
-                "error": health.error, "checked_at": _timestamp(health.checked_at)} if health else None)})
+                "error": health.error, "checked_at": _timestamp(health.checked_at),
+                "reconnect_required": health.failure_type == "AUTHENTICATION",
+                "reconnect_action": ("Reconnect provider credentials, then run Test connection."
+                    if health.failure_type == "AUTHENTICATION" else None)} if health else None)})
     session.commit()
     return results
 
@@ -1774,14 +1851,22 @@ def update_accounting_master_sync_schedule(
     schedule.interval_minutes = body.interval_minutes
     schedule.stale_after_minutes = body.stale_after_minutes
     schedule.next_run_at = datetime.now(timezone.utc) if body.enabled else None
+    schedule.connection_check_enabled = body.connection_check_enabled
+    schedule.connection_check_interval_minutes = body.connection_check_interval_minutes
+    schedule.next_connection_check_at = (datetime.now(timezone.utc)
+        if body.connection_check_enabled else None)
     session.add(AccountingConnectionEventRecord(provider=provider,
         event_type="ACCOUNTING_MASTER_DATA_SCHEDULE_UPDATED", actor=admin.name,
         details={"enabled": body.enabled, "interval_minutes": body.interval_minutes,
-                 "stale_after_minutes": body.stale_after_minutes}))
+                 "stale_after_minutes": body.stale_after_minutes,
+                 "connection_check_enabled": body.connection_check_enabled,
+                 "connection_check_interval_minutes": body.connection_check_interval_minutes}))
     session.commit()
     return {"provider": provider, "enabled": schedule.enabled,
             "interval_minutes": schedule.interval_minutes,
             "stale_after_minutes": schedule.stale_after_minutes,
+            "connection_check_enabled": schedule.connection_check_enabled,
+            "connection_check_interval_minutes": schedule.connection_check_interval_minutes,
             "next_run_at": _timestamp(schedule.next_run_at)}
 
 
@@ -1823,10 +1908,20 @@ def test_accounting_connection(
         event_type="ACCOUNTING_CONNECTION_TESTED", actor=admin.name,
         details={"status": status, "failure_type": failure_type, "error": error,
                  "account_id": health.account_id, "account_name": health.account_name}))
+    schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.provider == provider))
+    if schedule is not None:
+        schedule.last_connection_check_at = checked_at
+        schedule.next_connection_check_at = (checked_at + timedelta(
+            minutes=schedule.connection_check_interval_minutes)
+            if schedule.connection_check_enabled else None)
     session.commit()
     return {"provider": provider, "status": status, "failure_type": failure_type,
             "account_name": health.account_name, "account_id": health.account_id,
-            "error": error, "checked_at": _timestamp(checked_at)}
+            "error": error, "checked_at": _timestamp(checked_at),
+            "reconnect_required": failure_type == "AUTHENTICATION",
+            "reconnect_action": ("Reconnect the provider from Admin → Accounting connections, then run Test connection."
+                if failure_type == "AUTHENTICATION" else None)}
 
 
 @app.get("/admin/accounting-connections/{provider}/mappings")
@@ -1874,6 +1969,30 @@ def _record_mapping_changes(session: Session, *, provider: str, category: str,
             change_type=change_type, actor=actor, reverts_change_id=reverts_change_id))
         created.append(revision_id)
     return created
+
+
+def _mapping_validation_issues(session: Session, provider: str, category: str,
+                               mappings: dict[str, str]) -> list[dict]:
+    records = session.scalars(select(AccountingMasterDataRecord).where(
+        AccountingMasterDataRecord.provider == provider,
+        AccountingMasterDataRecord.category == category)).all()
+    by_id = {row.source_id: row for row in records}
+    issues = []
+    targets: dict[str, list[str]] = {}
+    for label, source_id in mappings.items():
+        target = by_id.get(source_id)
+        if target is None or not target.active:
+            issues.append({"type": "UNKNOWN_OR_INACTIVE_TARGET", "source_label": label,
+                           "provider_source_id": source_id,
+                           "provider_name": target.name if target else None,
+                           "active": target.active if target else False})
+        targets.setdefault(source_id, []).append(label)
+    for source_id, labels in targets.items():
+        if len(labels) > 1:
+            issues.append({"type": "DUPLICATE_PROVIDER_TARGET", "provider_source_id": source_id,
+                           "source_labels": sorted(labels),
+                           "provider_name": by_id[source_id].name if source_id in by_id else None})
+    return issues
 
 
 def mapping_change_result(change: AccountingMappingChangeRecord) -> dict:
@@ -1931,6 +2050,10 @@ def rollback_accounting_mapping_change(
         del mappings[key]
     if change.previous_source_id is not None and change.previous_source_label is not None:
         mappings[change.previous_source_label] = change.previous_source_id
+    issues = _mapping_validation_issues(session, provider, change.category, mappings)
+    if issues:
+        raise HTTPException(status_code=422, detail={"message": "Previous mapping target is no longer valid",
+                                                      "issues": issues})
     config[field] = mappings
     try:
         validate_configuration(provider, config)
@@ -1971,6 +2094,10 @@ def replace_accounting_mapping(
         before = config.get(field, {})
         after = {" ".join(key.strip().split()): value.strip()
                  for key, value in body.mappings.items()}
+        issues = _mapping_validation_issues(session, provider, category, after)
+        if issues:
+            raise HTTPException(status_code=422, detail={"message": "Mapping validation failed",
+                                                          "issues": issues})
         config[field] = after
         validate_configuration(provider, config)
         record.encrypted_config = encrypt_configuration(config)

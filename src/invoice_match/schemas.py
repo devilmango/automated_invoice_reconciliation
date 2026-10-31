@@ -356,6 +356,8 @@ class MasterDataSyncScheduleUpdate(StrictModel):
     enabled: bool
     interval_minutes: int = Field(ge=5, le=525600)
     stale_after_minutes: int = Field(ge=5, le=525600)
+    connection_check_enabled: bool = True
+    connection_check_interval_minutes: int = Field(default=60, ge=5, le=525600)
 
 
 class PaymentAdviceAllocation(StrictModel):

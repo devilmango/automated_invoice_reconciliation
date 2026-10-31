@@ -402,6 +402,10 @@ class MasterDataSyncScheduleRecord(CompanyScoped, Base):
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    connection_check_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    connection_check_interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    next_connection_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_connection_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MasterDataSyncRunRecord(CompanyScoped, Base):
@@ -415,6 +419,7 @@ class MasterDataSyncRunRecord(CompanyScoped, Base):
     status: Mapped[str] = mapped_column(String(16), default="RUNNING", index=True)
     counts: Mapped[dict] = mapped_column(JSON, default=dict)
     changes: Mapped[dict] = mapped_column(JSON, default=dict)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

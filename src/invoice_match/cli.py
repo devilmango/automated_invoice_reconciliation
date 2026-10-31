@@ -342,7 +342,7 @@ def worker(
         escalate_overdue, queue_due_reminders,
     )
     from .api import _apply_master_data_sync
-    from .master_data_sync import sync_due_master_data
+    from .master_data_sync import check_due_provider_connections, sync_due_master_data
     from .accounting_status import refresh_due_accounting_statuses
     from .credit_sync import sync_credit_applications
 
@@ -374,6 +374,12 @@ def worker(
                         provider_name, company_id=company
                     ),
                     apply_sync=_apply_master_data_sync, actor=worker_name, limit=limit,
+                )
+                connection_checks = check_due_provider_connections(
+                    session, company_id=company_id,
+                    adapter_factory=lambda provider_name, company: create_adapter(
+                        provider_name, company_id=company
+                    ), actor=worker_name, limit=limit,
                 )
                 ap = deliver_pending(session, provider, limit=limit, max_attempts=ap_attempts,
                                      initial_retry_seconds=ap_initial, max_retry_seconds=ap_max)
@@ -414,11 +420,13 @@ def worker(
                     + notifications.get("failed", 0) + notifications.get("dead_lettered", 0) \
                     + accounting_status.get("failed", 0) + credit_applications.get("failed", 0) \
                     + credit_applications.get("dead_lettered", 0) + master_data_syncs["failed"]
+                failures += connection_checks["failed"]
                 heartbeat.last_error = f"{failures} delivery attempt(s) failed or dead-lettered" if failures else None
                 session.commit()
                 cycle.append({"company_id": company_id, "ap": ap,
                               "accounting_status": accounting_status,
                               "master_data_syncs": master_data_syncs,
+                              "connection_checks": connection_checks,
                               "credit_applications": credit_applications, "notifications": notifications,
                               "health": "DEGRADED" if failures else "HEALTHY"})
         typer.echo(json.dumps({"companies": cycle}, indent=2))

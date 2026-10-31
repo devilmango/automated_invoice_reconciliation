@@ -56,7 +56,9 @@ def execute_master_data_sync(session: Session, *, provider: str, company_id: str
         MasterDataSyncScheduleRecord.provider == provider))
     if schedule is None:
         schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=provider,
-            enabled=False, interval_minutes=1440, stale_after_minutes=2880)
+            enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+            connection_check_enabled=True, connection_check_interval_minutes=60,
+            next_connection_check_at=started_at)
         session.add(schedule)
     schedule.last_started_at = started_at
     session.add(run)
@@ -70,11 +72,14 @@ def execute_master_data_sync(session: Session, *, provider: str, company_id: str
             if connection is None:
                 raise ValueError("No enabled accounting connection is configured")
             adapter = adapter_factory(provider, company_id)
-            counts, changes = apply_sync(session, provider, adapter, actor)
+            applied = apply_sync(session, provider, adapter, actor)
+            counts, changes = applied[:2]
+            details = applied[2] if len(applied) > 2 else {}
         finished_at = datetime.now(timezone.utc)
         run.status = "SUCCEEDED"
         run.counts = counts
         run.changes = changes
+        run.details = details
         run.duration_ms = max(0, int((time.perf_counter() - started_clock) * 1000))
         run.finished_at = finished_at
         run.error = None
@@ -131,6 +136,71 @@ def sync_due_master_data(session: Session, *, company_id: str, adapter_factory, 
         except Exception:
             summary["failed"] += 1
     if queue_stale_master_data_alerts(session):
+        session.commit()
+    return summary
+
+
+def check_due_provider_connections(session: Session, *, company_id: str, adapter_factory,
+                                   actor: str, limit: int = 100) -> dict[str, int]:
+    """Run scheduled provider authentication/connection checks and persist each outcome."""
+    now = datetime.now(timezone.utc)
+    enabled_providers = session.scalars(select(AccountingConnectionRecord.provider).where(
+        AccountingConnectionRecord.enabled.is_(True))).all()
+    for provider in enabled_providers:
+        schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+            MasterDataSyncScheduleRecord.provider == provider))
+        if schedule is None:
+            session.add(MasterDataSyncScheduleRecord(id=str(uuid4()), provider=provider,
+                enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+                connection_check_enabled=True, connection_check_interval_minutes=60,
+                next_connection_check_at=now))
+    session.flush()
+    due = session.scalars(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.connection_check_enabled.is_(True),
+        MasterDataSyncScheduleRecord.next_connection_check_at <= now,
+    ).order_by(MasterDataSyncScheduleRecord.next_connection_check_at).limit(limit)).all()
+    summary = {"checked": 0, "failed": 0}
+    for schedule in due:
+        checked_at = datetime.now(timezone.utc)
+        error, failure_type, account = None, None, {}
+        try:
+            connection = session.scalar(select(AccountingConnectionRecord).where(
+                AccountingConnectionRecord.provider == schedule.provider,
+                AccountingConnectionRecord.enabled.is_(True)))
+            if connection is None:
+                raise ValueError("No enabled accounting connection is configured")
+            adapter = adapter_factory(schedule.provider, company_id)
+            check = getattr(adapter, "test_connection", None)
+            if not callable(check):
+                raise RuntimeError(f"The {schedule.provider} adapter does not support connection checks")
+            account = check() or {}
+            status = "HEALTHY"
+        except Exception as exc:
+            status = "FAILED"
+            error = str(exc)[:1000]
+            failure_type = provider_failure_type(exc)
+        health = session.scalar(select(AccountingConnectionHealthRecord).where(
+            AccountingConnectionHealthRecord.provider == schedule.provider))
+        if health is None:
+            health = AccountingConnectionHealthRecord(id=str(uuid4()), provider=schedule.provider,
+                status=status, checked_at=checked_at)
+            session.add(health)
+        health.status, health.failure_type = status, failure_type
+        health.account_name = str(account.get("account_name"))[:255] if account.get("account_name") else None
+        health.account_id = str(account.get("account_id"))[:160] if account.get("account_id") else None
+        health.error, health.checked_at = error, checked_at
+        schedule.last_connection_check_at = checked_at
+        schedule.next_connection_check_at = checked_at + timedelta(
+            minutes=schedule.connection_check_interval_minutes)
+        event = "ACCOUNTING_CONNECTION_HEALTH_CHECKED" if status == "HEALTHY" else "ACCOUNTING_CONNECTION_HEALTH_CHECK_FAILED"
+        session.add(AccountingConnectionEventRecord(provider=schedule.provider,
+            event_type=event, actor=actor,
+            details={"status": status, "failure_type": failure_type, "error": error,
+                     "account_id": health.account_id, "checked_at": checked_at.isoformat()}))
+        if status == "FAILED":
+            summary["failed"] += 1
+        else:
+            summary["checked"] += 1
         session.commit()
     return summary
 

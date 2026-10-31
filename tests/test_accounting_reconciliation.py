@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from cryptography.fernet import Fernet
 
 from test_operations import submit
-from invoice_match.database import APOutboxRecord, AuditEvent, SessionLocal
+from invoice_match.database import APOutboxRecord, AccountingMasterDataRecord, AuditEvent, SessionLocal
 from invoice_match.delivery import deliver_pending
 
 
@@ -116,6 +117,11 @@ def test_admin_can_manage_provider_mapping_categories(client, admin_headers, mon
     saved = client.put("/admin/accounting-connections/quickbooks", headers=admin_headers,
                        json={"configuration": config, "enabled": True})
     assert saved.status_code == 200
+    with SessionLocal() as session:
+        session.add(AccountingMasterDataRecord(id="mapping-vendor-37", provider="quickbooks",
+            category="supplier", source_id="vendor-37", name="ABC Supplies", active=True,
+            source_data={}, synced_at=datetime.now(timezone.utc)))
+        session.commit()
     updated = client.put("/admin/accounting-connections/quickbooks/mappings/supplier",
         headers=admin_headers, json={"mappings": {"ABC Supplies": "vendor-37"}})
     assert updated.status_code == 200
