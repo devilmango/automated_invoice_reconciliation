@@ -9,7 +9,9 @@ from invoice_match.accounting_connections import encrypt_configuration
 from invoice_match.database import (
     AccountingConnectionEventRecord,
     AccountingConnectionRecord,
+    AccountingMappingChangeRecord,
     AccountingMasterDataRecord,
+    MasterDataSyncRunRecord,
     MatchRecord,
     NotificationOutboxRecord,
     SessionLocal,
@@ -273,6 +275,91 @@ def test_worker_schedules_checks_for_enabled_connections_without_admin_setup(mon
         health = session.query(AccountingConnectionHealthRecord).filter_by(provider="quickbooks").one()
         assert schedule.last_connection_check_at is not None
         assert health.account_id == "qbo-123"
+
+
+def test_successful_sync_queues_recovery_notice_after_prior_failure(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match import api
+
+    class Adapter:
+        name = "quickbooks"
+        fail = True
+
+        def fetch_master_data(self):
+            if self.fail:
+                raise RuntimeError("provider temporarily unavailable")
+            return {"supplier": [{"source_id": "vendor-1", "name": "ABC Supplies", "active": True}]}
+
+    adapter = Adapter()
+    monkeypatch.setattr(api, "create_adapter", lambda provider, company_id: adapter)
+    failed = client.post("/admin/accounting-connections/quickbooks/sync-masters", headers=admin_headers)
+    assert failed.status_code == 502
+    adapter.fail = False
+    recovered = client.post("/admin/accounting-connections/quickbooks/sync-masters", headers=admin_headers)
+    assert recovered.status_code == 200
+    alerts = client.get("/admin/alerts?state=ALL", headers=admin_headers)
+    assert alerts.status_code == 200
+    recovery = next(item for item in alerts.json() if item["event_type"] == "MASTER_DATA_SYNC_RECOVERED")
+    assert recovery["payload"]["recovery_run_id"] == recovered.json()["run"]["id"]
+    assert recovery["payload"]["failed_run_id"]
+
+
+def test_admin_can_acknowledge_and_snooze_provider_alerts(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import NotificationOutboxRecord
+
+    with SessionLocal() as session:
+        session.add(NotificationOutboxRecord(id="managed-alert", provider="quickbooks", match_id=None,
+            dedupe_key="managed-alert-once", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+            payload={"message": "Sync failed"}, state="DELIVERED", attempt_count=2))
+        session.commit()
+    snoozed = client.post("/admin/alerts/managed-alert/snooze", headers=admin_headers,
+        json={"snoozed_until": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()})
+    assert snoozed.status_code == 200
+    assert client.get("/admin/alerts?state=SNOOZED", headers=admin_headers).json()[0]["id"] == "managed-alert"
+    acknowledged = client.post("/admin/alerts/managed-alert/acknowledge", headers=admin_headers)
+    assert acknowledged.status_code == 200
+    assert client.get("/admin/alerts?state=ACKNOWLEDGED", headers=admin_headers).json()[0]["management_state"] == "ACKNOWLEDGED"
+    assert client.post("/admin/alerts/managed-alert/acknowledge",
+        headers={"Authorization": "Bearer test-reviewer-secret-token-for-unit-tests-0001"}).status_code == 403
+
+
+def test_admin_audit_export_includes_sync_mapping_connection_and_alert_records(
+    client, admin_headers, monkeypatch,
+):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import NotificationOutboxRecord
+
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        session.add(MasterDataSyncRunRecord(id="export-run", provider="quickbooks",
+            trigger_type="MANUAL", actor="cfo", status="SUCCEEDED", counts={"supplier": 1},
+            changes={"supplier": {"added": 1}}, details={"supplier": []},
+            started_at=now, finished_at=now, duration_ms=4))
+        session.add(AccountingMappingChangeRecord(id="export-map", provider="quickbooks",
+            category="supplier", source_label="ABC Supplies", previous_source_id=None,
+            previous_source_label=None, new_source_id="vendor-1", new_source_label="ABC Supplies",
+            change_type="ACCEPTED", actor="cfo"))
+        session.add(AccountingConnectionEventRecord(provider="quickbooks",
+            event_type="ACCOUNTING_CONNECTION_HEALTH_CHECKED", actor="worker",
+            details={"status": "HEALTHY"}, created_at=now))
+        session.add(NotificationOutboxRecord(id="export-alert", provider="quickbooks", match_id=None,
+            dedupe_key="export-alert", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+            payload={"message": "Failure"}, state="DELIVERED", attempt_count=1, created_at=now))
+        session.commit()
+    response = client.get(
+        f"/admin/accounting-connections/audit-export?start_date={now.date()}&end_date={now.date()}",
+        headers=admin_headers)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert 'attachment; filename="invoice-match-audit-' in response.headers["content-disposition"]
+    assert "SYNC_RUN" in response.text
+    assert "MAPPING_REVISION" in response.text
+    assert "CONNECTION_CHECK" in response.text
+    assert "ALERT" in response.text
+    denied = client.get(f"/admin/accounting-connections/audit-export?start_date={now.date()}&end_date={now.date()}",
+        headers={"Authorization": "Bearer test-reviewer-secret-token-for-unit-tests-0001"})
+    assert denied.status_code == 403
 
 
 def test_stale_provider_sync_queues_a_deduplicated_webhook_alert(monkeypatch):

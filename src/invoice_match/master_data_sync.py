@@ -54,6 +54,7 @@ def execute_master_data_sync(session: Session, *, provider: str, company_id: str
         started_at=started_at)
     schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
         MasterDataSyncScheduleRecord.provider == provider))
+    previous_sync_error = schedule.last_error if schedule is not None else None
     if schedule is None:
         schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=provider,
             enabled=False, interval_minutes=1440, stale_after_minutes=2880,
@@ -83,11 +84,35 @@ def execute_master_data_sync(session: Session, *, provider: str, company_id: str
         run.duration_ms = max(0, int((time.perf_counter() - started_clock) * 1000))
         run.finished_at = finished_at
         run.error = None
+        if previous_sync_error:
+            health = session.scalar(select(AccountingConnectionHealthRecord).where(
+                AccountingConnectionHealthRecord.provider == provider))
+            if health is not None:
+                health.status, health.failure_type, health.error = "HEALTHY", None, None
+                health.checked_at = finished_at
         if schedule is not None:
             schedule.last_success_at = finished_at
             schedule.last_error = None
             schedule.next_run_at = (finished_at + timedelta(minutes=schedule.interval_minutes)
                                     if schedule.enabled else None)
+        if previous_sync_error:
+            failed_run = session.scalar(select(MasterDataSyncRunRecord).where(
+                MasterDataSyncRunRecord.provider == provider,
+                MasterDataSyncRunRecord.status == "FAILED",
+            ).order_by(MasterDataSyncRunRecord.started_at.desc()).limit(1))
+            failed_run_id = failed_run.id if failed_run else "previous-failure"
+            recovery_key = f"MASTER_DATA_SYNC_RECOVERED:{provider}:{failed_run_id}"
+            recovered_payload = {"event_type": "MASTER_DATA_SYNC_RECOVERED", "provider": provider,
+                "message": "Provider master-data sync recovered after a previous failure.",
+                "previous_error": previous_sync_error, "failed_run_id": failed_run_id,
+                "recovery_run_id": run.id, "admin_url": _admin_url(provider),
+                "occurred_at": finished_at.isoformat()}
+            queue_system_notification(session, provider=provider, kind="MASTER_DATA_SYNC_RECOVERED",
+                dedupe_key=recovery_key, payload=recovered_payload)
+            session.add(AccountingConnectionEventRecord(provider=provider,
+                event_type="ACCOUNTING_MASTER_DATA_SYNC_RECOVERED", actor=actor,
+                details={"failed_run_id": failed_run_id, "recovery_run_id": run.id,
+                         "previous_error": previous_sync_error}))
         session.commit()
         return run
     except Exception as exc:

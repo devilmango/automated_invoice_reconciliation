@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import csv
+import io
 from datetime import date, datetime, time, timedelta, timezone
 from statistics import mean, median
 from decimal import Decimal, InvalidOperation
@@ -11,7 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -91,6 +93,7 @@ from .schemas import (
     BankReconciliationDecision,
     MappingSuggestionDecision,
     MasterDataSyncScheduleUpdate,
+    AlertSnoozeRequest,
 )
 from .accounting_connections import (check_payload_mappings, decrypt_configuration,
                                      encrypt_configuration, mapping_field, public_connection,
@@ -1003,6 +1006,182 @@ def list_notification_outbox(
     if state != "ALL":
         query = query.where(NotificationOutboxRecord.state == state)
     return session.scalars(query.order_by(NotificationOutboxRecord.created_at.asc()).limit(limit)).all()
+
+
+@app.get("/admin/alerts")
+def list_admin_alerts(
+    state: str = Query(default="ALL", pattern="^(ALL|OPEN|ACKNOWLEDGED|SNOOZED)$"),
+    limit: int = Query(default=200, ge=1, le=1000),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    now = datetime.now(timezone.utc)
+    alerts = session.scalars(select(NotificationOutboxRecord).where(
+        NotificationOutboxRecord.provider.is_not(None),
+        NotificationOutboxRecord.event_type.in_(
+            ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED")),
+    ).order_by(NotificationOutboxRecord.created_at.desc()).limit(limit)).all()
+    providers = {alert.provider for alert in alerts}
+    history_events = session.scalars(select(AccountingConnectionEventRecord).where(
+        AccountingConnectionEventRecord.provider.in_(providers or {"__none__"}),
+        AccountingConnectionEventRecord.event_type.in_(
+            ("ADMIN_ALERT_DELIVERED", "ADMIN_ALERT_DELIVERY_FAILED",
+             "ADMIN_ALERT_ACKNOWLEDGED", "ADMIN_ALERT_SNOOZED")),
+    ).order_by(AccountingConnectionEventRecord.created_at.asc())).all()
+    event_history: dict[str, list[dict]] = {}
+    for event in history_events:
+        notification_id = event.details.get("notification_id")
+        if notification_id:
+            event_history.setdefault(notification_id, []).append({
+                "event_type": event.event_type, "actor": event.actor,
+                "details": event.details, "created_at": _timestamp(event.created_at)})
+    results = []
+    for alert in alerts:
+        snoozed_until = _utc(alert.snoozed_until)
+        if alert.acknowledged_at:
+            status = "ACKNOWLEDGED"
+        elif snoozed_until and snoozed_until > now:
+            status = "SNOOZED"
+        else:
+            status = "OPEN"
+        if state != "ALL" and status != state:
+            continue
+        results.append({"id": alert.id, "provider": alert.provider,
+            "event_type": alert.event_type, "delivery_state": alert.state,
+            "management_state": status, "payload": alert.payload,
+            "attempt_count": alert.attempt_count, "next_attempt_at": _timestamp(alert.next_attempt_at),
+            "last_error": alert.last_error, "provider_reference": alert.provider_reference,
+            "created_at": _timestamp(alert.created_at), "delivered_at": _timestamp(alert.delivered_at),
+            "acknowledged_at": _timestamp(alert.acknowledged_at),
+            "acknowledged_by": alert.acknowledged_by,
+            "snoozed_until": _timestamp(alert.snoozed_until), "snoozed_by": alert.snoozed_by,
+            "history": event_history.get(alert.id, [])})
+    return results
+
+
+@app.post("/admin/alerts/{alert_id}/acknowledge")
+def acknowledge_admin_alert(
+    alert_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    alert = session.get(NotificationOutboxRecord, alert_id)
+    if alert is None or alert.provider is None:
+        raise HTTPException(status_code=404, detail="Provider alert not found")
+    if alert.acknowledged_at is not None:
+        return {"id": alert.id, "management_state": "ACKNOWLEDGED", "idempotent": True}
+    now = datetime.now(timezone.utc)
+    alert.acknowledged_at, alert.acknowledged_by = now, admin.name
+    alert.snoozed_until, alert.snoozed_by = None, None
+    session.add(AccountingConnectionEventRecord(provider=alert.provider,
+        event_type="ADMIN_ALERT_ACKNOWLEDGED", actor=admin.name,
+        details={"notification_id": alert.id, "event_type": alert.event_type,
+                 "delivery_state": alert.state}))
+    session.commit()
+    return {"id": alert.id, "management_state": "ACKNOWLEDGED", "idempotent": False}
+
+
+@app.post("/admin/alerts/{alert_id}/snooze")
+def snooze_admin_alert(
+    alert_id: str, body: AlertSnoozeRequest, session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    alert = session.get(NotificationOutboxRecord, alert_id)
+    if alert is None or alert.provider is None:
+        raise HTTPException(status_code=404, detail="Provider alert not found")
+    if alert.acknowledged_at is not None:
+        raise HTTPException(status_code=409, detail="An acknowledged alert cannot be snoozed")
+    snoozed_until = body.snoozed_until
+    if snoozed_until.tzinfo is None:
+        snoozed_until = snoozed_until.replace(tzinfo=timezone.utc)
+    alert.snoozed_until, alert.snoozed_by = snoozed_until, admin.name
+    session.add(AccountingConnectionEventRecord(provider=alert.provider,
+        event_type="ADMIN_ALERT_SNOOZED", actor=admin.name,
+        details={"notification_id": alert.id, "event_type": alert.event_type,
+                 "snoozed_until": _timestamp(snoozed_until)}))
+    session.commit()
+    return {"id": alert.id, "management_state": "SNOOZED",
+            "snoozed_until": _timestamp(snoozed_until)}
+
+
+@app.get("/admin/accounting-connections/audit-export")
+def export_accounting_audit(
+    start_date: date = Query(), end_date: date = Query(),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    """Download a date-bounded CSV of sync, mapping, connection, and alert audit data."""
+    if end_date < start_date or (end_date - start_date).days > 366:
+        raise HTTPException(status_code=422, detail="Choose an ordered date range no longer than 367 days")
+    start_at = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+    end_before = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    rows: list[dict] = []
+
+    def add(record_type: str, event_id: str, occurred_at: datetime | None, provider: str | None,
+            actor: str | None, event_type: str, status: str | None, details: dict | None) -> None:
+        rows.append({"company_id": session.info.get("company_id", "default"),
+            "record_type": record_type, "event_id": event_id,
+            "occurred_at": _timestamp(occurred_at), "provider": provider or "",
+            "actor": actor or "", "event_type": event_type, "status": status or "",
+            "details": json.dumps(details or {}, sort_keys=True, default=str, separators=(",", ":"))})
+
+    runs = session.scalars(select(MasterDataSyncRunRecord).where(
+        MasterDataSyncRunRecord.started_at >= start_at,
+        MasterDataSyncRunRecord.started_at < end_before).order_by(MasterDataSyncRunRecord.started_at)).all()
+    for run in runs:
+        add("SYNC_RUN", run.id, run.started_at, run.provider, run.actor, run.trigger_type,
+            run.status, {"finished_at": run.finished_at, "duration_ms": run.duration_ms,
+                         "counts": run.counts, "changes": run.changes, "details": run.details,
+                         "error": run.error})
+
+    mappings = session.scalars(select(AccountingMappingChangeRecord).where(
+        AccountingMappingChangeRecord.created_at >= start_at,
+        AccountingMappingChangeRecord.created_at < end_before
+    ).order_by(AccountingMappingChangeRecord.created_at)).all()
+    for change in mappings:
+        add("MAPPING_REVISION", change.id, change.created_at, change.provider, change.actor,
+            change.change_type, None, {"category": change.category, "source_label": change.source_label,
+                "previous_source_id": change.previous_source_id,
+                "previous_source_label": change.previous_source_label,
+                "new_source_id": change.new_source_id, "new_source_label": change.new_source_label,
+                "reverts_change_id": change.reverts_change_id})
+
+    connection_events = session.scalars(select(AccountingConnectionEventRecord).where(
+        AccountingConnectionEventRecord.created_at >= start_at,
+        AccountingConnectionEventRecord.created_at < end_before,
+    ).order_by(AccountingConnectionEventRecord.created_at)).all()
+    for event in connection_events:
+        if event.event_type in {"ACCOUNTING_CONNECTION_TESTED", "ACCOUNTING_CONNECTION_HEALTH_CHECKED",
+                                "ACCOUNTING_CONNECTION_HEALTH_CHECK_FAILED"}:
+            add("CONNECTION_CHECK", str(event.id), event.created_at, event.provider, event.actor,
+                event.event_type, event.details.get("status"), event.details)
+        elif event.event_type.startswith("ADMIN_ALERT_") or event.event_type == "ACCOUNTING_MASTER_DATA_SYNC_RECOVERED":
+            add("ALERT_EVENT", str(event.id), event.created_at, event.provider, event.actor,
+                event.event_type, None, event.details)
+
+    alerts = session.scalars(select(NotificationOutboxRecord).where(
+        NotificationOutboxRecord.provider.is_not(None),
+        NotificationOutboxRecord.created_at >= start_at,
+        NotificationOutboxRecord.created_at < end_before,
+    ).order_by(NotificationOutboxRecord.created_at)).all()
+    for alert in alerts:
+        add("ALERT", alert.id, alert.created_at, alert.provider, None, alert.event_type,
+            alert.state, {"payload": alert.payload, "attempt_count": alert.attempt_count,
+                "next_attempt_at": alert.next_attempt_at, "last_error": alert.last_error,
+                "provider_reference": alert.provider_reference, "delivered_at": alert.delivered_at,
+                "acknowledged_at": alert.acknowledged_at, "acknowledged_by": alert.acknowledged_by,
+                "snoozed_until": alert.snoozed_until, "snoozed_by": alert.snoozed_by})
+
+    rows.sort(key=lambda item: item["occurred_at"] or "")
+    output = io.StringIO(newline="")
+    fieldnames = ("company_id", "record_type", "event_id", "occurred_at", "provider", "actor",
+                  "event_type", "status", "details")
+    writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator="\r\n")
+    writer.writeheader()
+    for row in rows:
+        for key, value in row.items():
+            if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+                row[key] = "'" + value
+        writer.writerow(row)
+    filename = f"invoice-match-audit-{start_date.isoformat()}-to-{end_date.isoformat()}.csv"
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.post("/notifications/outbox/{notification_id}/retry", response_model=NotificationOutboxItem)

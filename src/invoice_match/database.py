@@ -243,6 +243,10 @@ class NotificationOutboxRecord(CompanyScoped, Base):
     provider_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    snoozed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class QuickBooksCredentialRecord(CompanyScoped, Base):

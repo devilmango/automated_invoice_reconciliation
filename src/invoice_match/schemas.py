@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
@@ -183,6 +183,24 @@ class NotificationOutboxItem(StrictModel):
     payload: dict
     created_at: datetime
     delivered_at: datetime | None
+    acknowledged_at: datetime | None = None
+    acknowledged_by: str | None = None
+    snoozed_until: datetime | None = None
+    snoozed_by: str | None = None
+
+
+class AlertSnoozeRequest(StrictModel):
+    snoozed_until: datetime
+
+    @model_validator(mode="after")
+    def validate_snooze_window(self):
+        now = datetime.now(timezone.utc)
+        value = self.snoozed_until
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if value <= now or value > now + timedelta(days=30):
+            raise ValueError("snoozed_until must be in the future and no more than 30 days away")
+        return self
 
 
 class ExceptionQueueItem(StrictModel):
