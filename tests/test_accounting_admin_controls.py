@@ -213,6 +213,86 @@ def test_sync_preview_shows_record_level_changes_without_applying_them(client, a
         assert session.query(AccountingMasterDataRecord).filter_by(source_id="vendor-new").count() == 0
 
 
+def test_risky_sync_requires_second_admin_and_applies_approved_snapshot(client, admin_headers,
+                                                                          second_admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match import api
+    from invoice_match.database import MasterDataSyncScheduleRecord
+
+    class Adapter:
+        name = "quickbooks"
+
+        def fetch_master_data(self):
+            return {"supplier": [{"source_id": "vendor-1", "name": "ABC Supplies", "active": True}]}
+
+    monkeypatch.setattr(api, "create_adapter", lambda provider, company_id: Adapter())
+    with SessionLocal() as session:
+        session.add(MasterDataSyncScheduleRecord(id="guard-schedule", provider="quickbooks",
+            enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+            max_deactivations=0, max_diff_records=100))
+        session.commit()
+
+    preview = client.post("/admin/accounting-connections/quickbooks/sync-preview", headers=admin_headers)
+    assert preview.status_code == 200
+    body = preview.json()
+    assert body["approval_required"] is True
+    assert body["risk"]["reasons"] == ["BULK_DEACTIVATION"]
+    approval_id = body["approval_id"]
+    assert client.post("/admin/accounting-connections/quickbooks/sync-masters", headers=admin_headers).status_code == 409
+    same_admin = client.post(
+        f"/admin/accounting-connections/quickbooks/sync-approvals/{approval_id}/approve",
+        headers=admin_headers,
+    )
+    assert same_admin.status_code == 403
+    approved = client.post(
+        f"/admin/accounting-connections/quickbooks/sync-approvals/{approval_id}/approve",
+        headers=second_admin_headers,
+    )
+    assert approved.status_code == 200 and approved.json()["status"] == "APPROVED"
+    applied = client.post(f"/admin/accounting-connections/quickbooks/sync-masters?approval_id={approval_id}",
+                          headers=admin_headers)
+    assert applied.status_code == 200
+    with SessionLocal() as session:
+        approval = session.get(api.MasterDataSyncApprovalRecord, approval_id)
+        assert approval.status == "APPLIED" and approval.run_id == applied.json()["run"]["id"]
+
+
+def test_risky_sync_rejects_provider_snapshot_changed_after_approval(client, admin_headers,
+                                                                      second_admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match import api
+    from invoice_match.database import MasterDataSyncScheduleRecord
+    from invoice_match.database import MasterDataSyncApprovalRecord
+
+    class Adapter:
+        name = "quickbooks"
+        changed = False
+
+        def fetch_master_data(self):
+            suffix = " changed" if self.changed else ""
+            return {"supplier": [{"source_id": "vendor-1", "name": "ABC Supplies" + suffix, "active": True}]}
+
+    adapter = Adapter()
+    monkeypatch.setattr(api, "create_adapter", lambda provider, company_id: adapter)
+    with SessionLocal() as session:
+        session.add(MasterDataSyncScheduleRecord(id="stale-guard-schedule", provider="quickbooks",
+            enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+            max_deactivations=0, max_diff_records=100))
+        session.commit()
+    preview = client.post("/admin/accounting-connections/quickbooks/sync-preview", headers=admin_headers).json()
+    approval_id = preview["approval_id"]
+    assert client.post(
+        f"/admin/accounting-connections/quickbooks/sync-approvals/{approval_id}/approve",
+        headers=second_admin_headers,
+    ).status_code == 200
+    adapter.changed = True
+    response = client.post(f"/admin/accounting-connections/quickbooks/sync-masters?approval_id={approval_id}",
+                           headers=admin_headers)
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "SYNC_PREVIEW_STALE"
+    with SessionLocal() as session:
+        assert session.get(MasterDataSyncApprovalRecord, approval_id).status == "STALE"
+
+
 def test_mapping_validation_rejects_unknown_inactive_and_duplicate_targets(client, admin_headers, monkeypatch):
     seed_admin_data(monkeypatch)
     invalid = client.put("/admin/accounting-connections/quickbooks/mappings/supplier",
@@ -302,6 +382,39 @@ def test_successful_sync_queues_recovery_notice_after_prior_failure(client, admi
     recovery = next(item for item in alerts.json() if item["event_type"] == "MASTER_DATA_SYNC_RECOVERED")
     assert recovery["payload"]["recovery_run_id"] == recovered.json()["run"]["id"]
     assert recovery["payload"]["failed_run_id"]
+    assert recovery["resolves_alert_id"]
+    resolved = next(item for item in alerts.json() if item["id"] == recovery["resolves_alert_id"])
+    assert resolved["management_state"] == "RESOLVED"
+    assert resolved["resolved_by_alert_id"] == recovery["id"]
+
+
+def test_escalation_waits_for_snooze_expiry_and_is_idempotent(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import MasterDataSyncScheduleRecord, NotificationOutboxRecord
+    from invoice_match.master_data_sync import escalate_unacknowledged_master_data_alerts
+
+    with SessionLocal() as session:
+        session.add(MasterDataSyncScheduleRecord(id="escalation-schedule", provider="quickbooks",
+            enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+            alert_escalation_enabled=True, alert_escalation_minutes=5))
+        session.add(NotificationOutboxRecord(id="old-alert", provider="quickbooks", match_id=None,
+            dedupe_key="old-alert-once", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+            payload={"message": "Provider sync failed"}, state="DELIVERED", attempt_count=1,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            snoozed_until=datetime.now(timezone.utc) + timedelta(hours=1), snoozed_by="cfo"))
+        session.commit()
+        assert escalate_unacknowledged_master_data_alerts(session) == 0
+        alert = session.get(NotificationOutboxRecord, "old-alert")
+        alert.snoozed_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.commit()
+        assert escalate_unacknowledged_master_data_alerts(session) == 1
+        session.commit()
+        assert escalate_unacknowledged_master_data_alerts(session) == 0
+    listing = client.get("/admin/alerts?state=ALL", headers=admin_headers).json()
+    original = next(item for item in listing if item["id"] == "old-alert")
+    escalation = next(item for item in listing if item["event_type"] == "MASTER_DATA_SYNC_ESCALATED")
+    assert original["escalated_at"]
+    assert escalation["payload"]["source_alert_id"] == "old-alert"
 
 
 def test_admin_can_acknowledge_and_snooze_provider_alerts(client, admin_headers, monkeypatch):

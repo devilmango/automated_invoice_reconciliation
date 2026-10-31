@@ -14,6 +14,7 @@ from .database import (
     AccountingConnectionRecord,
     MasterDataSyncRunRecord,
     MasterDataSyncScheduleRecord,
+    NotificationOutboxRecord,
 )
 from .notification_delivery import queue_system_notification
 
@@ -33,13 +34,15 @@ def provider_failure_type(exc: Exception) -> str:
 
 
 def queue_master_data_alert(session: Session, *, provider: str, kind: str,
-                            message: str, anchor: str) -> None:
+                            message: str, anchor: str, details: dict | None = None):
     today = datetime.now(timezone.utc).date().isoformat()
-    queue_system_notification(
+    payload = {"event_type": kind, "provider": provider, "message": message,
+               "admin_url": _admin_url(provider), "occurred_at": datetime.now(timezone.utc).isoformat()}
+    payload.update(details or {})
+    return queue_system_notification(
         session, provider=provider, kind=kind,
         dedupe_key=f"{kind}:{provider}:{anchor}:{today}",
-        payload={"event_type": kind, "provider": provider, "message": message,
-                 "admin_url": _admin_url(provider), "occurred_at": datetime.now(timezone.utc).isoformat()},
+        payload=payload,
     )
 
 
@@ -107,8 +110,25 @@ def execute_master_data_sync(session: Session, *, provider: str, company_id: str
                 "previous_error": previous_sync_error, "failed_run_id": failed_run_id,
                 "recovery_run_id": run.id, "admin_url": _admin_url(provider),
                 "occurred_at": finished_at.isoformat()}
-            queue_system_notification(session, provider=provider, kind="MASTER_DATA_SYNC_RECOVERED",
+            recovery_alert = queue_system_notification(session, provider=provider, kind="MASTER_DATA_SYNC_RECOVERED",
                 dedupe_key=recovery_key, payload=recovered_payload)
+            failed_alerts = session.scalars(select(NotificationOutboxRecord).where(
+                NotificationOutboxRecord.provider == provider,
+                NotificationOutboxRecord.event_type == "MASTER_DATA_SYNC_FAILED",
+                NotificationOutboxRecord.resolved_at.is_(None),
+            ).order_by(NotificationOutboxRecord.created_at.desc())).all()
+            failed_alert = next((alert for alert in failed_alerts
+                if alert.payload.get("failed_run_id") == failed_run_id), None)
+            if failed_alert is None:
+                failed_alert = next(iter(failed_alerts), None)
+            if failed_alert is not None:
+                failed_alert.resolved_at = finished_at
+                failed_alert.resolved_by_alert_id = recovery_alert.id if recovery_alert else None
+                if recovery_alert is not None:
+                    recovery_alert.resolves_alert_id = failed_alert.id
+                recovered_payload["resolved_alert_id"] = failed_alert.id
+                if recovery_alert is not None:
+                    recovery_alert.payload = recovered_payload
             session.add(AccountingConnectionEventRecord(provider=provider,
                 event_type="ACCOUNTING_MASTER_DATA_SYNC_RECOVERED", actor=actor,
                 details={"failed_run_id": failed_run_id, "recovery_run_id": run.id,
@@ -138,7 +158,7 @@ def execute_master_data_sync(session: Session, *, provider: str, company_id: str
             event_type="ACCOUNTING_MASTER_DATA_SYNC_FAILED", actor=actor,
             details={"sync_run_id": run.id, "error": run.error}))
         queue_master_data_alert(session, provider=provider, kind="MASTER_DATA_SYNC_FAILED",
-            message=run.error, anchor="daily")
+            message=run.error, anchor=run.id, details={"failed_run_id": run.id})
         session.commit()
         raise
 
@@ -160,7 +180,9 @@ def sync_due_master_data(session: Session, *, company_id: str, adapter_factory, 
             summary["synced"] += 1
         except Exception:
             summary["failed"] += 1
-    if queue_stale_master_data_alerts(session):
+    queued = queue_stale_master_data_alerts(session)
+    escalated = escalate_unacknowledged_master_data_alerts(session)
+    if queued or escalated:
         session.commit()
     return summary
 
@@ -258,3 +280,48 @@ def queue_stale_master_data_alerts(session: Session, *, admin_url: str | None = 
         if notification is not None:
             queued += 1
     return queued
+
+
+def escalate_unacknowledged_master_data_alerts(session: Session) -> int:
+    """Queue a single escalation notice after an alert's configured response window."""
+    now = datetime.now(timezone.utc)
+    schedules = {row.provider: row for row in session.scalars(
+        select(MasterDataSyncScheduleRecord)).all()}
+    alerts = session.scalars(select(NotificationOutboxRecord).where(
+        NotificationOutboxRecord.provider.is_not(None),
+        NotificationOutboxRecord.event_type.in_(
+            ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED")),
+        NotificationOutboxRecord.acknowledged_at.is_(None),
+        NotificationOutboxRecord.resolved_at.is_(None),
+        NotificationOutboxRecord.escalated_at.is_(None),
+    )).all()
+    count = 0
+    for alert in alerts:
+        schedule = schedules.get(alert.provider)
+        if schedule is None or not schedule.alert_escalation_enabled:
+            continue
+        created_at = alert.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        snoozed_until = alert.snoozed_until
+        if snoozed_until is not None:
+            if snoozed_until.tzinfo is None:
+                snoozed_until = snoozed_until.replace(tzinfo=timezone.utc)
+            if snoozed_until > now:
+                continue
+        if now - created_at < timedelta(minutes=schedule.alert_escalation_minutes):
+            continue
+        notification = queue_system_notification(session, provider=alert.provider,
+            kind="MASTER_DATA_SYNC_ESCALATED",
+            dedupe_key=f"MASTER_DATA_SYNC_ESCALATED:{alert.id}",
+            payload={"event_type": "MASTER_DATA_SYNC_ESCALATED", "provider": alert.provider,
+                "message": "A provider alert remains unacknowledged beyond its escalation window.",
+                "source_alert_id": alert.id, "source_event_type": alert.event_type,
+                "admin_url": _admin_url(alert.provider), "occurred_at": now.isoformat()})
+        alert.escalated_at = now
+        session.add(AccountingConnectionEventRecord(provider=alert.provider,
+            event_type="ADMIN_ALERT_ESCALATED", actor="system",
+            details={"notification_id": alert.id, "escalation_notification_id": notification.id if notification else None,
+                     "event_type": alert.event_type, "escalated_at": now.isoformat()}))
+        count += 1
+    return count

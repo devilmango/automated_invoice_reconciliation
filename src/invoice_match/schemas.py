@@ -376,6 +376,10 @@ class MasterDataSyncScheduleUpdate(StrictModel):
     stale_after_minutes: int = Field(ge=5, le=525600)
     connection_check_enabled: bool = True
     connection_check_interval_minutes: int = Field(default=60, ge=5, le=525600)
+    max_deactivations: int = Field(default=10, ge=0, le=1000000)
+    max_diff_records: int = Field(default=100, ge=0, le=1000000)
+    alert_escalation_enabled: bool = True
+    alert_escalation_minutes: int = Field(default=1440, ge=5, le=525600)
 
 
 class PaymentAdviceAllocation(StrictModel):

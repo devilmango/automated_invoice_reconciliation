@@ -247,6 +247,10 @@ class NotificationOutboxRecord(CompanyScoped, Base):
     acknowledged_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     snoozed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_alert_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    resolves_alert_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class QuickBooksCredentialRecord(CompanyScoped, Base):
@@ -410,6 +414,28 @@ class MasterDataSyncScheduleRecord(CompanyScoped, Base):
     connection_check_interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
     next_connection_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_connection_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    max_deactivations: Mapped[int] = mapped_column(Integer, default=10, server_default="10")
+    max_diff_records: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
+    alert_escalation_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    alert_escalation_minutes: Mapped[int] = mapped_column(Integer, default=1440, server_default="1440")
+
+
+class MasterDataSyncApprovalRecord(CompanyScoped, Base):
+    __tablename__ = "master_data_sync_approvals"
+    __table_args__ = (Index("ix_master_sync_approval_provider_status", "company_id", "provider", "status"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(24), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    risk_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    requested_by: Mapped[str] = mapped_column(String(255))
+    approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
 class MasterDataSyncRunRecord(CompanyScoped, Base):

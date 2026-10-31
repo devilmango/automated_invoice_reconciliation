@@ -46,6 +46,7 @@ from .database import (
     MappingSuggestionDecisionRecord,
     MasterDataSyncScheduleRecord,
     MasterDataSyncRunRecord,
+    MasterDataSyncApprovalRecord,
     CreditNoteApplicationRecord,
     CreditApplicationOutboxRecord,
     BankStatementBatchRecord,
@@ -55,7 +56,8 @@ from .document_capture import extract_document
 from .integration_auth import require_integration
 from .matcher import match_documents
 from .notification_delivery import escalate_overdue, queue_notification
-from .master_data_sync import execute_master_data_sync, provider_failure_type
+from .master_data_sync import (execute_master_data_sync, provider_failure_type,
+                               escalate_unacknowledged_master_data_alerts)
 from .delivery import deliver_match
 from .procurement_sync import sync_procurement
 from .vendor_profiles import canonical_vendor, load_vendor_profiles, normalize_name, vendor_aliases
@@ -1010,7 +1012,7 @@ def list_notification_outbox(
 
 @app.get("/admin/alerts")
 def list_admin_alerts(
-    state: str = Query(default="ALL", pattern="^(ALL|OPEN|ACKNOWLEDGED|SNOOZED)$"),
+    state: str = Query(default="ALL", pattern="^(ALL|OPEN|ACKNOWLEDGED|SNOOZED|RESOLVED)$"),
     limit: int = Query(default=200, ge=1, le=1000),
     session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
 ):
@@ -1018,14 +1020,15 @@ def list_admin_alerts(
     alerts = session.scalars(select(NotificationOutboxRecord).where(
         NotificationOutboxRecord.provider.is_not(None),
         NotificationOutboxRecord.event_type.in_(
-            ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED")),
+            ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED",
+             "MASTER_DATA_SYNC_ESCALATED")),
     ).order_by(NotificationOutboxRecord.created_at.desc()).limit(limit)).all()
     providers = {alert.provider for alert in alerts}
     history_events = session.scalars(select(AccountingConnectionEventRecord).where(
         AccountingConnectionEventRecord.provider.in_(providers or {"__none__"}),
         AccountingConnectionEventRecord.event_type.in_(
             ("ADMIN_ALERT_DELIVERED", "ADMIN_ALERT_DELIVERY_FAILED",
-             "ADMIN_ALERT_ACKNOWLEDGED", "ADMIN_ALERT_SNOOZED")),
+             "ADMIN_ALERT_ACKNOWLEDGED", "ADMIN_ALERT_SNOOZED", "ADMIN_ALERT_ESCALATED")),
     ).order_by(AccountingConnectionEventRecord.created_at.asc())).all()
     event_history: dict[str, list[dict]] = {}
     for event in history_events:
@@ -1037,7 +1040,9 @@ def list_admin_alerts(
     results = []
     for alert in alerts:
         snoozed_until = _utc(alert.snoozed_until)
-        if alert.acknowledged_at:
+        if alert.resolved_at:
+            status = "RESOLVED"
+        elif alert.acknowledged_at:
             status = "ACKNOWLEDGED"
         elif snoozed_until and snoozed_until > now:
             status = "SNOOZED"
@@ -1054,6 +1059,10 @@ def list_admin_alerts(
             "acknowledged_at": _timestamp(alert.acknowledged_at),
             "acknowledged_by": alert.acknowledged_by,
             "snoozed_until": _timestamp(alert.snoozed_until), "snoozed_by": alert.snoozed_by,
+            "resolved_at": _timestamp(alert.resolved_at),
+            "resolved_by_alert_id": alert.resolved_by_alert_id,
+            "resolves_alert_id": alert.resolves_alert_id,
+            "escalated_at": _timestamp(alert.escalated_at),
             "history": event_history.get(alert.id, [])})
     return results
 
@@ -1151,8 +1160,13 @@ def export_accounting_audit(
                                 "ACCOUNTING_CONNECTION_HEALTH_CHECK_FAILED"}:
             add("CONNECTION_CHECK", str(event.id), event.created_at, event.provider, event.actor,
                 event.event_type, event.details.get("status"), event.details)
-        elif event.event_type.startswith("ADMIN_ALERT_") or event.event_type == "ACCOUNTING_MASTER_DATA_SYNC_RECOVERED":
+        elif (event.event_type.startswith("ADMIN_ALERT_") or
+              event.event_type.startswith("ACCOUNTING_MASTER_DATA_SYNC_RECOVER")):
             add("ALERT_EVENT", str(event.id), event.created_at, event.provider, event.actor,
+                event.event_type, None, event.details)
+        elif event.event_type in {"ACCOUNTING_MASTER_DATA_SYNC_APPROVAL_REQUESTED",
+                                  "ACCOUNTING_MASTER_DATA_SYNC_APPROVED"}:
+            add("SYNC_APPROVAL_EVENT", str(event.id), event.created_at, event.provider, event.actor,
                 event.event_type, None, event.details)
 
     alerts = session.scalars(select(NotificationOutboxRecord).where(
@@ -1166,7 +1180,9 @@ def export_accounting_audit(
                 "next_attempt_at": alert.next_attempt_at, "last_error": alert.last_error,
                 "provider_reference": alert.provider_reference, "delivered_at": alert.delivered_at,
                 "acknowledged_at": alert.acknowledged_at, "acknowledged_by": alert.acknowledged_by,
-                "snoozed_until": alert.snoozed_until, "snoozed_by": alert.snoozed_by})
+                "snoozed_until": alert.snoozed_until, "snoozed_by": alert.snoozed_by,
+                "resolved_at": alert.resolved_at, "resolved_by_alert_id": alert.resolved_by_alert_id,
+                "resolves_alert_id": alert.resolves_alert_id, "escalated_at": alert.escalated_at})
 
     rows.sort(key=lambda item: item["occurred_at"] or "")
     output = io.StringIO(newline="")
@@ -1597,7 +1613,8 @@ def accounting_connection_events(
 
 @app.post("/admin/accounting-connections/{provider}/sync-masters")
 def sync_accounting_masters(
-    provider: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+    provider: str, approval_id: str | None = Query(default=None),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
 ):
     provider = provider.casefold()
     connection = session.scalar(select(AccountingConnectionRecord).where(
@@ -1606,10 +1623,57 @@ def sync_accounting_masters(
     if connection is None:
         raise HTTPException(status_code=404, detail="Enabled accounting connection not found")
     try:
+        adapter = create_adapter(provider, company_id=session.info.get("company_id", "default"))
+        if adapter.name != provider or not callable(getattr(adapter, "fetch_master_data", None)):
+            raise ValueError(f"The {provider} adapter does not support master-data sync")
+        try:
+            references = adapter.fetch_master_data()
+        except Exception:
+            # Run the normal durable failure path so failed previews still
+            # produce sync history, connection health, and a retryable alert.
+            run = execute_master_data_sync(session, provider=provider,
+                company_id=session.info.get("company_id", "default"),
+                adapter_factory=lambda name, company: create_adapter(name, company_id=company),
+                apply_sync=_apply_master_data_sync, actor=admin.name, trigger_type="MANUAL")
+            return {"provider": provider, "synced_at": _timestamp(run.finished_at),
+                    "counts": run.counts, "changes": run.changes, "details": run.details,
+                    "run": master_data_sync_run_result(run)}
+        counts, changes, details = _master_data_diff(session, provider, references)
+        risk = _sync_risk_summary(session, provider, changes)
+        approval = session.get(MasterDataSyncApprovalRecord, approval_id) if approval_id else None
+        if risk["approval_required"]:
+            if approval is None or approval.provider != provider or approval.status != "APPROVED":
+                raise HTTPException(status_code=409,
+                    detail={"code": "SYNC_APPROVAL_REQUIRED", "message": "This sync exceeds the configured risk limits and requires a second admin approval.", "risk": risk})
+            expires_at = approval.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
+                approval.status = "EXPIRED"
+                session.commit()
+                raise HTTPException(status_code=409, detail="Sync approval expired; create a fresh preview")
+            fingerprint = _sync_fingerprint(session, provider, references)
+            if approval.fingerprint != fingerprint:
+                approval.status = "STALE"
+                session.commit()
+                raise HTTPException(status_code=409, detail={"code": "SYNC_PREVIEW_STALE", "message": "Provider or local master data changed after approval. Preview and approve the updated diff."})
+        elif approval_id:
+            raise HTTPException(status_code=409, detail="The current sync no longer exceeds approval limits; run it without an approval ID")
+
+        class PreparedAdapter:
+            name = provider
+            def fetch_master_data(self):
+                return references
+
         run = execute_master_data_sync(session, provider=provider,
             company_id=session.info.get("company_id", "default"),
-            adapter_factory=lambda name, company: create_adapter(name, company_id=company),
+            adapter_factory=lambda name, company: PreparedAdapter(),
             apply_sync=_apply_master_data_sync, actor=admin.name, trigger_type="MANUAL")
+        if approval is not None:
+            approval.status, approval.applied_at, approval.run_id = "APPLIED", datetime.now(timezone.utc), run.id
+            session.commit()
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Accounting master-data sync failed: {exc}") from exc
     return {"provider": provider, "synced_at": _timestamp(run.finished_at),
@@ -1635,8 +1699,88 @@ def preview_accounting_master_sync(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Accounting master-data preview failed: {exc}") from exc
     counts, changes, details = _master_data_diff(session, provider, references)
+    risk = _sync_risk_summary(session, provider, changes)
+    approval_id = None
+    if risk["approval_required"]:
+        now = datetime.now(timezone.utc)
+        approval_id = str(uuid4())
+        approval = MasterDataSyncApprovalRecord(id=approval_id, provider=provider,
+            status="PENDING", fingerprint=_sync_fingerprint(session, provider, references),
+            risk_summary=risk, requested_by=admin.name, created_at=now,
+            expires_at=now + timedelta(minutes=30))
+        session.add(approval)
+        session.add(AccountingConnectionEventRecord(provider=provider,
+            event_type="ACCOUNTING_MASTER_DATA_SYNC_APPROVAL_REQUESTED", actor=admin.name,
+            details={"approval_id": approval_id, "risk": risk}))
+        session.commit()
     return {"provider": provider, "previewed_at": _timestamp(datetime.now(timezone.utc)),
-            "applies_changes": False, "counts": counts, "changes": changes, "details": details}
+            "applies_changes": False, "counts": counts, "changes": changes, "details": details,
+            "risk": risk, "approval_required": risk["approval_required"], "approval_id": approval_id}
+
+
+@app.post("/admin/accounting-connections/{provider}/sync-approvals/{approval_id}/approve")
+def approve_accounting_master_sync(
+    provider: str, approval_id: str, session: Session = Depends(get_session),
+    admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    approval = session.get(MasterDataSyncApprovalRecord, approval_id)
+    if approval is None or approval.provider != provider:
+        raise HTTPException(status_code=404, detail="Sync approval request not found")
+    now = datetime.now(timezone.utc)
+    expires_at = approval.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if approval.status != "PENDING" or expires_at <= now:
+        if approval.status == "PENDING":
+            approval.status = "EXPIRED"
+            session.commit()
+        raise HTTPException(status_code=409, detail="Sync approval request is no longer pending")
+    if approval.requested_by == admin.name:
+        raise HTTPException(status_code=403, detail="A second, different admin must approve this sync")
+    approval.status, approval.approved_by, approval.approved_at = "APPROVED", admin.name, now
+    session.add(AccountingConnectionEventRecord(provider=provider,
+        event_type="ACCOUNTING_MASTER_DATA_SYNC_APPROVED", actor=admin.name,
+        details={"approval_id": approval.id, "requested_by": approval.requested_by,
+                 "risk": approval.risk_summary}))
+    session.commit()
+    return {"approval_id": approval.id, "status": approval.status,
+            "requested_by": approval.requested_by, "approved_by": approval.approved_by,
+            "expires_at": _timestamp(approval.expires_at)}
+
+
+def _sync_risk_summary(session: Session, provider: str, changes: dict) -> dict:
+    schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.provider == provider))
+    max_deactivations = schedule.max_deactivations if schedule else 10
+    max_diff_records = schedule.max_diff_records if schedule else 100
+    totals = {key: sum(category.get(key, 0) for category in changes.values())
+              for key in ("added", "changed", "deactivated")}
+    diff_records = sum(totals.values())
+    reasons = []
+    if totals["deactivated"] > max_deactivations:
+        reasons.append("BULK_DEACTIVATION")
+    if diff_records > max_diff_records:
+        reasons.append("LARGE_DIFF")
+    return {"approval_required": bool(reasons), "reasons": reasons,
+            "totals": {**totals, "diff_records": diff_records},
+            "limits": {"max_deactivations": max_deactivations,
+                       "max_diff_records": max_diff_records}}
+
+
+def _sync_fingerprint(session: Session, provider: str, references: dict) -> str:
+    local = session.scalars(select(AccountingMasterDataRecord).where(
+        AccountingMasterDataRecord.provider == provider).order_by(
+            AccountingMasterDataRecord.category, AccountingMasterDataRecord.source_id)).all()
+    canonical_references = {category: (sorted(items, key=lambda item: str(item.get("source_id", "")))
+                           if isinstance(items, list) else items)
+                           for category, items in references.items()}
+    snapshot = {"provider": provider, "references": canonical_references,
+        "local": [{"category": row.category, "source_id": row.source_id, "name": row.name,
+            "code": row.code, "active": row.active, "source_data": row.source_data}
+            for row in local]}
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _apply_master_data_sync(session: Session, provider: str, adapter, actor: str) -> tuple[dict, dict]:
@@ -1995,6 +2139,10 @@ def accounting_master_sync_status(
             "stale_after_minutes": schedule.stale_after_minutes,
             "connection_check_enabled": schedule.connection_check_enabled,
             "connection_check_interval_minutes": schedule.connection_check_interval_minutes,
+            "max_deactivations": schedule.max_deactivations,
+            "max_diff_records": schedule.max_diff_records,
+            "alert_escalation_enabled": schedule.alert_escalation_enabled,
+            "alert_escalation_minutes": schedule.alert_escalation_minutes,
             "last_connection_check_at": _timestamp(schedule.last_connection_check_at),
             "next_connection_check_at": _timestamp(schedule.next_connection_check_at),
             "sync_status": _master_sync_status(schedule, now),
@@ -2032,6 +2180,10 @@ def update_accounting_master_sync_schedule(
     schedule.next_run_at = datetime.now(timezone.utc) if body.enabled else None
     schedule.connection_check_enabled = body.connection_check_enabled
     schedule.connection_check_interval_minutes = body.connection_check_interval_minutes
+    schedule.max_deactivations = body.max_deactivations
+    schedule.max_diff_records = body.max_diff_records
+    schedule.alert_escalation_enabled = body.alert_escalation_enabled
+    schedule.alert_escalation_minutes = body.alert_escalation_minutes
     schedule.next_connection_check_at = (datetime.now(timezone.utc)
         if body.connection_check_enabled else None)
     session.add(AccountingConnectionEventRecord(provider=provider,
@@ -2039,13 +2191,21 @@ def update_accounting_master_sync_schedule(
         details={"enabled": body.enabled, "interval_minutes": body.interval_minutes,
                  "stale_after_minutes": body.stale_after_minutes,
                  "connection_check_enabled": body.connection_check_enabled,
-                 "connection_check_interval_minutes": body.connection_check_interval_minutes}))
+                 "connection_check_interval_minutes": body.connection_check_interval_minutes,
+                 "max_deactivations": body.max_deactivations,
+                 "max_diff_records": body.max_diff_records,
+                 "alert_escalation_enabled": body.alert_escalation_enabled,
+                 "alert_escalation_minutes": body.alert_escalation_minutes}))
     session.commit()
     return {"provider": provider, "enabled": schedule.enabled,
             "interval_minutes": schedule.interval_minutes,
             "stale_after_minutes": schedule.stale_after_minutes,
             "connection_check_enabled": schedule.connection_check_enabled,
             "connection_check_interval_minutes": schedule.connection_check_interval_minutes,
+            "max_deactivations": schedule.max_deactivations,
+            "max_diff_records": schedule.max_diff_records,
+            "alert_escalation_enabled": schedule.alert_escalation_enabled,
+            "alert_escalation_minutes": schedule.alert_escalation_minutes,
             "next_run_at": _timestamp(schedule.next_run_at)}
 
 
