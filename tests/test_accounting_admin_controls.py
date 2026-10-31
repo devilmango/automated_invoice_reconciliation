@@ -475,6 +475,91 @@ def test_admin_audit_export_includes_sync_mapping_connection_and_alert_records(
     assert denied.status_code == 403
 
 
+def test_audit_export_filters_manifest_checksum_and_saved_download(client, admin_headers, monkeypatch):
+    import csv
+    import hashlib
+    import io
+    import json
+
+    seed_admin_data(monkeypatch)
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        session.add(MasterDataSyncRunRecord(id="filtered-export-run", provider="quickbooks",
+            trigger_type="MANUAL", actor="cfo", status="SUCCEEDED", counts={}, changes={},
+            details={}, started_at=now, finished_at=now))
+        session.add(MasterDataSyncRunRecord(id="other-export-run", provider="xero",
+            trigger_type="MANUAL", actor="controller", status="FAILED", counts={}, changes={},
+            details={}, error="timeout", started_at=now, finished_at=now))
+        session.commit()
+
+    response = client.get(
+        f"/admin/accounting-connections/audit-export?start_date={now.date()}&end_date={now.date()}"
+        "&provider=quickbooks&event_type=MANUAL&actor=cfo", headers=admin_headers)
+    assert response.status_code == 200
+    export_id = response.headers["x-audit-export-id"]
+    checksum = response.headers["x-audit-export-sha256"]
+    records = list(csv.DictReader(io.StringIO(response.content.decode("utf-8"))))
+    assert len(records) == 2
+    assert records[0]["event_id"] == "filtered-export-run"
+    assert records[-1]["record_type"] == "EXPORT_MANIFEST"
+    manifest = json.loads(records[-1]["details"])
+    assert manifest["generated_by"] == "cfo"
+    assert manifest["date_range"] == {"start_date": now.date().isoformat(), "end_date": now.date().isoformat()}
+    assert manifest["filters"] == {"provider": "quickbooks", "event_type": "manual", "actor": "cfo"}
+    assert hashlib.sha256(response.content[:manifest["data_bytes"]]).hexdigest() == checksum
+    assert manifest["checksum_sha256"] == checksum and manifest["row_count"] == 1
+
+    history = client.get("/admin/accounting-connections/audit-exports", headers=admin_headers).json()
+    saved = next(item for item in history if item["id"] == export_id)
+    assert saved["generated_by"] == "cfo" and saved["row_count"] == 1
+    assert saved["checksum_sha256"] == checksum
+    assert client.get(saved["manifest_url"], headers=admin_headers).json() == manifest
+    downloaded = client.get(saved["download_url"], headers=admin_headers)
+    assert downloaded.content == response.content
+    assert downloaded.headers["x-audit-export-sha256"] == checksum
+
+
+def test_accounting_trends_summarize_sync_failure_alert_response_and_mapping_activity(
+    client, admin_headers, monkeypatch,
+):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import AccountingMappingChangeRecord
+
+    now = datetime.now(timezone.utc)
+    alert_created = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=1)
+    with SessionLocal() as session:
+        for run_id, status, error in (("trend-ok", "SUCCEEDED", None),
+                                      ("trend-fail-1", "FAILED", "provider timeout"),
+                                      ("trend-fail-2", "FAILED", "provider timeout")):
+            session.add(MasterDataSyncRunRecord(id=run_id, provider="quickbooks",
+                trigger_type="MANUAL", actor="cfo", status=status, counts={}, changes={}, details={},
+                error=error, started_at=now, finished_at=now))
+        session.add(NotificationOutboxRecord(id="trend-alert", provider="quickbooks", match_id=None,
+            dedupe_key="trend-alert-once", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+            payload={"message": "Failure"}, state="DELIVERED", attempt_count=1,
+            created_at=alert_created, acknowledged_at=alert_created + timedelta(minutes=30),
+            resolved_at=alert_created + timedelta(minutes=50)))
+        session.add(AccountingMappingChangeRecord(id="trend-map", provider="quickbooks",
+            category="supplier", source_label="ABC Supplies", previous_source_id=None,
+            previous_source_label=None, new_source_id="vendor-1", new_source_label="ABC Supplies",
+            change_type="ACCEPTED", actor="cfo", created_at=now))
+        session.commit()
+
+    response = client.get(
+        f"/admin/accounting-connections/trends?start_date={now.date()}&end_date={now.date()}"
+        "&provider=quickbooks&bucket=week", headers=admin_headers)
+    assert response.status_code == 200
+    trends = response.json()
+    assert trends["sync_series"][0]["total"] == 3
+    assert trends["sync_series"][0]["success_rate_percent"] == 33.33
+    assert trends["recurring_failures"][0]["count"] == 2
+    assert trends["recurring_failures"][0]["error"] == "provider timeout"
+    assert trends["alert_response_series"][0]["avg_ack_minutes"] == 30
+    assert trends["alert_response_series"][0]["avg_resolution_minutes"] == 50
+    assert trends["mapping_series"][0]["count"] == 1
+    assert trends["mapping_series"][0]["by_category"] == {"supplier": 1}
+
+
 def test_stale_provider_sync_queues_a_deduplicated_webhook_alert(monkeypatch):
     seed_admin_data(monkeypatch)
     from invoice_match.database import MasterDataSyncScheduleRecord

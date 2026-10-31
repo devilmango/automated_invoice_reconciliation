@@ -438,6 +438,24 @@ class MasterDataSyncApprovalRecord(CompanyScoped, Base):
     run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
+class AuditExportRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_audit_exports"
+    __table_args__ = (Index("ix_audit_exports_company_created", "company_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    generated_by: Mapped[str] = mapped_column(String(255))
+    start_date: Mapped[str] = mapped_column(String(10))
+    end_date: Mapped[str] = mapped_column(String(10))
+    provider_filter: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    event_type_filter: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    actor_filter: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    checksum_sha256: Mapped[str] = mapped_column(String(64))
+    row_count: Mapped[int] = mapped_column(Integer)
+    manifest: Mapped[dict] = mapped_column(JSON)
+    file_content: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class MasterDataSyncRunRecord(CompanyScoped, Base):
     __tablename__ = "master_data_sync_runs"
     __table_args__ = (Index("ix_master_data_sync_runs_provider_started", "company_id", "provider", "started_at"),)

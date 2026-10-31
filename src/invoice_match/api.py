@@ -47,6 +47,7 @@ from .database import (
     MasterDataSyncScheduleRecord,
     MasterDataSyncRunRecord,
     MasterDataSyncApprovalRecord,
+    AuditExportRecord,
     CreditNoteApplicationRecord,
     CreditApplicationOutboxRecord,
     BankStatementBatchRecord,
@@ -1113,9 +1114,12 @@ def snooze_admin_alert(
 @app.get("/admin/accounting-connections/audit-export")
 def export_accounting_audit(
     start_date: date = Query(), end_date: date = Query(),
+    provider: str | None = Query(default=None, min_length=1, max_length=24),
+    event_type: str | None = Query(default=None, min_length=1, max_length=80),
+    actor: str | None = Query(default=None, min_length=1, max_length=255),
     session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
 ):
-    """Download a date-bounded CSV of sync, mapping, connection, and alert audit data."""
+    """Create and persist a filtered CSV audit artifact with an embedded manifest."""
     if end_date < start_date or (end_date - start_date).days > 366:
         raise HTTPException(status_code=422, detail="Choose an ordered date range no longer than 367 days")
     start_at = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
@@ -1168,6 +1172,9 @@ def export_accounting_audit(
                                   "ACCOUNTING_MASTER_DATA_SYNC_APPROVED"}:
             add("SYNC_APPROVAL_EVENT", str(event.id), event.created_at, event.provider, event.actor,
                 event.event_type, None, event.details)
+        elif event.event_type == "ACCOUNTING_AUDIT_EXPORTED":
+            add("AUDIT_EXPORT_EVENT", str(event.id), event.created_at, event.provider, event.actor,
+                event.event_type, None, event.details)
 
     alerts = session.scalars(select(NotificationOutboxRecord).where(
         NotificationOutboxRecord.provider.is_not(None),
@@ -1184,6 +1191,13 @@ def export_accounting_audit(
                 "resolved_at": alert.resolved_at, "resolved_by_alert_id": alert.resolved_by_alert_id,
                 "resolves_alert_id": alert.resolves_alert_id, "escalated_at": alert.escalated_at})
 
+    provider_filter = provider.casefold().strip() if provider else None
+    event_filter = event_type.casefold().strip() if event_type else None
+    actor_filter = actor.casefold().strip() if actor else None
+    rows = [row for row in rows
+        if (not provider_filter or row["provider"].casefold() == provider_filter)
+        and (not event_filter or row["event_type"].casefold() == event_filter)
+        and (not actor_filter or row["actor"].casefold() == actor_filter)]
     rows.sort(key=lambda item: item["occurred_at"] or "")
     output = io.StringIO(newline="")
     fieldnames = ("company_id", "record_type", "event_id", "occurred_at", "provider", "actor",
@@ -1195,9 +1209,203 @@ def export_accounting_audit(
             if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
                 row[key] = "'" + value
         writer.writerow(row)
+    data_bytes = output.getvalue().encode("utf-8")
+    checksum = hashlib.sha256(data_bytes).hexdigest()
+    export_id = str(uuid4())
+    generated_at = datetime.now(timezone.utc)
+    manifest = {"schema_version": 1, "export_id": export_id,
+        "generated_at": _timestamp(generated_at), "generated_by": admin.name,
+        "company_id": session.info.get("company_id", "default"),
+        "date_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        "filters": {"provider": provider_filter, "event_type": event_filter, "actor": actor_filter},
+        "row_count": len(rows), "checksum_algorithm": "sha256",
+        "checksum_sha256": checksum, "data_bytes": len(data_bytes)}
+    manifest_row = {"company_id": session.info.get("company_id", "default"),
+        "record_type": "EXPORT_MANIFEST", "event_id": export_id,
+        "occurred_at": _timestamp(generated_at), "provider": provider_filter or "",
+        "actor": admin.name, "event_type": "AUDIT_EXPORT_MANIFEST", "status": "COMPLETE",
+        "details": json.dumps(manifest, sort_keys=True, separators=(",", ":"))}
+    for key, value in manifest_row.items():
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+            manifest_row[key] = "'" + value
+    writer.writerow(manifest_row)
+    content = output.getvalue().encode("utf-8")
+    export_record = AuditExportRecord(id=export_id, generated_by=admin.name,
+        start_date=start_date.isoformat(), end_date=end_date.isoformat(),
+        provider_filter=provider_filter, event_type_filter=event_filter, actor_filter=actor_filter,
+        checksum_sha256=checksum, row_count=len(rows), manifest=manifest,
+        file_content=content, created_at=generated_at)
+    session.add(export_record)
+    session.add(AccountingConnectionEventRecord(provider=provider_filter or "all",
+        event_type="ACCOUNTING_AUDIT_EXPORTED", actor=admin.name,
+        details={"export_id": export_id, "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(), "filters": manifest["filters"],
+            "row_count": len(rows), "checksum_sha256": checksum}))
+    session.commit()
     filename = f"invoice-match-audit-{start_date.isoformat()}-to-{end_date.isoformat()}.csv"
-    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    return Response(content=content, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "X-Audit-Export-ID": export_id,
+                 "X-Audit-Export-SHA256": checksum,
+                 "X-Audit-Export-Manifest-URL": f"/admin/accounting-connections/audit-exports/{export_id}/manifest"})
+
+
+@app.get("/admin/accounting-connections/audit-exports")
+def list_accounting_audit_exports(
+    limit: int = Query(default=50, ge=1, le=500),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    exports = session.scalars(select(AuditExportRecord).order_by(
+        AuditExportRecord.created_at.desc()).limit(limit)).all()
+    return [{"id": row.id, "generated_at": _timestamp(row.created_at),
+        "generated_by": row.generated_by, "start_date": row.start_date, "end_date": row.end_date,
+        "filters": {"provider": row.provider_filter, "event_type": row.event_type_filter,
+                    "actor": row.actor_filter}, "row_count": row.row_count,
+        "checksum_sha256": row.checksum_sha256, "manifest_url":
+            f"/admin/accounting-connections/audit-exports/{row.id}/manifest",
+        "download_url": f"/admin/accounting-connections/audit-exports/{row.id}"}
+        for row in exports]
+
+
+@app.get("/admin/accounting-connections/audit-exports/{export_id}/manifest")
+def get_accounting_audit_export_manifest(
+    export_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    export_record = session.get(AuditExportRecord, export_id)
+    if export_record is None:
+        raise HTTPException(status_code=404, detail="Audit export not found")
+    return export_record.manifest
+
+
+@app.get("/admin/accounting-connections/audit-exports/{export_id}")
+def download_accounting_audit_export(
+    export_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    export_record = session.get(AuditExportRecord, export_id)
+    if export_record is None:
+        raise HTTPException(status_code=404, detail="Audit export not found")
+    filename = f"invoice-match-audit-{export_record.start_date}-to-{export_record.end_date}.csv"
+    return Response(content=export_record.file_content, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "X-Audit-Export-ID": export_record.id,
+                 "X-Audit-Export-SHA256": export_record.checksum_sha256,
+                 "X-Audit-Export-Manifest-URL": f"/admin/accounting-connections/audit-exports/{export_record.id}/manifest"})
+
+
+@app.get("/admin/accounting-connections/trends")
+def accounting_admin_trends(
+    start_date: date = Query(), end_date: date = Query(),
+    provider: str | None = Query(default=None, min_length=1, max_length=24),
+    bucket: str = Query(default="day", pattern="^(day|week)$"),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    """Summarize provider sync reliability, alert response, and mapping activity."""
+    if end_date < start_date or (end_date - start_date).days > 366:
+        raise HTTPException(status_code=422, detail="Choose an ordered date range no longer than 367 days")
+    start_at = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+    end_before = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    provider_filter = provider.casefold().strip() if provider else None
+
+    def in_scope(value: str | None) -> bool:
+        return not provider_filter or (value or "").casefold() == provider_filter
+
+    def period_for(value: datetime | None) -> str:
+        normalized = _utc(value)
+        if normalized is None:
+            return "unknown"
+        day = normalized.date()
+        if bucket == "week":
+            day -= timedelta(days=day.weekday())
+        return day.isoformat()
+
+    runs = session.scalars(select(MasterDataSyncRunRecord).where(
+        MasterDataSyncRunRecord.started_at >= start_at,
+        MasterDataSyncRunRecord.started_at < end_before,
+    ).order_by(MasterDataSyncRunRecord.started_at)).all()
+    sync_counts: dict[tuple[str, str], dict[str, int]] = {}
+    recurring: dict[tuple[str, str], dict] = {}
+    for run in runs:
+        if not in_scope(run.provider):
+            continue
+        key = (period_for(run.started_at), run.provider)
+        counts = sync_counts.setdefault(key, {"total": 0, "succeeded": 0, "failed": 0,
+                                               "in_progress": 0})
+        counts["total"] += 1
+        if run.status == "SUCCEEDED":
+            counts["succeeded"] += 1
+        elif run.status == "FAILED":
+            counts["failed"] += 1
+            error = (run.error or "Unspecified provider error").strip()[:250]
+            failure = recurring.setdefault((run.provider, error), {"provider": run.provider,
+                "error": error, "count": 0, "first_seen": _timestamp(run.started_at),
+                "last_seen": _timestamp(run.started_at)})
+            failure["count"] += 1
+            failure["last_seen"] = _timestamp(run.started_at)
+        else:
+            counts["in_progress"] += 1
+
+    sync_series = []
+    for (period, provider_name), counts in sorted(sync_counts.items()):
+        sync_series.append({"period": period, "provider": provider_name, **counts,
+            "success_rate_percent": round(counts["succeeded"] /
+                (counts["succeeded"] + counts["failed"]) * 100, 2)
+                if counts["succeeded"] + counts["failed"] else None})
+
+    alert_types = ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE",
+                   "MASTER_DATA_SYNC_RECOVERED", "MASTER_DATA_SYNC_ESCALATED")
+    alerts = session.scalars(select(NotificationOutboxRecord).where(
+        NotificationOutboxRecord.provider.is_not(None),
+        NotificationOutboxRecord.event_type.in_(alert_types),
+        NotificationOutboxRecord.created_at >= start_at,
+        NotificationOutboxRecord.created_at < end_before,
+    ).order_by(NotificationOutboxRecord.created_at)).all()
+    alert_counts: dict[tuple[str, str], dict] = {}
+    for alert in alerts:
+        if not in_scope(alert.provider):
+            continue
+        key = (period_for(alert.created_at), alert.provider)
+        stats = alert_counts.setdefault(key, {"alerts": 0, "acknowledged": 0,
+            "resolved": 0, "ack_minutes": [], "resolution_minutes": []})
+        stats["alerts"] += 1
+        created = _utc(alert.created_at)
+        acknowledged = _utc(alert.acknowledged_at)
+        resolved = _utc(alert.resolved_at)
+        if acknowledged and created:
+            stats["acknowledged"] += 1
+            stats["ack_minutes"].append(max(0, (acknowledged - created).total_seconds() / 60))
+        if resolved and created:
+            stats["resolved"] += 1
+            stats["resolution_minutes"].append(max(0, (resolved - created).total_seconds() / 60))
+    alert_response_series = []
+    for (period, provider_name), stats in sorted(alert_counts.items()):
+        ack_values = stats.pop("ack_minutes")
+        resolution_values = stats.pop("resolution_minutes")
+        alert_response_series.append({"period": period, "provider": provider_name, **stats,
+            "avg_ack_minutes": round(sum(ack_values) / len(ack_values), 2) if ack_values else None,
+            "median_ack_minutes": round(median(ack_values), 2) if ack_values else None,
+            "avg_resolution_minutes": round(sum(resolution_values) / len(resolution_values), 2)
+                if resolution_values else None})
+
+    revisions = session.scalars(select(AccountingMappingChangeRecord).where(
+        AccountingMappingChangeRecord.created_at >= start_at,
+        AccountingMappingChangeRecord.created_at < end_before,
+    ).order_by(AccountingMappingChangeRecord.created_at)).all()
+    mapping_counts: dict[tuple[str, str], dict] = {}
+    for revision in revisions:
+        if not in_scope(revision.provider):
+            continue
+        key = (period_for(revision.created_at), revision.provider)
+        stats = mapping_counts.setdefault(key, {"count": 0, "by_category": {}})
+        stats["count"] += 1
+        stats["by_category"][revision.category] = stats["by_category"].get(revision.category, 0) + 1
+
+    return {"date_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        "bucket": bucket, "provider": provider_filter,
+        "sync_series": sync_series,
+        "recurring_failures": sorted(recurring.values(), key=lambda item: (-item["count"], item["provider"], item["error"])),
+        "alert_response_series": alert_response_series,
+        "mapping_series": [{"period": period, "provider": provider_name, **stats}
+            for (period, provider_name), stats in sorted(mapping_counts.items())]}
 
 
 @app.post("/notifications/outbox/{notification_id}/retry", response_model=NotificationOutboxItem)
