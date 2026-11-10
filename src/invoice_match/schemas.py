@@ -171,6 +171,24 @@ class ApprovalPolicySimulationRequest(StrictModel):
     samples: list[ApprovalPolicySimulationSample] = Field(min_length=1, max_length=100)
 
 
+class AccountingPeriodCloseRequest(StrictModel):
+    period_start: date
+    period_end: date
+    signoff_note: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def valid_period(self):
+        if self.period_end < self.period_start:
+            raise ValueError("period_end must be on or after period_start")
+        if (self.period_end - self.period_start).days > 366:
+            raise ValueError("period close ranges cannot exceed 367 days")
+        return self
+
+
+class AccountingPeriodReopenRequest(StrictModel):
+    note: str = Field(min_length=1, max_length=2000)
+
+
 class RuleVersionResult(StrictModel):
     id: str
     version: int

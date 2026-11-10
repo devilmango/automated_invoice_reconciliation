@@ -35,6 +35,8 @@ from .database import (
     DocumentCaptureEvent,
     ExceptionRecord,
     MatchRecord,
+    AccountingPeriodCloseRecord,
+    AccountingPeriodCloseEventRecord,
     PaymentReconciliationEventRecord,
     RemittancePaymentRecord,
     NotificationOutboxRecord,
@@ -109,6 +111,8 @@ from .schemas import (
     AlertSnoozeRequest,
     AuditExportRetentionUpdate,
     AdminAlertRouteUpsert,
+    AccountingPeriodCloseRequest,
+    AccountingPeriodReopenRequest,
 )
 from .accounting_connections import (check_payload_mappings, decrypt_configuration,
                                      encrypt_configuration, mapping_field, public_connection,
@@ -119,6 +123,7 @@ from .accounting_status import refresh_accounting_status
 from .bank_statement import parse_statement
 from .credit_sync import retry_credit_application, sync_credit_applications as _sync_credit_applications
 from .audit_export_retention import current_retention, cleanup_expired_audit_exports
+from .period_close import build_period_close_report, locked_period_for_date, match_accounting_date
 
 app = FastAPI(
     title="invoice-match",
@@ -391,6 +396,16 @@ def _submit_match(
         if existing.request_hash != request_digest:
             raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_KEY_REUSED"})
         return JSONResponse(status_code=200, content=_result(existing))
+
+    accounting_date = request.invoice.invoice_date or datetime.now(timezone.utc).date()
+    locked_period = locked_period_for_date(session, accounting_date)
+    if locked_period is not None:
+        raise HTTPException(status_code=423, detail={
+            "code": "ACCOUNTING_PERIOD_LOCKED",
+            "period_close_id": locked_period.id,
+            "period_start": locked_period.period_start.isoformat(),
+            "period_end": locked_period.period_end.isoformat(),
+        })
 
     profiles = load_vendor_profiles()
     vendor_key = _normalized(canonical_vendor(request.invoice.vendor or request.po.vendor, profiles)) or ""
@@ -1268,6 +1283,126 @@ def snooze_admin_alert(
     session.commit()
     return {"id": alert.id, "management_state": "SNOOZED",
             "snoozed_until": _timestamp(snoozed_until)}
+
+
+@app.get("/admin/period-closes/preview")
+def preview_accounting_period_close(
+    period_start: date = Query(), period_end: date = Query(),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    if period_end < period_start or (period_end - period_start).days > 366:
+        raise HTTPException(status_code=422, detail="Choose an ordered period no longer than 367 days")
+    report = build_period_close_report(session, period_start, period_end)
+    close = session.scalar(select(AccountingPeriodCloseRecord).where(
+        AccountingPeriodCloseRecord.period_start == period_start,
+        AccountingPeriodCloseRecord.period_end == period_end,
+    ))
+    report["close_status"] = close.status if close else "OPEN"
+    report["period_close_id"] = close.id if close else None
+    return report
+
+
+@app.post("/admin/period-closes", status_code=201)
+def sign_off_accounting_period_close(
+    body: AccountingPeriodCloseRequest,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    active_overlap = session.scalar(select(AccountingPeriodCloseRecord).where(
+        AccountingPeriodCloseRecord.status == "LOCKED",
+        AccountingPeriodCloseRecord.period_start <= body.period_end,
+        AccountingPeriodCloseRecord.period_end >= body.period_start,
+    ).limit(1))
+    if active_overlap is not None:
+        raise HTTPException(status_code=409, detail={"code": "ACCOUNTING_PERIOD_OVERLAP",
+            "period_close_id": active_overlap.id,
+            "period_start": active_overlap.period_start.isoformat(),
+            "period_end": active_overlap.period_end.isoformat()})
+    report = build_period_close_report(session, body.period_start, body.period_end)
+    if not report["ready_to_close"]:
+        raise HTTPException(status_code=409, detail={"code": "PERIOD_CLOSE_BLOCKED", "report": report})
+    close = session.scalar(select(AccountingPeriodCloseRecord).where(
+        AccountingPeriodCloseRecord.period_start == body.period_start,
+        AccountingPeriodCloseRecord.period_end == body.period_end,
+    ))
+    now = datetime.now(timezone.utc)
+    if close is None:
+        close = AccountingPeriodCloseRecord(id=str(uuid4()), period_start=body.period_start,
+            period_end=body.period_end, status="LOCKED", signed_off_by=admin.name,
+            signed_off_at=now, signoff_note=body.signoff_note, report_snapshot=report,
+            created_at=now)
+        session.add(close)
+        event_type = "PERIOD_LOCKED"
+    else:
+        close.status = "LOCKED"
+        close.signed_off_by, close.signed_off_at = admin.name, now
+        close.signoff_note, close.report_snapshot = body.signoff_note, report
+        event_type = "PERIOD_RELOCKED"
+    session.add(AccountingPeriodCloseEventRecord(id=str(uuid4()), close_id=close.id,
+        event_type=event_type, actor=admin.name, created_at=now,
+        details={"period_start": body.period_start.isoformat(),
+                 "period_end": body.period_end.isoformat(),
+                 "signoff_note": body.signoff_note, "report": report}))
+    session.commit()
+    return {"id": close.id, "period_start": close.period_start.isoformat(),
+        "period_end": close.period_end.isoformat(), "status": close.status,
+        "signed_off_by": close.signed_off_by, "signed_off_at": _timestamp(close.signed_off_at),
+        "signoff_note": close.signoff_note, "report_snapshot": close.report_snapshot}
+
+
+@app.get("/admin/period-closes")
+def list_accounting_period_closes(
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    rows = session.scalars(select(AccountingPeriodCloseRecord).order_by(
+        AccountingPeriodCloseRecord.period_start.desc()).limit(limit)).all()
+    return [{"id": row.id, "period_start": row.period_start.isoformat(),
+        "period_end": row.period_end.isoformat(), "status": row.status,
+        "signed_off_by": row.signed_off_by, "signed_off_at": _timestamp(row.signed_off_at),
+        "signoff_note": row.signoff_note, "blocker_count_at_signoff":
+            row.report_snapshot.get("blocker_count", 0)} for row in rows]
+
+
+@app.get("/admin/period-closes/{close_id}")
+def get_accounting_period_close(
+    close_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    close = session.scalar(select(AccountingPeriodCloseRecord).where(
+        AccountingPeriodCloseRecord.id == close_id))
+    if close is None:
+        raise HTTPException(status_code=404, detail="Accounting period close not found")
+    events = session.scalars(select(AccountingPeriodCloseEventRecord).where(
+        AccountingPeriodCloseEventRecord.close_id == close_id
+    ).order_by(AccountingPeriodCloseEventRecord.created_at.asc())).all()
+    return {"id": close.id, "period_start": close.period_start.isoformat(),
+        "period_end": close.period_end.isoformat(), "status": close.status,
+        "signed_off_by": close.signed_off_by, "signed_off_at": _timestamp(close.signed_off_at),
+        "signoff_note": close.signoff_note, "report_snapshot": close.report_snapshot,
+        "history": [{"event_type": event.event_type, "actor": event.actor,
+                     "created_at": _timestamp(event.created_at), "details": event.details}
+                    for event in events]}
+
+
+@app.post("/admin/period-closes/{close_id}/reopen")
+def reopen_accounting_period_close(
+    close_id: str, body: AccountingPeriodReopenRequest,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    close = session.scalar(select(AccountingPeriodCloseRecord).where(
+        AccountingPeriodCloseRecord.id == close_id))
+    if close is None:
+        raise HTTPException(status_code=404, detail="Accounting period close not found")
+    if close.status != "LOCKED":
+        raise HTTPException(status_code=409, detail="Accounting period is already open")
+    now = datetime.now(timezone.utc)
+    close.status = "REOPENED"
+    session.add(AccountingPeriodCloseEventRecord(id=str(uuid4()), close_id=close.id,
+        event_type="PERIOD_REOPENED", actor=admin.name, created_at=now,
+        details={"note": body.note, "prior_signed_off_by": close.signed_off_by,
+                 "prior_signed_off_at": _timestamp(close.signed_off_at)}))
+    session.commit()
+    return {"id": close.id, "status": close.status, "reopened_by": admin.name,
+            "reopened_at": _timestamp(now), "note": body.note}
 
 
 @app.get("/admin/alert-routes")
@@ -3728,6 +3863,16 @@ def apply_credit_note(
                 "application_id": prior_app.id, "sync_id": prior_sync.id,
                 "sync_state": prior_sync.state, "idempotency_key": prior_sync.idempotency_key,
                 "replayed": True}
+    for source_match in (credit, invoice):
+        accounting_date = match_accounting_date(source_match)
+        locked_period = locked_period_for_date(session, accounting_date)
+        if locked_period is not None:
+            raise HTTPException(status_code=423, detail={
+                "code": "ACCOUNTING_PERIOD_LOCKED",
+                "period_close_id": locked_period.id,
+                "period_start": locked_period.period_start.isoformat(),
+                "period_end": locked_period.period_end.isoformat(),
+            })
     credit_remaining = abs(Decimal(str(credit_outbox.payload.get("total_amount") or 0))) - _credit_applied_total(session, credit.id)
     allocated = session.scalar(select(func.sum(PaymentAllocationRecord.amount)).where(
         PaymentAllocationRecord.match_id == invoice.id))

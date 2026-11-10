@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, Numeric, String, create_engine, text, Boolean
+from sqlalchemy import Date, DateTime, ForeignKey, Index, Integer, JSON, LargeBinary, Numeric, String, create_engine, text, Boolean
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker, with_loader_criteria
 from sqlalchemy import event
 
@@ -103,6 +103,37 @@ class ExceptionRecord(CompanyScoped, Base):
     escalated: Mapped[bool] = mapped_column(default=False, index=True)
     escalated_to: Mapped[str | None] = mapped_column(String(32), nullable=True)
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AccountingPeriodCloseRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_period_closes"
+    __table_args__ = (
+        Index("uq_accounting_period_close_range", "company_id", "period_start", "period_end", unique=True),
+        Index("ix_accounting_period_closes_status", "company_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    period_start: Mapped[date] = mapped_column(Date, index=True)
+    period_end: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="LOCKED", index=True)
+    signed_off_by: Mapped[str] = mapped_column(String(255))
+    signed_off_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    signoff_note: Mapped[str] = mapped_column(String(2000))
+    report_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AccountingPeriodCloseEventRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_period_close_events"
+    __table_args__ = (Index("ix_accounting_period_close_events_close_created",
+        "company_id", "close_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    close_id: Mapped[str] = mapped_column(ForeignKey("accounting_period_closes.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(24), index=True)
+    actor: Mapped[str] = mapped_column(String(255))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

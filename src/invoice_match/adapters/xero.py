@@ -137,12 +137,12 @@ class XeroAdapter:
         session.flush()
         return data["access_token"]
 
-    def _token(self):
+    def _token(self, *, force_refresh: bool = False):
         with self.session_factory() as session:
             record = session.scalar(select(XeroCredentialRecord).where(
                 XeroCredentialRecord.tenant_id == self.tenant_id).with_for_update())
             now = datetime.now(timezone.utc)
-            if record is not None:
+            if record is not None and not force_refresh:
                 expires = record.access_token_expires_at
                 if expires.tzinfo is None:
                     expires = expires.replace(tzinfo=timezone.utc)
@@ -171,13 +171,21 @@ class XeroAdapter:
         url = _API_URL + path
         if query:
             url += "?" + urlencode(query)
-        headers = {"Authorization": f"Bearer {self._token()}", "Xero-tenant-id": self.tenant_id,
-                   "Accept": "application/json", "Content-Type": "application/json"}
-        if idempotency_key:
-            headers["Idempotency-Key"] = idempotency_key
         payload = json.dumps(data, separators=(",", ":")).encode() if data is not None else None
-        request = Request(url, data=payload, headers=headers, method=method)
-        return self._open_json(request)
+        for attempt in range(2):
+            headers = {"Authorization": f"Bearer {self._token(force_refresh=attempt == 1)}",
+                       "Xero-tenant-id": self.tenant_id,
+                       "Accept": "application/json", "Content-Type": "application/json"}
+            if idempotency_key:
+                headers["Idempotency-Key"] = idempotency_key
+            request = Request(url, data=payload, headers=headers, method=method)
+            try:
+                return self._open_json(request)
+            except XeroAPIError as exc:
+                if exc.status == 401 and attempt == 0:
+                    continue
+                raise
+        raise XeroAPIError("Xero authentication retry failed", status=401)
 
     def _find_invoice(self, invoice_number):
         data = self._api("Invoices", query={"InvoiceNumbers": invoice_number})

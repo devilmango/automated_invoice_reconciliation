@@ -412,6 +412,16 @@ Audit export requests accept optional exact-match `provider`, `event_type`, and 
 
 The operations page also displays accounting trends over the selected report date range. `GET /admin/accounting-connections/trends?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&bucket=day` returns per-period sync counts and success rates, repeated provider errors, alert acknowledgement/resolution times, and mapping revision counts by category. Set `bucket=week` for Monday-based weekly grouping; use the optional `provider` filter to focus the report.
 
+### Period close controls
+
+Admins can preview an inclusive invoice-date range before closing it. `GET /admin/period-closes/preview?period_start=YYYY-MM-DD&period_end=YYYY-MM-DD` lists open exceptions, pending invoice and credit syncs, and failed or running provider master-data syncs. A close is rejected with HTTP `409` and the live blocker report until all items are resolved. Sign off with `POST /admin/period-closes` and a `period_start`, `period_end`, and required `signoff_note`; the saved close includes the report snapshot, signer, timestamp, and append-only close/reopen events. Active ranges cannot overlap.
+
+Once locked, new invoice matches and credit applications dated in that period return HTTP `423`. To record an authorized adjustment, use `POST /admin/period-closes/{close_id}/reopen` with a reason in `note`; reopening is retained in the close history, and a cleared range can be signed off again. Use `GET /admin/period-closes` to list close records and `GET /admin/period-closes/{close_id}` to inspect the original sign-off snapshot and full history. Close ranges are limited to 367 inclusive days.
+
+### Provider adapter contract tests
+
+The QuickBooks and Xero contract tests run offline with deterministic HTTP response fixtures in `tests/fixtures/providers/`. They exercise OAuth refresh and token rotation, one retry after an expired access token, preservation of provider idempotency keys across retries, and propagation of HTTP 429 status and `Retry-After`. No provider sandbox credentials are needed for the normal test suite. Run them with `pytest tests/test_provider_contracts.py`; the existing adapter suites also cover payload mapping and duplicate-safe exports.
+
 Trend anomaly alerts are configured per provider with `PUT /admin/accounting-connections/{provider}/trend-alert-settings`. Choose a rolling `window_hours`, sync failure count, minimum-sampled average alert acknowledgement time, mapping revision count, and alert cooldown. The worker queues one webhook per anomaly type and cooldown window. Each notice includes the metric, threshold, window, and `trend_url` to the related provider/date range. Trend table rows include **Inspect** links to the underlying sync runs, alerts, or mapping revisions via `GET /admin/accounting-connections/trends/drilldown`.
 
 To repeatably validate a saved audit artifact, call `POST /admin/accounting-connections/audit-exports/{export_id}/verify`. The response checks the stored CSV data-prefix checksum against both the saved manifest and persisted checksum record, checks the embedded manifest and metadata, and verifies row counts. Each verification records the admin, timestamp, and result; inspect prior checks at `GET /admin/accounting-connections/audit-exports/{export_id}/verifications`.
@@ -602,6 +612,11 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `GET` | `/admin/alerts` | Inspect provider alert delivery history and admin status (admin token required) |
 | `POST` | `/admin/alerts/{alert_id}/acknowledge` | Acknowledge a provider alert and add an audit event (admin token required) |
 | `POST` | `/admin/alerts/{alert_id}/snooze` | Snooze a provider alert for up to 30 days (admin token required) |
+| `GET` | `/admin/period-closes/preview?period_start=...&period_end=...` | Report unresolved period exceptions and pending syncs before close (admin token required) |
+| `POST` | `/admin/period-closes` | Sign off and lock a clear date range with a retained report snapshot (admin token required) |
+| `GET` | `/admin/period-closes` | List accounting period close sign-offs (admin token required) |
+| `GET` | `/admin/period-closes/{close_id}` | Inspect close snapshot and sign-off/reopen event history (admin token required) |
+| `POST` | `/admin/period-closes/{close_id}/reopen` | Reopen a locked range with an audited reason (admin token required) |
 | `GET` | `/admin/alert-routes` | List company webhook routes by provider and severity (admin token required) |
 | `POST` | `/admin/alert-routes` | Add a provider/severity webhook route (admin token required) |
 | `PUT` / `DELETE` | `/admin/alert-routes/{route_id}` | Update or remove a webhook route (admin token required) |
@@ -865,7 +880,7 @@ pytest
 invoice-match --help
 ```
 
-The automated suite covers matching and financial calculations, cumulative partial invoices, PO revisions, units and credit notes, adapter retries and dead letters, company data isolation, PDF/email capture and verification, idempotent submissions, CSV validation, approval workflows, and audit history.
+The automated suite covers matching and financial calculations, cumulative partial invoices, PO revisions, units and credit notes, adapter retries and dead letters, QuickBooks/Xero contract behavior with offline fixtures, accounting period close controls, company data isolation, PDF/email capture and verification, idempotent submissions, CSV validation, approval workflows, and audit history.
 
 ## Security and scope
 

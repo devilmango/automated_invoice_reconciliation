@@ -51,6 +51,8 @@ def apply_database_migrations():
 @pytest.fixture(autouse=True)
 def clear_database(apply_database_migrations):
     with engine.begin() as connection:
+        connection.exec_driver_sql("DELETE FROM accounting_period_close_events")
+        connection.exec_driver_sql("DELETE FROM accounting_period_closes")
         connection.exec_driver_sql("DELETE FROM credit_application_outbox")
         connection.exec_driver_sql("DELETE FROM payment_reconciliation_events")
         connection.exec_driver_sql("DELETE FROM payment_allocations")
