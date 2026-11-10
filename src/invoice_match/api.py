@@ -80,7 +80,10 @@ from .schemas import (
     CapturedDocumentResult,
     CsvMatchRequest,
     DocumentCaptureAuditEntry,
+    Discrepancy,
     ExceptionQueueItem,
+    GoodsReceipt,
+    LineItem,
     MatchRequest,
     MatchResult,
     MatchStatus,
@@ -88,6 +91,7 @@ from .schemas import (
     RuleVersionCreate,
     RuleVersionAuditEntry,
     RuleVersionResult,
+    ApprovalPolicySimulationRequest,
     ReviewerAPOutboxItem,
     SupplierInvoice,
     VerifyCapturedInvoice,
@@ -176,7 +180,53 @@ def _invoice_date(value: str | None) -> date | None:
         return None
 
 
-def _check_duplicate_invoice(session: Session, request: MatchRequest, profiles: list[dict]) -> None:
+def _receipt_documents(receipt: GoodsReceipt):
+    if receipt.items:
+        yield receipt.number, receipt.items
+    for document in receipt.receipts:
+        yield document.number, document.items
+
+
+def _cumulative_receipt(
+    records: list[MatchRecord], current: GoodsReceipt,
+) -> tuple[GoodsReceipt, int]:
+    """Sum distinct numbered receipts for a PO; use the largest unnumbered snapshot as fallback."""
+    identified: dict[str, tuple[str, list[LineItem]]] = {}
+    unnumbered: list[list[LineItem]] = []
+    for record in records:
+        if record.approval_status == "REJECTED":
+            continue
+        try:
+            prior = MatchRequest.model_validate(record.input_data).receipt
+        except (ValueError, TypeError):
+            continue
+        for number, items in _receipt_documents(prior):
+            key = normalize_name(number) if number else ""
+            if key:
+                # A repeated receipt ID is a correction/snapshot, not a second receipt.
+                identified[key] = (number, items)
+            elif items:
+                unnumbered.append(items)
+    for number, items in _receipt_documents(current):
+        key = normalize_name(number) if number else ""
+        if key:
+            identified[key] = (number, items)
+        elif items:
+            unnumbered.append(items)
+
+    distinct_items = [item for _, items in identified.values() for item in items]
+    receipt_count = len(identified)
+    if unnumbered:
+        # Without receipt numbers, treat submissions as refreshed snapshots to avoid
+        # counting the same cumulative receipt balance once per invoice. Identified
+        # documents remain additive; give each delivery a number when mixing styles.
+        snapshot = max(unnumbered, key=lambda items: sum((item.qty for item in items), Decimal(0)))
+        distinct_items.extend(snapshot)
+        receipt_count += 1
+    return GoodsReceipt(items=distinct_items), receipt_count
+
+
+def _duplicate_invoice_assessment(session: Session, request: MatchRequest, profiles: list[dict]) -> dict:
     supplier = request.invoice.vendor or request.po.vendor
     canonical = canonical_vendor(supplier, profiles)
     vendor_keys = {
@@ -186,13 +236,17 @@ def _check_duplicate_invoice(session: Session, request: MatchRequest, profiles: 
     if canonical:
         vendor_keys.add(_normalized(canonical))
     if not vendor_keys:
-        return
+        return {"status": "CLEAR", "candidates": []}
     records = session.scalars(select(MatchRecord).where(MatchRecord.vendor_key.in_(vendor_keys))).all()
     incoming_number = normalize_name(request.invoice.number)
     incoming_amount = _invoice_amount(request.invoice.model_dump(mode="json"))
     incoming_date = request.invoice.invoice_date
+    incoming_lines = _invoice_line_fingerprint(request.invoice.model_dump(mode="json"))
+    exact = []
     risks = []
     for record in records:
+        if record.approval_status == "REJECTED":
+            continue
         old = record.input_data
         old_invoice = old.get("invoice", {})
         old_vendor = old_invoice.get("vendor") or old.get("po", {}).get("vendor")
@@ -204,10 +258,9 @@ def _check_duplicate_invoice(session: Session, request: MatchRequest, profiles: 
             continue
         old_number = normalize_name(old_invoice.get("number"))
         if incoming_number and incoming_number == old_number:
-            raise HTTPException(status_code=409, detail={
-                "code": "DUPLICATE_SUPPLIER_INVOICE",
-                "existing_match_id": record.id,
-            })
+            exact.append({"match_id": record.id, "invoice_number": old_invoice.get("number"),
+                          "invoice_date": old_invoice.get("invoice_date"), "reason": "NORMALIZED_INVOICE_NUMBER_MATCH"})
+            continue
         old_amount = _invoice_amount(old_invoice)
         amount_close = False
         if incoming_amount is not None and old_amount is not None:
@@ -221,30 +274,59 @@ def _check_duplicate_invoice(session: Session, request: MatchRequest, profiles: 
             number_similarity = SequenceMatcher(None, incoming_number, old_number).ratio()
         else:
             number_similarity = 0
+        old_lines = _invoice_line_fingerprint(old_invoice)
+        line_similarity = SequenceMatcher(None, incoming_lines, old_lines).ratio() if incoming_lines and old_lines else 0
         date_conflict = bool(
             incoming_date and old_date and abs((incoming_date - old_date).days) > 7
         )
         number_close = number_similarity >= 0.92 and not date_conflict
-        if amount_close and (number_close or dates_close):
+        number_near = number_similarity >= 0.90 and not date_conflict
+        lines_close = line_similarity >= 0.85
+        if amount_close and (number_close or dates_close or (lines_close and number_near)):
             evidence = ["SAME_CANONICAL_VENDOR", "INVOICE_AMOUNT_WITHIN_0.5_PERCENT"]
-            if number_close:
+            if number_near:
                 evidence.append(f"INVOICE_NUMBER_SIMILARITY:{number_similarity:.2f}")
             if dates_close:
                 evidence.append("INVOICE_DATE_WITHIN_3_DAYS")
+            if lines_close:
+                evidence.append(f"INVOICE_LINE_SIMILARITY:{line_similarity:.2f}")
             risks.append({
                 "match_id": record.id,
                 "invoice_number": old_invoice.get("number"),
                 "invoice_date": old_invoice.get("invoice_date"),
                 "invoice_amount": str(old_amount) if old_amount is not None else None,
                 "number_similarity": round(number_similarity, 2),
+                "line_similarity": round(line_similarity, 2),
                 "evidence": evidence,
             })
+    if exact:
+        return {"status": "DUPLICATE", "candidates": exact[:5]}
     if risks:
+        return {"status": "REVIEW", "candidates": risks[:5]}
+    return {"status": "CLEAR", "candidates": []}
+
+
+def _invoice_line_fingerprint(invoice: dict) -> str:
+    items = invoice.get("items", [])
+    signatures = []
+    for item in items:
+        sku = normalize_name(item.get("sku"))
+        description = normalize_name(item.get("description"))
+        quantity = str(item.get("qty", ""))
+        price = str(item.get("price", ""))
+        signatures.append("|".join((sku, description, quantity, price)))
+    return "\n".join(sorted(signatures))
+
+
+def _check_duplicate_invoice(session: Session, request: MatchRequest, profiles: list[dict]) -> list[dict]:
+    assessment = _duplicate_invoice_assessment(session, request, profiles)
+    if assessment["status"] == "DUPLICATE":
         raise HTTPException(status_code=409, detail={
-            "code": "DUPLICATE_INVOICE_RISK",
-            "message": "A similar invoice already exists; review the candidate matches before resubmitting.",
-            "candidates": risks[:5],
+            "code": "DUPLICATE_SUPPLIER_INVOICE",
+            "existing_match_id": assessment["candidates"][0]["match_id"],
+            "candidates": assessment["candidates"],
         })
+    return assessment["candidates"] if assessment["status"] == "REVIEW" else []
 
 
 def _request_hash(request: MatchRequest) -> str:
@@ -313,7 +395,7 @@ def _submit_match(
     profiles = load_vendor_profiles()
     vendor_key = _normalized(canonical_vendor(request.invoice.vendor or request.po.vendor, profiles)) or ""
     invoice_key = _normalized(request.invoice.number)
-    _check_duplicate_invoice(session, request, profiles)
+    duplicate_candidates = _check_duplicate_invoice(session, request, profiles)
 
     po_vendor_keys = {
         _normalized(alias) for alias in vendor_aliases(request.po.vendor, profiles)
@@ -339,9 +421,28 @@ def _submit_match(
         for record in po_records
         if record.approval_status != "REJECTED"
     ]
+    cumulative_receipt, cumulative_receipt_count = _cumulative_receipt(
+        po_records, request.receipt,
+    )
 
     rules, rule_version, rule_digest = _active_rules(session)
-    result = match_documents(request, rules, previously_invoiced=previously_invoiced)
+    result = match_documents(request, rules, previously_invoiced=previously_invoiced,
+                             cumulative_receipt=cumulative_receipt)
+    if duplicate_candidates:
+        duplicate_summary = ", ".join(
+            f"{candidate['match_id']} ({', '.join(candidate['evidence'])})"
+            for candidate in duplicate_candidates
+        )
+        result.discrepancies.append(Discrepancy(
+            reason="DUPLICATE_INVOICE_RISK",
+            expected="No similar prior invoice",
+            invoiced=f"{len(duplicate_candidates)} candidate(s)",
+            message=f"Review possible duplicate invoice matches: {duplicate_summary}",
+        ))
+        result.status = MatchStatus.EXCEPTION
+        result.reason = "DUPLICATE_INVOICE_RISK"
+        result.approval_status = "PENDING"
+        result.duplicate_candidates = duplicate_candidates
     match_id = str(uuid4())
     result.match_id = match_id
     record = MatchRecord(
@@ -395,6 +496,8 @@ def _submit_match(
             "po_revision": request.po.revision,
             "po_change_reason": request.po.change_reason,
             "previous_invoice_count": len(previously_invoiced),
+            "cumulative_receipt_document_count": cumulative_receipt_count,
+            "duplicate_candidate_ids": [candidate["match_id"] for candidate in duplicate_candidates],
             "rule_version_id": rule_version.id if rule_version else None,
             "rule_digest": rule_digest,
         },
@@ -723,6 +826,21 @@ def captured_document_audit(
     ) for event in events]
 
 
+@app.post("/matches/duplicate-check")
+def check_match_duplicate_risk(
+    request: MatchRequest,
+    session: Session = Depends(get_session),
+    actor: str = Depends(require_integration),
+):
+    """Preview exact and fuzzy duplicate candidates without creating a match."""
+    assessment = _duplicate_invoice_assessment(session, request, load_vendor_profiles())
+    return {**assessment, "recommended_action": {
+        "CLEAR": "SUBMIT",
+        "REVIEW": "REVIEW_CANDIDATES",
+        "DUPLICATE": "DO_NOT_RESUBMIT",
+    }[assessment["status"]]}
+
+
 @app.post("/matches", response_model=MatchResult, status_code=201)
 def create_match(
     request: MatchRequest,
@@ -880,7 +998,10 @@ def _decide(
         raise HTTPException(status_code=409, detail="This exception has already been decided")
     if record.required_role == "admin" and "admin" not in principal.roles:
         raise HTTPException(status_code=403, detail="This approval requires an admin role")
-    if record.assigned_to and principal.name != record.assigned_to and "admin" not in principal.roles:
+    delegated = principal.name.casefold() in {
+        name.casefold() for name in record.result_data.get("delegates", [])
+    }
+    if record.assigned_to and principal.name != record.assigned_to and not delegated and "admin" not in principal.roles:
         raise HTTPException(status_code=403, detail="This exception is assigned to another reviewer")
     submitter = session.scalar(select(AuditEvent.actor).where(
         AuditEvent.match_id == match_id,
@@ -895,6 +1016,18 @@ def _decide(
     ))
     if prior_vote is not None:
         raise HTTPException(status_code=409, detail="A reviewer may only vote once on an exception")
+    delegation_group = {name.casefold() for name in record.result_data.get("delegates", [])}
+    if record.assigned_to:
+        delegation_group.add(record.assigned_to.casefold())
+    if principal.name.casefold() in delegation_group and len(delegation_group) > 1:
+        prior_group_vote = session.scalar(select(AuditEvent).where(
+            AuditEvent.match_id == match_id,
+            AuditEvent.event_type.in_(["EXCEPTION_APPROVAL_RECORDED", "EXCEPTION_APPROVED"]),
+            func.lower(AuditEvent.actor).in_(delegation_group),
+        ))
+        if prior_group_vote is not None:
+            raise HTTPException(status_code=409,
+                detail="The assigned reviewer or a delegate has already voted for this approval slot")
 
     result = dict(record.result_data)
     if outcome == "REJECTED":
@@ -906,7 +1039,8 @@ def _decide(
             match_id=match_id,
             event_type="EXCEPTION_REJECTED",
             actor=principal.name,
-            details={"comment": decision.comment, "approvals_received": record.approvals_received},
+            details={"comment": decision.comment, "approvals_received": record.approvals_received,
+                     "delegated_from": record.assigned_to if delegated else None},
         ))
     else:
         record.approvals_received += 1
@@ -924,6 +1058,7 @@ def _decide(
                     "comment": decision.comment,
                     "approvals_received": record.approvals_received,
                     "approvals_required": record.approvals_required,
+                    "delegated_from": record.assigned_to if delegated else None,
                 },
             ))
             request = MatchRequest.model_validate(record.input_data)
@@ -934,7 +1069,8 @@ def _decide(
                 match_id=match_id,
                 event_type="EXCEPTION_APPROVAL_RECORDED",
                 actor=principal.name,
-                details={"comment": decision.comment, "approvals_received": record.approvals_received},
+                details={"comment": decision.comment, "approvals_received": record.approvals_received,
+                         "delegated_from": record.assigned_to if delegated else None},
             ))
     if commit:
         session.commit()
@@ -1747,6 +1883,85 @@ def list_rule_versions(
 ):
     versions = session.scalars(select(RuleVersionRecord).order_by(RuleVersionRecord.version.desc())).all()
     return [_rule_version_result(version) for version in versions]
+
+
+@app.post("/admin/approval-policies/simulate")
+def simulate_approval_policies(
+    body: ApprovalPolicySimulationRequest,
+    admin: Principal = Depends(require_admin),
+):
+    """Evaluate proposed approval rules against sample invoices without saving or activating them."""
+    try:
+        rules = parse_rules_yaml(body.content)
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid rules: {exc}") from exc
+    simulations = []
+    for sample in body.samples:
+        result = match_documents(sample.documents, rules)
+        policy = next((candidate for candidate in rules.approval_policies
+                       if candidate.name == result.approval_policy), None)
+        configured_delegates = result.delegates
+        reviewers = sample.reviewers
+
+        def has_required_role(name: str) -> bool:
+            roles = set(reviewers.get(name, []))
+            if not roles:
+                roles = next((set(value) for key, value in reviewers.items()
+                              if key.casefold() == name.casefold()), set())
+            return "admin" in roles or (result.required_role == "approver" and "approver" in roles)
+
+        if result.assigned_to:
+            candidate_names = [result.assigned_to, *configured_delegates]
+        else:
+            candidate_names = [name for name in reviewers if has_required_role(name)]
+        candidate_names = list(dict.fromkeys(candidate_names))
+        role_eligible = [name for name in candidate_names if has_required_role(name)]
+        submitter_conflict = sample.submitted_by.casefold() in {name.casefold() for name in role_eligible}
+        eligible = [name for name in role_eligible if name.casefold() != sample.submitted_by.casefold()]
+        delegate_eligible = [name for name in configured_delegates if name in eligible]
+        warnings = []
+        if result.assigned_to and not has_required_role(result.assigned_to):
+            warnings.append("ASSIGNEE_MISSING_REQUIRED_ROLE")
+        missing_delegates = [name for name in configured_delegates if not has_required_role(name)]
+        if missing_delegates:
+            warnings.append("DELEGATE_MISSING_REQUIRED_ROLE")
+        if configured_delegates and not result.assigned_to:
+            warnings.append("DELEGATION_HAS_NO_PRIMARY_ASSIGNEE")
+        if submitter_conflict:
+            warnings.append("SUBMITTER_EXCLUDED_BY_SEPARATION_OF_DUTIES")
+        approval_required = result.status == MatchStatus.EXCEPTION
+        sufficient = not approval_required or len(eligible) >= result.approvals_required
+        if approval_required and not sufficient:
+            warnings.append("INSUFFICIENT_DISTINCT_ELIGIBLE_APPROVERS")
+        simulations.append({
+            "sample": sample.name,
+            "match_status": result.status.value,
+            "match_reason": result.reason,
+            "invoice_total": str(result.invoice_total),
+            "approval_required": approval_required,
+            "approval_status": result.approval_status,
+            "approval_policy": result.approval_policy,
+            "required_role": result.required_role,
+            "approvals_required": result.approvals_required,
+            "assigned_to": result.assigned_to,
+            "delegates": configured_delegates,
+            "eligible_delegates": delegate_eligible,
+            "eligible_approvers": eligible,
+            "sla_hours": policy.sla_hours if policy else 72,
+            "escalation_role": policy.escalation_role if policy else "admin",
+            "separation_of_duties": {
+                "submitter": sample.submitted_by,
+                "submitter_is_assignee": bool(result.assigned_to and
+                    result.assigned_to.casefold() == sample.submitted_by.casefold()),
+                "submitter_was_excluded": submitter_conflict,
+                "eligible_distinct_approver_count": len(eligible),
+                "sufficient_distinct_approvers": sufficient,
+            },
+            "policy_conditions": policy.model_dump(mode="json") if policy else {"name": "default"},
+            "warnings": warnings,
+        })
+    return {"simulated_by": admin.name, "saved": False, "sample_count": len(simulations),
+            "results": simulations}
 
 
 @app.post("/rules/versions", response_model=RuleVersionResult, status_code=201)

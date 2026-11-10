@@ -8,15 +8,15 @@ Documents enter as validated JSON or CSV, can be fetched through an AP adapter, 
 
 ## Features
 
-- **Three-way matching:** Compare PO, receipt, and invoice lines by SKU, quantity, and unit price.
+- **Cumulative three-way matching:** Compare PO, distinct receipt documents, and invoice lines by SKU; retain ordered, received, invoiced, backordered, and still-invoiceable quantities across partial bills.
 - **Financial terms:** Check line discounts, tax codes and rates, invoice tax, freight, document discounts, totals, and currency conversion.
 - **Currency precision:** Configure conversion rates and minor-unit precision for currencies such as JPY and KWD.
-- **Rule-driven approvals:** Select approval policies by amount, variance, supplier, or cost center, with role, assignment, approval count, and SLA.
+- **Rule-driven approvals:** Select approval policies by amount, variance, supplier, or cost center, with role, assignment, named delegates, approval count, and SLA; simulate proposed rules against sample invoices before saving.
 - **Exception queue:** List, approve, and reject discrepancies through the API.
 - **Reviewer queue controls:** Search and filter exceptions, page through results, make atomic bulk decisions, and escalate overdue items to an admin queue.
 - **Versioned rule controls:** Create validated rule drafts, activate them with a second admin, and inspect rule change history; every match retains its rule snapshot and digest.
 - **Authenticated integrations:** Protect matching, CSV intake, and AP export routes with service bearer tokens.
-- **Idempotency and duplicate detection:** Replay safe request retries, reject exact duplicate supplier invoices, and flag amount/date/number near-matches for review across configured supplier aliases.
+- **Idempotency and duplicate detection:** Replay safe request retries, reject exact duplicate supplier invoices, and route likely amount/date/number/line-similar duplicates into the reviewer queue across configured supplier aliases.
 - **AP export outbox:** Poll approved payables as structured JSON and acknowledge downstream delivery.
 - **AP adapter contract:** Fetch POs and receipts and send payables through generic REST or local filesystem adapters.
 - **Scheduled procurement sync:** Synchronize purchase orders and their receipts into the database using filesystem or generic REST adapters; reruns update the stored snapshot.
@@ -186,7 +186,9 @@ curl --request POST http://127.0.0.1:8000/matches \
   --data-binary @examples/match-request.json
 ```
 
-The integration identity is recorded in the audit log; the client cannot supply an actor name. Idempotency keys are required (8–128 characters). Repeating the same key and request returns the original match with HTTP `200`; reusing the key with different content returns `409`. An exact repeat returns `409 DUPLICATE_SUPPLIER_INVOICE`; a likely near-match returns `409 DUPLICATE_INVOICE_RISK` with candidate match IDs and evidence such as invoice-number similarity, close totals, and invoice dates. Review the candidate before resubmitting. Exceptions enter the review queue automatically.
+The integration identity is recorded in the audit log; the client cannot supply an actor name. Idempotency keys are required (8–128 characters). Repeating the same key and request returns the original match with HTTP `200`; reusing the key with different content returns `409`. Call `POST /matches/duplicate-check` first to receive `CLEAR`, `REVIEW`, or `DUPLICATE` and up to five candidates without creating a record. Submission blocks exact duplicates with `409 DUPLICATE_SUPPLIER_INVOICE`; likely near-matches are saved into the exception queue with reason `DUPLICATE_INVOICE_RISK`, candidate evidence, and normal approval controls so finance can confirm a legitimate repeat or reject it. Similarity evidence can include normalized invoice number, amount, date, and line-item similarity. Rejected invoices are excluded from duplicate candidates.
+
+Each match response includes `po_line_balances`, with ordered, cumulatively received, cumulatively invoiced, backordered, and still-invoiceable quantities by SKU. Earlier non-rejected invoice quantities are reserved against the PO, including invoices awaiting approval, so concurrent partial invoices cannot exceed the ordered or received quantity beyond the configured quantity tolerance. Numbered goods receipts are summed once per distinct receipt number across invoices. A repeated receipt number is treated as an updated snapshot. When receipt numbers are absent, the largest submitted receipt quantity is treated as a snapshot; provide stable receipt numbers to accurately add separate deliveries. Unreceived PO quantities remain backordered and do not block invoicing against quantities already received.
 
 ### Import CSV documents
 
@@ -243,7 +245,7 @@ vendors:
       A-100: A100
 ```
 
-Near-duplicate checks compare records for the same canonical vendor and currency. An exact normalized invoice number is blocked. A possible duplicate is flagged when the total is within 0.5% and either the normalized invoice numbers are at least 92% similar (unless dates differ by more than seven days), or invoice dates are within three days. The response includes up to five candidate match IDs, prior invoice number/date/amount, similarity, and matching evidence; review these candidates before retrying.
+Near-duplicate checks compare records for the same canonical vendor and currency. An exact normalized invoice number is blocked. A possible duplicate is flagged when totals are within 0.5% and either normalized invoice numbers are at least 92% similar (unless dates differ by more than seven days), invoice dates are within three days, or both line details are at least 85% similar and invoice numbers are at least 90% similar. The combined line and number signal helps avoid flagging routine repeat purchases with identical line items. The preflight and submission response includes up to five candidate match IDs, prior invoice number/date/amount, number and line similarity, and evidence. Use the preflight to surface a review choice before submitting; rejected matches are ignored.
 
 The Docker image installs `poppler-utils` and `tesseract-ocr`. For non-Docker deployments, install those system packages separately. OCR uses English by default and is limited to 20 pages, rendered at 200 DPI. Configure it with:
 
@@ -354,7 +356,7 @@ curl http://127.0.0.1:8000/rules/versions/RULE_VERSION_ID/audit \
   --header 'Authorization: Bearer replace-with-a-random-admin-token-at-least-32-chars'
 ```
 
-Rule version endpoints require an `admin` role. Rule drafts are immutable; submit a new version for each proposed change. For separation of duties, the match submitter also cannot approve or reject that match, and the person who captured an invoice cannot verify that capture.
+Rule version endpoints require an `admin` role. Rule drafts are immutable; submit a new version for each proposed change. Use `POST /admin/approval-policies/simulate` to try proposed YAML against sample PO/receipt/invoice sets and a reviewer-role directory before saving a draft. Each approval policy can include `assigned_to` and `delegates: [reviewer-name]`; the simulator reports role eligibility, delegation candidates, thresholds, SLA and escalation roles, self-approval exclusions, and whether enough distinct approvers remain. A configured delegate can decide for the assigned reviewer, but only one member of that assignment/delegate group may vote on a given exception. The match submitter also cannot approve or reject that match, and the person who captured an invoice cannot verify that capture.
 
 ### Deliver approved payables to an AP system
 
@@ -626,6 +628,7 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `POST` | `/admin/accounting-connections/{provider}/mapping-history/{change_id}/rollback` | Restore a mapping revision with a conflict guard (admin token required) |
 | `GET` | `/integrations/procurement/purchase-orders/{po_number}` | Read a synchronized PO and receipt snapshot (integration token required) |
 | `POST` | `/matches` | Match and persist documents (integration token and idempotency key required) |
+| `POST` | `/matches/duplicate-check` | Preview exact and likely duplicate invoice candidates without saving (integration token required) |
 | `POST` | `/imports/csv` | Parse CSV documents and submit a match (integration token and idempotency key required) |
 | `POST` | `/documents/extract` | Capture a raw PDF, email, or text invoice for extraction |
 | `GET` | `/documents?status=REVIEW_REQUIRED\|VERIFIED\|ALL` | List captured documents (reviewer token required) |
@@ -652,6 +655,7 @@ Audit CSV files are retained for 365 days by default. Change the company setting
 
 Webhook routes can be configured for `quickbooks`, `xero`, or `*` and severity `INFO`, `WARNING`, `CRITICAL`, or `ANY`. Matching chooses the most specific provider and severity combination. Failed syncs and escalations are critical; stale syncs and trend anomalies are warnings; other provider notifications are informational. Routes use HTTPS (localhost HTTP is accepted for local development). If no route matches, delivery uses `NOTIFICATION_WEBHOOK_URL`. Acknowledging an escalation notice records who acknowledged it on both the escalation and its original alert.
 | `GET` | `/rules/versions` | List immutable rule versions (admin token required) |
+| `POST` | `/admin/approval-policies/simulate` | Preview thresholds, reviewer roles, delegation, and separation-of-duties for sample invoices (admin token required) |
 | `POST` | `/rules/versions` | Validate and create a draft rule version (admin token required) |
 | `POST` | `/rules/versions/{version_id}/activate` | Activate a draft with a different admin identity |
 | `GET` | `/rules/versions/{version_id}/audit` | Read the rule version change history (admin token required) |

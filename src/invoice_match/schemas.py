@@ -103,6 +103,15 @@ class Discrepancy(StrictModel):
     message: str
 
 
+class PurchaseOrderLineBalance(StrictModel):
+    sku: str
+    ordered_qty: Decimal
+    received_qty: Decimal
+    cumulatively_invoiced_qty: Decimal
+    remaining_to_receive_qty: Decimal
+    remaining_invoiceable_qty: Decimal
+
+
 class MatchResult(StrictModel):
     match_id: str | None = None
     status: MatchStatus
@@ -117,6 +126,8 @@ class MatchResult(StrictModel):
     base_currency: str
     invoice_total: Decimal = Decimal(0)
     discrepancies: list[Discrepancy] = Field(default_factory=list)
+    duplicate_candidates: list[dict] = Field(default_factory=list)
+    po_line_balances: list[PurchaseOrderLineBalance] = Field(default_factory=list)
     approval_status: Literal["NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED"] = "PENDING"
     approval_policy: str = "default"
     required_role: str = "approver"
@@ -124,6 +135,7 @@ class MatchResult(StrictModel):
     approvals_required: int = 1
     approvals_received: int = 0
     assigned_to: str | None = None
+    delegates: list[str] = Field(default_factory=list)
     due_at: datetime | None = None
     rule_version_id: str | None = None
     rule_digest: str | None = None
@@ -145,6 +157,18 @@ class BulkApprovalDecision(ApprovalDecision):
 
 class RuleVersionCreate(StrictModel):
     content: str = Field(min_length=1, max_length=100_000)
+
+
+class ApprovalPolicySimulationSample(StrictModel):
+    name: str = Field(min_length=1, max_length=120)
+    documents: MatchRequest
+    submitted_by: str = Field(min_length=1, max_length=255)
+    reviewers: dict[str, list[Literal["reviewer", "approver", "admin"]]] = Field(default_factory=dict)
+
+
+class ApprovalPolicySimulationRequest(StrictModel):
+    content: str = Field(min_length=1, max_length=100_000)
+    samples: list[ApprovalPolicySimulationSample] = Field(min_length=1, max_length=100)
 
 
 class RuleVersionResult(StrictModel):

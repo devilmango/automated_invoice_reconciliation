@@ -6,7 +6,8 @@ from decimal import Decimal
 
 from .financials import invoice_summary, item_tax_rate, round_currency, to_base_currency
 from .rules import ToleranceRules, select_approval_policy
-from .schemas import Discrepancy, MatchRequest, MatchResult, MatchStatus, SupplierInvoice
+from .schemas import (Discrepancy, GoodsReceipt, MatchRequest, MatchResult, MatchStatus,
+                      PurchaseOrderLineBalance, SupplierInvoice)
 from .vendor_profiles import vendors_equivalent
 
 
@@ -86,6 +87,7 @@ def match_documents(
     rules: ToleranceRules,
     *,
     previously_invoiced: list[SupplierInvoice] | None = None,
+    cumulative_receipt: GoodsReceipt | None = None,
 ) -> MatchResult:
     previously_invoiced = previously_invoiced or []
     po, receipt, invoice = request.po, request.receipt, request.invoice
@@ -110,7 +112,7 @@ def match_documents(
         ))
 
     po_items = _totals(po.items, rules, po.tax_rate)
-    receipt_items = _totals(receipt.all_items(), rules)
+    receipt_items = _totals((cumulative_receipt or receipt).all_items(), rules)
     invoice_items = _totals(invoice.items, rules)
     prior_invoiced: dict[str, Decimal] = defaultdict(Decimal)
     prior_unit_families: dict[str, set[str]] = defaultdict(set)
@@ -134,8 +136,12 @@ def match_documents(
             invoice.credit_note_for or "MISSING",
             invoice.number or "UNKNOWN",
         ))
+    cumulative_billed_by_sku = dict(prior_invoiced)
     for sku in sorted(set(po_items) | set(receipt_items) | set(invoice_items)):
         ordered, received, billed = po_items.get(sku), receipt_items.get(sku), invoice_items.get(sku)
+        if billed is not None:
+            quantity_sign = Decimal(-1) if invoice.document_type == "CREDIT_NOTE" else Decimal(1)
+            cumulative_billed_by_sku[sku] = prior_invoiced[sku] + billed["qty"] * quantity_sign
         if ordered is None:
             if billed is not None:
                 discrepancies.append(_discrepancy(
@@ -184,6 +190,7 @@ def match_documents(
             cumulative_billed = prior_qty - billed["qty"]
         else:
             cumulative_billed = prior_qty + billed["qty"]
+        cumulative_billed_by_sku[sku] = cumulative_billed
 
         if received["qty"] > ordered["qty"] and _outside_tolerance(
             ordered["qty"], received["qty"], rules.quantity_variance
@@ -296,6 +303,19 @@ def match_documents(
                 ))
 
     invoice_total_base = to_base_currency(summary["total"], invoice_currency, rules) or Decimal(0)
+    po_line_balances = []
+    for sku, ordered in sorted(po_items.items()):
+        received_qty = receipt_items.get(sku, {}).get("qty", Decimal(0))
+        invoiced_qty = cumulative_billed_by_sku.get(sku, prior_invoiced.get(sku, Decimal(0)))
+        invoiceable_limit = min(ordered["qty"], received_qty)
+        po_line_balances.append(PurchaseOrderLineBalance(
+            sku=sku,
+            ordered_qty=ordered["qty"],
+            received_qty=received_qty,
+            cumulatively_invoiced_qty=invoiced_qty,
+            remaining_to_receive_qty=max(Decimal(0), ordered["qty"] - received_qty),
+            remaining_invoiceable_qty=max(Decimal(0), invoiceable_limit - invoiced_qty),
+        ))
     monetary_reasons = {
         "TAX_MISMATCH", "FREIGHT_MISMATCH", "DOCUMENT_DISCOUNT_MISMATCH", "INVOICE_TOTAL_MISMATCH"
     }
@@ -341,6 +361,7 @@ def match_documents(
         base_currency=rules.base_currency,
         invoice_total=invoice_total_base,
         discrepancies=discrepancies,
+        po_line_balances=po_line_balances,
         approval_status=(
             "PENDING" if status == MatchStatus.EXCEPTION
             else "APPROVED" if rules.auto_approve_matches
@@ -350,5 +371,6 @@ def match_documents(
         required_role=policy.required_role,
         approvals_required=policy.approvals_required,
         assigned_to=policy.assigned_to,
+        delegates=list(dict.fromkeys(name.strip() for name in policy.delegates if name.strip())),
         due_at=due_at,
     )

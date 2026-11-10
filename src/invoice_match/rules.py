@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ApprovalPolicy(BaseModel):
@@ -21,8 +21,18 @@ class ApprovalPolicy(BaseModel):
     required_role: Literal["approver", "admin"] = "approver"
     approvals_required: int = Field(default=1, ge=1, le=10)
     assigned_to: str | None = None
+    delegates: list[str] = Field(default_factory=list, max_length=50)
     sla_hours: int = Field(default=72, ge=1, le=8760)
     escalation_role: Literal["approver", "admin"] = "admin"
+
+    @model_validator(mode="after")
+    def validate_delegates(self):
+        normalized = [name.strip().casefold() for name in self.delegates]
+        if any(not name for name in normalized) or len(set(normalized)) != len(normalized):
+            raise ValueError("delegates must contain unique, non-empty reviewer names")
+        if self.assigned_to and self.assigned_to.strip().casefold() in normalized:
+            raise ValueError("assigned_to cannot also be listed as a delegate")
+        return self
 
     def matches(
         self,
