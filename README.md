@@ -410,6 +410,10 @@ Audit export requests accept optional exact-match `provider`, `event_type`, and 
 
 The operations page also displays accounting trends over the selected report date range. `GET /admin/accounting-connections/trends?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD&bucket=day` returns per-period sync counts and success rates, repeated provider errors, alert acknowledgement/resolution times, and mapping revision counts by category. Set `bucket=week` for Monday-based weekly grouping; use the optional `provider` filter to focus the report.
 
+Trend anomaly alerts are configured per provider with `PUT /admin/accounting-connections/{provider}/trend-alert-settings`. Choose a rolling `window_hours`, sync failure count, minimum-sampled average alert acknowledgement time, mapping revision count, and alert cooldown. The worker queues one webhook per anomaly type and cooldown window. Each notice includes the metric, threshold, window, and `trend_url` to the related provider/date range. Trend table rows include **Inspect** links to the underlying sync runs, alerts, or mapping revisions via `GET /admin/accounting-connections/trends/drilldown`.
+
+To repeatably validate a saved audit artifact, call `POST /admin/accounting-connections/audit-exports/{export_id}/verify`. The response checks the stored CSV data-prefix checksum against both the saved manifest and persisted checksum record, checks the embedded manifest and metadata, and verifies row counts. Each verification records the admin, timestamp, and result; inspect prior checks at `GET /admin/accounting-connections/audit-exports/{export_id}/verifications`.
+
 ### Guarding high-risk provider syncs
 
 Use `POST /admin/accounting-connections/{provider}/sync-preview` to inspect the record diff. Configure `max_deactivations` and `max_diff_records` on the provider's `PUT /admin/accounting-connections/{provider}/sync-schedule` schedule; exceeding either limit creates a 30-minute approval request. The admin who requested the preview cannot approve it. A second admin approves with `POST /admin/accounting-connections/{provider}/sync-approvals/{approval_id}/approve`, then an admin applies it using `POST /admin/accounting-connections/{provider}/sync-masters?approval_id={approval_id}`. Before applying, the service fetches the provider snapshot again and compares its fingerprint, including current local master data, with the approved preview. A changed snapshot invalidates that approval and requires a new preview.
@@ -596,11 +600,21 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `GET` | `/admin/alerts` | Inspect provider alert delivery history and admin status (admin token required) |
 | `POST` | `/admin/alerts/{alert_id}/acknowledge` | Acknowledge a provider alert and add an audit event (admin token required) |
 | `POST` | `/admin/alerts/{alert_id}/snooze` | Snooze a provider alert for up to 30 days (admin token required) |
+| `GET` | `/admin/alert-routes` | List company webhook routes by provider and severity (admin token required) |
+| `POST` | `/admin/alert-routes` | Add a provider/severity webhook route (admin token required) |
+| `PUT` / `DELETE` | `/admin/alert-routes/{route_id}` | Update or remove a webhook route (admin token required) |
 | `GET` | `/admin/accounting-connections/audit-export?start_date=...&end_date=...` | Download date-bounded sync, mapping, connection, and alert records as CSV (admin token required) |
 | `GET` | `/admin/accounting-connections/audit-exports` | List previously generated exports with generator, range, filters, and checksum (admin token required) |
 | `GET` | `/admin/accounting-connections/audit-exports/{export_id}` | Retrieve a saved audit CSV artifact (admin token required) |
 | `GET` | `/admin/accounting-connections/audit-exports/{export_id}/manifest` | Retrieve the saved export manifest (admin token required) |
+| `POST` | `/admin/accounting-connections/audit-exports/{export_id}/verify` | Verify the stored CSV, embedded manifest, and checksum (admin token required) |
+| `GET` | `/admin/accounting-connections/audit-exports/{export_id}/verifications` | Inspect export verification history (admin token required) |
+| `GET` / `PUT` | `/admin/accounting-connections/audit-export-retention` | Read or set saved CSV retention in days (1–3650; admin token required) |
+| `POST` | `/admin/accounting-connections/audit-exports/cleanup` | Run cleanup immediately and record each removed artifact (admin token required) |
+| `GET` | `/admin/accounting-connections/audit-exports/cleanup-history` | Inspect cleanup actor, time, policy, bytes removed, and preserved checksum (admin token required) |
 | `GET` | `/admin/accounting-connections/trends?start_date=...&end_date=...` | Summarize sync, alert response, recurring failure, and mapping activity trends (admin token required) |
+| `PUT` | `/admin/accounting-connections/{provider}/trend-alert-settings` | Configure rolling provider anomaly thresholds (admin token required) |
+| `GET` | `/admin/accounting-connections/trends/drilldown?...` | Inspect source records behind a trend row (admin token required) |
 | `GET` | `/admin/accounting-connections/{provider}/mapping-suggestions` | Get advisory mapping candidates (admin token required) |
 | `GET` | `/admin/accounting-connections/{provider}/mapping-coverage` | Report unmapped labels, ambiguous suggestions, and inactive references (admin token required) |
 | `POST` | `/admin/accounting-connections/{provider}/mapping-suggestions/review` | Accept or dismiss a candidate and audit the reviewer decision (admin token required) |
@@ -631,6 +645,12 @@ XERO_TAX_TYPE_MAP={"STANDARD":"OUTPUT2"}
 | `POST` | `/exceptions/escalate-overdue` | Escalate open items past their SLA (approver/admin token required) |
 | `GET` | `/notifications/outbox?state=PENDING\|DELIVERED\|DEAD\|ALL` | Inspect webhook delivery state (reviewer token required) |
 | `POST` | `/notifications/outbox/{notification_id}/retry` | Requeue a dead-lettered notification (admin token required) |
+
+### Audit export retention and alert routing
+
+Audit CSV files are retained for 365 days by default. Change the company setting with the admin UI or `PUT /admin/accounting-connections/audit-export-retention`, then let the worker clean expired files on its regular cycle or run `POST /admin/accounting-connections/audit-exports/cleanup` immediately. Cleanup removes only the CSV bytes. The export row, manifest, generator, date range, filters, checksum, and a cleanup history entry remain available. Downloads of cleaned files return `410 Gone`; verification records the artifact as unavailable while still checking the preserved metadata.
+
+Webhook routes can be configured for `quickbooks`, `xero`, or `*` and severity `INFO`, `WARNING`, `CRITICAL`, or `ANY`. Matching chooses the most specific provider and severity combination. Failed syncs and escalations are critical; stale syncs and trend anomalies are warnings; other provider notifications are informational. Routes use HTTPS (localhost HTTP is accepted for local development). If no route matches, delivery uses `NOTIFICATION_WEBHOOK_URL`. Acknowledging an escalation notice records who acknowledged it on both the escalation and its original alert.
 | `GET` | `/rules/versions` | List immutable rule versions (admin token required) |
 | `POST` | `/rules/versions` | Validate and create a draft rule version (admin token required) |
 | `POST` | `/rules/versions/{version_id}/activate` | Activate a draft with a different admin identity |

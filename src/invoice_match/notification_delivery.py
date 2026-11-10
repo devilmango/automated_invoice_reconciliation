@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .database import (
+    AdminAlertRouteRecord,
     AccountingConnectionEventRecord,
     AuditEvent,
     ExceptionRecord,
@@ -28,18 +29,19 @@ class WebhookNotificationAdapter:
 
     name = "webhook"
 
-    def __init__(self, endpoint: str, *, token: str | None = None, secret: str | None = None,
+    def __init__(self, endpoint: str | None, *, token: str | None = None, secret: str | None = None,
                  timeout: float = 10.0):
-        parsed = urlsplit(endpoint)
-        local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-        if (parsed.scheme != "https" and not local_http) or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("Notification webhook must use HTTPS (HTTP is allowed for localhost)")
+        if endpoint:
+            parsed = urlsplit(endpoint)
+            local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            if (parsed.scheme != "https" and not local_http) or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError("Notification webhook must use HTTPS (HTTP is allowed for localhost)")
         self.endpoint = endpoint
         self.token = token
         self.secret = secret
         self.timeout = timeout
 
-    def deliver(self, payload: dict, *, idempotency_key: str) -> str | None:
+    def deliver(self, payload: dict, *, idempotency_key: str, endpoint: str | None = None) -> str | None:
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json",
                    "Idempotency-Key": idempotency_key}
@@ -49,7 +51,14 @@ class WebhookNotificationAdapter:
             headers["X-Invoice-Match-Signature"] = hmac.new(
                 self.secret.encode("utf-8"), body, hashlib.sha256
             ).hexdigest()
-        request = Request(self.endpoint, data=body, headers=headers, method="POST")
+        target = endpoint or self.endpoint
+        if not target:
+            raise RuntimeError("No notification webhook route or default URL is configured")
+        parsed = urlsplit(target)
+        local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if (parsed.scheme != "https" and not local_http) or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Notification route must use HTTPS (HTTP is allowed for localhost)")
+        request = Request(target, data=body, headers=headers, method="POST")
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 raw = response.read(16_384)
@@ -205,21 +214,35 @@ def deliver_pending_notifications(
     max_attempts: int = MAX_NOTIFICATION_ATTEMPTS,
     initial_retry_seconds: int = 30,
     max_retry_seconds: int = 3600,
+    routed_only: bool = False,
 ) -> dict:
     current = now or datetime.now(timezone.utc)
     summary = {"adapter": adapter.name, "delivered": 0, "failed": 0, "dead_lettered": 0, "items": []}
+    skipped_ids: set[str] = set()
     while len(summary["items"]) < limit:
         query = select(NotificationOutboxRecord).where(
             NotificationOutboxRecord.state == "PENDING",
             (NotificationOutboxRecord.next_attempt_at.is_(None)
              | (NotificationOutboxRecord.next_attempt_at <= current)),
         ).order_by(NotificationOutboxRecord.created_at.asc()).limit(1).with_for_update(skip_locked=True)
+        if routed_only:
+            query = query.where(NotificationOutboxRecord.provider.is_not(None))
+        if skipped_ids:
+            query = query.where(~NotificationOutboxRecord.id.in_(skipped_ids))
         record = session.scalar(query)
         if record is None:
             break
         record.attempt_count += 1
+        route = _matching_alert_route(session, record)
+        if routed_only and route is None:
+            skipped_ids.add(record.id)
+            continue
         try:
-            reference = adapter.deliver(record.payload, idempotency_key=record.dedupe_key)
+            if route is not None and isinstance(adapter, WebhookNotificationAdapter):
+                reference = adapter.deliver(record.payload, idempotency_key=record.dedupe_key,
+                                            endpoint=route.endpoint_url)
+            else:
+                reference = adapter.deliver(record.payload, idempotency_key=record.dedupe_key)
         except Exception as exc:  # Persist downstream failures so the scheduled worker can retry.
             record.last_error = str(exc)[:1000]
             if record.attempt_count >= max_attempts:
@@ -231,7 +254,7 @@ def deliver_pending_notifications(
                 summary["failed"] += 1
             details = {"notification_id": record.id, "event_type": record.event_type,
                        "attempt": record.attempt_count, "state": record.state,
-                       "error": record.last_error}
+                       "error": record.last_error, "route_id": route.id if route else None}
             if record.match_id:
                 session.add(AuditEvent(match_id=record.match_id,
                     event_type="NOTIFICATION_DELIVERY_FAILED", actor=f"notification:{adapter.name}",
@@ -260,6 +283,29 @@ def deliver_pending_notifications(
                     details=details))
             summary["delivered"] += 1
             summary["items"].append({"notification_id": record.id, "state": "DELIVERED",
-                                     "provider_reference": reference})
+                                     "provider_reference": reference,
+                                     "route_id": route.id if route else None})
         session.commit()
     return summary
+
+
+def _matching_alert_route(session: Session, record: NotificationOutboxRecord) -> AdminAlertRouteRecord | None:
+    """Resolve the most specific enabled route for provider alerts and their severity."""
+    if record.provider is None:
+        return None
+    event_type = record.event_type
+    severity = str(record.payload.get("severity") or (
+        "CRITICAL" if event_type in {"MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_ESCALATED"}
+        else "WARNING" if event_type in {"MASTER_DATA_SYNC_STALE", "MASTER_DATA_TREND_ANOMALY"}
+        else "INFO"
+    )).upper()
+    candidates = session.scalars(select(AdminAlertRouteRecord).where(
+        AdminAlertRouteRecord.enabled.is_(True),
+        AdminAlertRouteRecord.provider_key.in_((record.provider, "*")),
+        AdminAlertRouteRecord.severity.in_((severity, "ANY")),
+    )).all()
+    if not candidates:
+        return None
+    return max(candidates, key=lambda route: (
+        route.provider_key == record.provider, route.severity == severity, route.updated_at,
+    ))

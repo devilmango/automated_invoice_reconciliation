@@ -251,6 +251,24 @@ class NotificationOutboxRecord(CompanyScoped, Base):
     resolved_by_alert_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     resolves_alert_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    escalation_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    escalation_acknowledged_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class AdminAlertRouteRecord(CompanyScoped, Base):
+    __tablename__ = "admin_alert_routes"
+    __table_args__ = (Index("uq_admin_alert_routes_company_provider_severity",
+        "company_id", "provider_key", "severity", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    provider_key: Mapped[str] = mapped_column(String(24), default="*", server_default="*")
+    severity: Mapped[str] = mapped_column(String(16), default="ANY", server_default="ANY")
+    endpoint_url: Mapped[str] = mapped_column(String(2048))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"))
+    created_by: Mapped[str] = mapped_column(String(255))
+    updated_by: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class QuickBooksCredentialRecord(CompanyScoped, Base):
@@ -418,6 +436,13 @@ class MasterDataSyncScheduleRecord(CompanyScoped, Base):
     max_diff_records: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
     alert_escalation_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     alert_escalation_minutes: Mapped[int] = mapped_column(Integer, default=1440, server_default="1440")
+    trend_alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    trend_window_hours: Mapped[int] = mapped_column(Integer, default=24, server_default="24")
+    sync_failure_threshold: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    alert_response_threshold_minutes: Mapped[int] = mapped_column(Integer, default=120, server_default="120")
+    alert_response_min_samples: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    mapping_change_threshold: Mapped[int] = mapped_column(Integer, default=20, server_default="20")
+    trend_alert_cooldown_minutes: Mapped[int] = mapped_column(Integer, default=1440, server_default="1440")
 
 
 class MasterDataSyncApprovalRecord(CompanyScoped, Base):
@@ -452,8 +477,46 @@ class AuditExportRecord(CompanyScoped, Base):
     checksum_sha256: Mapped[str] = mapped_column(String(64))
     row_count: Mapped[int] = mapped_column(Integer)
     manifest: Mapped[dict] = mapped_column(JSON)
-    file_content: Mapped[bytes] = mapped_column(LargeBinary)
+    file_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    content_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    content_deleted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AuditExportRetentionRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_audit_export_retention"
+    __table_args__ = (Index("uq_audit_export_retention_company", "company_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    retention_days: Mapped[int] = mapped_column(Integer, default=365, server_default="365")
+    updated_by: Mapped[str] = mapped_column(String(255), default="system")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AuditExportCleanupRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_audit_export_cleanups"
+    __table_args__ = (Index("ix_audit_export_cleanups_company_created", "company_id", "cleaned_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    export_id: Mapped[str] = mapped_column(String(36), index=True)
+    cleaned_by: Mapped[str] = mapped_column(String(255))
+    cleaned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    retention_days: Mapped[int] = mapped_column(Integer)
+    checksum_sha256: Mapped[str] = mapped_column(String(64))
+    bytes_removed: Mapped[int] = mapped_column(Integer)
+
+
+class AuditExportVerificationRecord(CompanyScoped, Base):
+    __tablename__ = "accounting_audit_export_verifications"
+    __table_args__ = (Index("ix_audit_export_verifications_export_created",
+        "company_id", "export_id", "verified_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    export_id: Mapped[str] = mapped_column(ForeignKey("accounting_audit_exports.id"), index=True)
+    verified_by: Mapped[str] = mapped_column(String(255))
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    valid: Mapped[bool] = mapped_column(Boolean)
+    checks: Mapped[dict] = mapped_column(JSON)
 
 
 class MasterDataSyncRunRecord(CompanyScoped, Base):

@@ -203,6 +203,17 @@ class AlertSnoozeRequest(StrictModel):
         return self
 
 
+class AuditExportRetentionUpdate(StrictModel):
+    retention_days: int = Field(ge=1, le=3650)
+
+
+class AdminAlertRouteUpsert(StrictModel):
+    provider: str = Field(default="*", min_length=1, max_length=24)
+    severity: Literal["ANY", "INFO", "WARNING", "CRITICAL"] = "ANY"
+    endpoint_url: str = Field(min_length=1, max_length=2048)
+    enabled: bool = True
+
+
 class ExceptionQueueItem(StrictModel):
     match_id: str
     status: MatchStatus
@@ -380,6 +391,16 @@ class MasterDataSyncScheduleUpdate(StrictModel):
     max_diff_records: int = Field(default=100, ge=0, le=1000000)
     alert_escalation_enabled: bool = True
     alert_escalation_minutes: int = Field(default=1440, ge=5, le=525600)
+
+
+class MasterDataTrendAlertSettingsUpdate(StrictModel):
+    enabled: bool = False
+    window_hours: int = Field(default=24, ge=1, le=720)
+    sync_failure_threshold: int = Field(default=3, ge=1, le=100000)
+    alert_response_threshold_minutes: int = Field(default=120, ge=1, le=525600)
+    alert_response_min_samples: int = Field(default=3, ge=1, le=100000)
+    mapping_change_threshold: int = Field(default=20, ge=1, le=100000)
+    cooldown_minutes: int = Field(default=1440, ge=5, le=525600)
 
 
 class PaymentAdviceAllocation(StrictModel):

@@ -10,6 +10,7 @@ from statistics import mean, median
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -48,6 +49,10 @@ from .database import (
     MasterDataSyncRunRecord,
     MasterDataSyncApprovalRecord,
     AuditExportRecord,
+    AuditExportVerificationRecord,
+    AuditExportRetentionRecord,
+    AuditExportCleanupRecord,
+    AdminAlertRouteRecord,
     CreditNoteApplicationRecord,
     CreditApplicationOutboxRecord,
     BankStatementBatchRecord,
@@ -96,7 +101,10 @@ from .schemas import (
     BankReconciliationDecision,
     MappingSuggestionDecision,
     MasterDataSyncScheduleUpdate,
+    MasterDataTrendAlertSettingsUpdate,
     AlertSnoozeRequest,
+    AuditExportRetentionUpdate,
+    AdminAlertRouteUpsert,
 )
 from .accounting_connections import (check_payload_mappings, decrypt_configuration,
                                      encrypt_configuration, mapping_field, public_connection,
@@ -106,6 +114,7 @@ from .payment_reconciliation import manually_allocate, payment_result, reconcile
 from .accounting_status import refresh_accounting_status
 from .bank_statement import parse_statement
 from .credit_sync import retry_credit_application, sync_credit_applications as _sync_credit_applications
+from .audit_export_retention import current_retention, cleanup_expired_audit_exports
 
 app = FastAPI(
     title="invoice-match",
@@ -1022,14 +1031,15 @@ def list_admin_alerts(
         NotificationOutboxRecord.provider.is_not(None),
         NotificationOutboxRecord.event_type.in_(
             ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED",
-             "MASTER_DATA_SYNC_ESCALATED")),
+             "MASTER_DATA_SYNC_ESCALATED", "MASTER_DATA_TREND_ANOMALY")),
     ).order_by(NotificationOutboxRecord.created_at.desc()).limit(limit)).all()
     providers = {alert.provider for alert in alerts}
     history_events = session.scalars(select(AccountingConnectionEventRecord).where(
         AccountingConnectionEventRecord.provider.in_(providers or {"__none__"}),
         AccountingConnectionEventRecord.event_type.in_(
             ("ADMIN_ALERT_DELIVERED", "ADMIN_ALERT_DELIVERY_FAILED",
-             "ADMIN_ALERT_ACKNOWLEDGED", "ADMIN_ALERT_SNOOZED", "ADMIN_ALERT_ESCALATED")),
+             "ADMIN_ALERT_ACKNOWLEDGED", "ADMIN_ALERT_SNOOZED", "ADMIN_ALERT_ESCALATED",
+             "ADMIN_ESCALATION_ACKNOWLEDGED", "ACCOUNTING_TREND_ANOMALY_DETECTED")),
     ).order_by(AccountingConnectionEventRecord.created_at.asc())).all()
     event_history: dict[str, list[dict]] = {}
     for event in history_events:
@@ -1064,6 +1074,8 @@ def list_admin_alerts(
             "resolved_by_alert_id": alert.resolved_by_alert_id,
             "resolves_alert_id": alert.resolves_alert_id,
             "escalated_at": _timestamp(alert.escalated_at),
+            "escalation_acknowledged_at": _timestamp(alert.escalation_acknowledged_at),
+            "escalation_acknowledged_by": alert.escalation_acknowledged_by,
             "history": event_history.get(alert.id, [])})
     return results
 
@@ -1080,12 +1092,23 @@ def acknowledge_admin_alert(
     now = datetime.now(timezone.utc)
     alert.acknowledged_at, alert.acknowledged_by = now, admin.name
     alert.snoozed_until, alert.snoozed_by = None, None
+    source_alert_id = alert.payload.get("source_alert_id") if alert.event_type == "MASTER_DATA_SYNC_ESCALATED" else None
+    if source_alert_id:
+        source_alert = session.get(NotificationOutboxRecord, source_alert_id)
+        if source_alert is not None:
+            source_alert.escalation_acknowledged_at = now
+            source_alert.escalation_acknowledged_by = admin.name
+            session.add(AccountingConnectionEventRecord(provider=source_alert.provider or alert.provider,
+                event_type="ADMIN_ESCALATION_ACKNOWLEDGED", actor=admin.name,
+                details={"notification_id": alert.id, "source_alert_id": source_alert.id,
+                         "event_type": source_alert.event_type}))
     session.add(AccountingConnectionEventRecord(provider=alert.provider,
         event_type="ADMIN_ALERT_ACKNOWLEDGED", actor=admin.name,
         details={"notification_id": alert.id, "event_type": alert.event_type,
                  "delivery_state": alert.state}))
     session.commit()
-    return {"id": alert.id, "management_state": "ACKNOWLEDGED", "idempotent": False}
+    return {"id": alert.id, "management_state": "ACKNOWLEDGED", "idempotent": False,
+            "source_alert_id": source_alert_id}
 
 
 @app.post("/admin/alerts/{alert_id}/snooze")
@@ -1109,6 +1132,128 @@ def snooze_admin_alert(
     session.commit()
     return {"id": alert.id, "management_state": "SNOOZED",
             "snoozed_until": _timestamp(snoozed_until)}
+
+
+@app.get("/admin/alert-routes")
+def list_admin_alert_routes(session: Session = Depends(get_session), admin: Principal = Depends(require_admin)):
+    rows = session.scalars(select(AdminAlertRouteRecord).order_by(
+        AdminAlertRouteRecord.provider_key, AdminAlertRouteRecord.severity)).all()
+    return [{"id": row.id, "provider": row.provider_key, "severity": row.severity,
+             "endpoint_url": row.endpoint_url, "enabled": row.enabled,
+             "created_by": row.created_by, "updated_by": row.updated_by,
+             "created_at": _timestamp(row.created_at), "updated_at": _timestamp(row.updated_at)}
+            for row in rows]
+
+
+@app.post("/admin/alert-routes")
+def create_admin_alert_route(body: AdminAlertRouteUpsert, session: Session = Depends(get_session),
+                             admin: Principal = Depends(require_admin)):
+    provider = body.provider.casefold()
+    if provider not in {"*", "quickbooks", "xero"}:
+        raise HTTPException(status_code=422, detail="Provider must be *, quickbooks, or xero")
+    parsed = urlsplit(body.endpoint_url)
+    local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if ((parsed.scheme != "https" and not local_http) or not parsed.hostname
+            or parsed.username or parsed.password or parsed.fragment):
+        raise HTTPException(status_code=422, detail="Webhook target must be an HTTPS URL (HTTP is allowed for localhost)")
+    existing = session.scalar(select(AdminAlertRouteRecord).where(
+        AdminAlertRouteRecord.provider_key == provider,
+        AdminAlertRouteRecord.severity == body.severity,
+    ))
+    if existing:
+        raise HTTPException(status_code=409, detail="A route already exists for this provider and severity")
+    now = datetime.now(timezone.utc)
+    row = AdminAlertRouteRecord(id=str(uuid4()), provider_key=provider, severity=body.severity,
+        endpoint_url=body.endpoint_url, enabled=body.enabled, created_by=admin.name,
+        updated_by=admin.name, created_at=now, updated_at=now)
+    session.add(row)
+    session.add(AccountingConnectionEventRecord(provider=provider, event_type="ADMIN_ALERT_ROUTE_CREATED",
+        actor=admin.name, details={"route_id": row.id, "severity": row.severity,
+                                   "enabled": row.enabled, "target_host": parsed.hostname}))
+    session.commit()
+    return {"id": row.id, "provider": row.provider_key, "severity": row.severity,
+            "endpoint_url": row.endpoint_url, "enabled": row.enabled}
+
+
+@app.put("/admin/alert-routes/{route_id}")
+def update_admin_alert_route(route_id: str, body: AdminAlertRouteUpsert,
+                             session: Session = Depends(get_session), admin: Principal = Depends(require_admin)):
+    row = session.get(AdminAlertRouteRecord, route_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alert route not found")
+    provider = body.provider.casefold()
+    parsed = urlsplit(body.endpoint_url)
+    local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if provider not in {"*", "quickbooks", "xero"} or ((parsed.scheme != "https" and not local_http)
+            or not parsed.hostname or parsed.username or parsed.password or parsed.fragment):
+        raise HTTPException(status_code=422, detail="Use a supported provider and HTTPS webhook target")
+    duplicate = session.scalar(select(AdminAlertRouteRecord).where(
+        AdminAlertRouteRecord.id != route_id, AdminAlertRouteRecord.provider_key == provider,
+        AdminAlertRouteRecord.severity == body.severity))
+    if duplicate:
+        raise HTTPException(status_code=409, detail="A route already exists for this provider and severity")
+    row.provider_key, row.severity = provider, body.severity
+    row.endpoint_url, row.enabled = body.endpoint_url, body.enabled
+    row.updated_by, row.updated_at = admin.name, datetime.now(timezone.utc)
+    session.add(AccountingConnectionEventRecord(provider=provider, event_type="ADMIN_ALERT_ROUTE_UPDATED",
+        actor=admin.name, details={"route_id": row.id, "severity": row.severity,
+                                   "enabled": row.enabled, "target_host": parsed.hostname}))
+    session.commit()
+    return {"id": row.id, "provider": row.provider_key, "severity": row.severity,
+            "endpoint_url": row.endpoint_url, "enabled": row.enabled}
+
+
+@app.delete("/admin/alert-routes/{route_id}")
+def delete_admin_alert_route(route_id: str, session: Session = Depends(get_session),
+                             admin: Principal = Depends(require_admin)):
+    row = session.get(AdminAlertRouteRecord, route_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Alert route not found")
+    session.add(AccountingConnectionEventRecord(provider=row.provider_key,
+        event_type="ADMIN_ALERT_ROUTE_DELETED", actor=admin.name,
+        details={"route_id": row.id, "severity": row.severity}))
+    session.delete(row)
+    session.commit()
+    return {"id": route_id, "deleted": True}
+
+
+@app.get("/admin/accounting-connections/audit-export-retention")
+def get_audit_export_retention(session: Session = Depends(get_session), admin: Principal = Depends(require_admin)):
+    row = current_retention(session)
+    session.commit()
+    return {"retention_days": row.retention_days, "updated_by": row.updated_by,
+            "updated_at": _timestamp(row.updated_at)}
+
+
+@app.put("/admin/accounting-connections/audit-export-retention")
+def update_audit_export_retention(body: AuditExportRetentionUpdate,
+                                  session: Session = Depends(get_session), admin: Principal = Depends(require_admin)):
+    row = current_retention(session)
+    row.retention_days = body.retention_days
+    row.updated_by, row.updated_at = admin.name, datetime.now(timezone.utc)
+    session.add(AccountingConnectionEventRecord(provider="all", event_type="ACCOUNTING_AUDIT_RETENTION_UPDATED",
+        actor=admin.name, details={"retention_days": row.retention_days}))
+    session.commit()
+    return {"retention_days": row.retention_days, "updated_by": row.updated_by,
+            "updated_at": _timestamp(row.updated_at)}
+
+
+@app.post("/admin/accounting-connections/audit-exports/cleanup")
+def cleanup_audit_exports(session: Session = Depends(get_session), admin: Principal = Depends(require_admin)):
+    summary = cleanup_expired_audit_exports(session, actor=admin.name)
+    session.commit()
+    return summary
+
+
+@app.get("/admin/accounting-connections/audit-exports/cleanup-history")
+def list_audit_export_cleanup_history(limit: int = Query(default=100, ge=1, le=1000),
+                                     session: Session = Depends(get_session), admin: Principal = Depends(require_admin)):
+    rows = session.scalars(select(AuditExportCleanupRecord).order_by(
+        AuditExportCleanupRecord.cleaned_at.desc()).limit(limit)).all()
+    return [{"id": row.id, "export_id": row.export_id, "cleaned_by": row.cleaned_by,
+        "cleaned_at": _timestamp(row.cleaned_at), "retention_days": row.retention_days,
+        "checksum_sha256": row.checksum_sha256, "bytes_removed": row.bytes_removed}
+        for row in rows]
 
 
 @app.get("/admin/accounting-connections/audit-export")
@@ -1164,8 +1309,9 @@ def export_accounting_audit(
                                 "ACCOUNTING_CONNECTION_HEALTH_CHECK_FAILED"}:
             add("CONNECTION_CHECK", str(event.id), event.created_at, event.provider, event.actor,
                 event.event_type, event.details.get("status"), event.details)
-        elif (event.event_type.startswith("ADMIN_ALERT_") or
-              event.event_type.startswith("ACCOUNTING_MASTER_DATA_SYNC_RECOVER")):
+        elif (event.event_type.startswith(("ADMIN_ALERT_", "ADMIN_ESCALATION_")) or
+              event.event_type.startswith("ACCOUNTING_MASTER_DATA_SYNC_RECOVER") or
+              event.event_type in {"ACCOUNTING_AUDIT_RETENTION_UPDATED", "ACCOUNTING_AUDIT_EXPORT_CLEANED"}):
             add("ALERT_EVENT", str(event.id), event.created_at, event.provider, event.actor,
                 event.event_type, None, event.details)
         elif event.event_type in {"ACCOUNTING_MASTER_DATA_SYNC_APPROVAL_REQUESTED",
@@ -1175,6 +1321,16 @@ def export_accounting_audit(
         elif event.event_type == "ACCOUNTING_AUDIT_EXPORTED":
             add("AUDIT_EXPORT_EVENT", str(event.id), event.created_at, event.provider, event.actor,
                 event.event_type, None, event.details)
+        elif event.event_type == "ACCOUNTING_AUDIT_EXPORT_VERIFIED":
+            add("AUDIT_EXPORT_VERIFICATION", str(event.id), event.created_at, event.provider,
+                event.actor, event.event_type, "VALID" if event.details.get("valid") else "INVALID",
+                event.details)
+        elif event.event_type == "ACCOUNTING_TREND_ALERT_SETTINGS_UPDATED":
+            add("TREND_ALERT_SETTINGS", str(event.id), event.created_at, event.provider,
+                event.actor, event.event_type, None, event.details)
+        elif event.event_type == "ACCOUNTING_TREND_ANOMALY_DETECTED":
+            add("TREND_ANOMALY", str(event.id), event.created_at, event.provider,
+                event.actor, event.event_type, "QUEUED", event.details)
 
     alerts = session.scalars(select(NotificationOutboxRecord).where(
         NotificationOutboxRecord.provider.is_not(None),
@@ -1189,7 +1345,9 @@ def export_accounting_audit(
                 "acknowledged_at": alert.acknowledged_at, "acknowledged_by": alert.acknowledged_by,
                 "snoozed_until": alert.snoozed_until, "snoozed_by": alert.snoozed_by,
                 "resolved_at": alert.resolved_at, "resolved_by_alert_id": alert.resolved_by_alert_id,
-                "resolves_alert_id": alert.resolves_alert_id, "escalated_at": alert.escalated_at})
+                "resolves_alert_id": alert.resolves_alert_id, "escalated_at": alert.escalated_at,
+                "escalation_acknowledged_at": alert.escalation_acknowledged_at,
+                "escalation_acknowledged_by": alert.escalation_acknowledged_by})
 
     provider_filter = provider.casefold().strip() if provider else None
     event_filter = event_type.casefold().strip() if event_type else None
@@ -1261,7 +1419,10 @@ def list_accounting_audit_exports(
         "generated_by": row.generated_by, "start_date": row.start_date, "end_date": row.end_date,
         "filters": {"provider": row.provider_filter, "event_type": row.event_type_filter,
                     "actor": row.actor_filter}, "row_count": row.row_count,
-        "checksum_sha256": row.checksum_sha256, "manifest_url":
+        "checksum_sha256": row.checksum_sha256,
+        "artifact_available": row.file_content is not None,
+        "content_deleted_at": _timestamp(row.content_deleted_at),
+        "content_deleted_by": row.content_deleted_by, "manifest_url":
             f"/admin/accounting-connections/audit-exports/{row.id}/manifest",
         "download_url": f"/admin/accounting-connections/audit-exports/{row.id}"}
         for row in exports]
@@ -1277,6 +1438,82 @@ def get_accounting_audit_export_manifest(
     return export_record.manifest
 
 
+@app.post("/admin/accounting-connections/audit-exports/{export_id}/verify")
+def verify_accounting_audit_export(
+    export_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    """Check a saved artifact against its manifest and persisted checksum record."""
+    export_record = session.get(AuditExportRecord, export_id)
+    if export_record is None:
+        raise HTTPException(status_code=404, detail="Audit export not found")
+    content = bytes(export_record.file_content or b"")
+    manifest = export_record.manifest or {}
+    actual_sha256 = None
+    prefix_valid = False
+    embedded_manifest_valid = False
+    row_count_valid = False
+    try:
+        if export_record.file_content is None:
+            raise ValueError("Export file content was removed by retention cleanup")
+        data_bytes = int(manifest.get("data_bytes", -1))
+        if 0 <= data_bytes <= len(content):
+            actual_sha256 = hashlib.sha256(content[:data_bytes]).hexdigest()
+            prefix_valid = actual_sha256 == export_record.checksum_sha256
+        csv_rows = list(csv.DictReader(io.StringIO(content.decode("utf-8"))))
+        manifest_rows = [row for row in csv_rows if row.get("record_type") == "EXPORT_MANIFEST"]
+        if manifest_rows:
+            embedded = json.loads(manifest_rows[-1].get("details") or "{}")
+            embedded_manifest_valid = embedded == manifest
+        data_rows = [row for row in csv_rows if row.get("record_type") != "EXPORT_MANIFEST"]
+        row_count_valid = len(data_rows) == export_record.row_count == manifest.get("row_count")
+    except (UnicodeDecodeError, csv.Error, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    record_fields_valid = (
+        manifest.get("export_id") == export_record.id
+        and manifest.get("generated_by") == export_record.generated_by
+        and manifest.get("date_range") == {"start_date": export_record.start_date,
+                                             "end_date": export_record.end_date}
+        and manifest.get("filters") == {"provider": export_record.provider_filter,
+            "event_type": export_record.event_type_filter, "actor": export_record.actor_filter}
+        and manifest.get("checksum_sha256") == export_record.checksum_sha256
+    )
+    checks = {"artifact_retained": export_record.file_content is not None,
+        "stored_sha256_matches_manifest": manifest.get("checksum_sha256") == export_record.checksum_sha256,
+        "data_prefix_checksum_valid": prefix_valid,
+        "embedded_manifest_matches_record": embedded_manifest_valid,
+        "record_metadata_matches_manifest": record_fields_valid,
+        "row_count_matches": row_count_valid}
+    valid = all(checks.values())
+    verified_at = datetime.now(timezone.utc)
+    verification = AuditExportVerificationRecord(id=str(uuid4()), export_id=export_record.id,
+        verified_by=admin.name, verified_at=verified_at, valid=valid, checks=checks)
+    session.add(verification)
+    session.add(AccountingConnectionEventRecord(provider=export_record.provider_filter or "all",
+        event_type="ACCOUNTING_AUDIT_EXPORT_VERIFIED", actor=admin.name,
+        details={"export_id": export_record.id, "verification_id": verification.id,
+                 "valid": valid, "checks": checks, "verified_at": verified_at.isoformat()}))
+    session.commit()
+    return {"export_id": export_record.id, "verification_id": verification.id,
+        "valid": valid, "verified_by": admin.name, "verified_at": _timestamp(verified_at),
+        "stored_checksum_sha256": export_record.checksum_sha256,
+        "actual_checksum_sha256": actual_sha256, "checks": checks}
+
+
+@app.get("/admin/accounting-connections/audit-exports/{export_id}/verifications")
+def list_accounting_audit_export_verifications(
+    export_id: str, limit: int = Query(default=50, ge=1, le=500),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    if session.get(AuditExportRecord, export_id) is None:
+        raise HTTPException(status_code=404, detail="Audit export not found")
+    rows = session.scalars(select(AuditExportVerificationRecord).where(
+        AuditExportVerificationRecord.export_id == export_id
+    ).order_by(AuditExportVerificationRecord.verified_at.desc()).limit(limit)).all()
+    return [{"id": row.id, "verified_by": row.verified_by,
+        "verified_at": _timestamp(row.verified_at), "valid": row.valid, "checks": row.checks}
+        for row in rows]
+
+
 @app.get("/admin/accounting-connections/audit-exports/{export_id}")
 def download_accounting_audit_export(
     export_id: str, session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
@@ -1284,6 +1521,12 @@ def download_accounting_audit_export(
     export_record = session.get(AuditExportRecord, export_id)
     if export_record is None:
         raise HTTPException(status_code=404, detail="Audit export not found")
+    if export_record.file_content is None:
+        raise HTTPException(status_code=410, detail={"message": "Audit export file expired and was removed",
+            "content_deleted_at": _timestamp(export_record.content_deleted_at),
+            "content_deleted_by": export_record.content_deleted_by,
+            "checksum_sha256": export_record.checksum_sha256,
+            "manifest_url": f"/admin/accounting-connections/audit-exports/{export_record.id}/manifest"})
     filename = f"invoice-match-audit-{export_record.start_date}-to-{export_record.end_date}.csv"
     return Response(content=export_record.file_content, media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"',
@@ -1318,6 +1561,18 @@ def accounting_admin_trends(
             day -= timedelta(days=day.weekday())
         return day.isoformat()
 
+    def trend_detail_url(kind: str, provider_name: str, period: str | None = None,
+                         **extra: str) -> str:
+        detail_start, detail_end = start_date, end_date
+        if period:
+            period_start = date.fromisoformat(period)
+            period_end = period_start + timedelta(days=6 if bucket == "week" else 0)
+            detail_start = max(start_date, period_start)
+            detail_end = min(end_date, period_end)
+        params = {"kind": kind, "provider": provider_name,
+            "start_date": detail_start.isoformat(), "end_date": detail_end.isoformat(), **extra}
+        return f"/admin/accounting-connections/trends/drilldown?{urlencode(params)}"
+
     runs = session.scalars(select(MasterDataSyncRunRecord).where(
         MasterDataSyncRunRecord.started_at >= start_at,
         MasterDataSyncRunRecord.started_at < end_before,
@@ -1338,7 +1593,8 @@ def accounting_admin_trends(
             error = (run.error or "Unspecified provider error").strip()[:250]
             failure = recurring.setdefault((run.provider, error), {"provider": run.provider,
                 "error": error, "count": 0, "first_seen": _timestamp(run.started_at),
-                "last_seen": _timestamp(run.started_at)})
+                "last_seen": _timestamp(run.started_at),
+                "drilldown_url": trend_detail_url("failures", run.provider, error=error)})
             failure["count"] += 1
             failure["last_seen"] = _timestamp(run.started_at)
         else:
@@ -1349,10 +1605,12 @@ def accounting_admin_trends(
         sync_series.append({"period": period, "provider": provider_name, **counts,
             "success_rate_percent": round(counts["succeeded"] /
                 (counts["succeeded"] + counts["failed"]) * 100, 2)
-                if counts["succeeded"] + counts["failed"] else None})
+                if counts["succeeded"] + counts["failed"] else None,
+            "drilldown_url": trend_detail_url("syncs", provider_name, period)})
 
     alert_types = ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE",
-                   "MASTER_DATA_SYNC_RECOVERED", "MASTER_DATA_SYNC_ESCALATED")
+                   "MASTER_DATA_SYNC_RECOVERED", "MASTER_DATA_SYNC_ESCALATED",
+                   "MASTER_DATA_TREND_ANOMALY")
     alerts = session.scalars(select(NotificationOutboxRecord).where(
         NotificationOutboxRecord.provider.is_not(None),
         NotificationOutboxRecord.event_type.in_(alert_types),
@@ -1384,7 +1642,8 @@ def accounting_admin_trends(
             "avg_ack_minutes": round(sum(ack_values) / len(ack_values), 2) if ack_values else None,
             "median_ack_minutes": round(median(ack_values), 2) if ack_values else None,
             "avg_resolution_minutes": round(sum(resolution_values) / len(resolution_values), 2)
-                if resolution_values else None})
+                if resolution_values else None,
+            "drilldown_url": trend_detail_url("alerts", provider_name, period)})
 
     revisions = session.scalars(select(AccountingMappingChangeRecord).where(
         AccountingMappingChangeRecord.created_at >= start_at,
@@ -1404,8 +1663,62 @@ def accounting_admin_trends(
         "sync_series": sync_series,
         "recurring_failures": sorted(recurring.values(), key=lambda item: (-item["count"], item["provider"], item["error"])),
         "alert_response_series": alert_response_series,
-        "mapping_series": [{"period": period, "provider": provider_name, **stats}
+        "mapping_series": [{"period": period, "provider": provider_name, **stats,
+            "drilldown_url": trend_detail_url("mappings", provider_name, period)}
             for (period, provider_name), stats in sorted(mapping_counts.items())]}
+
+
+@app.get("/admin/accounting-connections/trends/drilldown")
+def accounting_admin_trend_drilldown(
+    kind: str = Query(pattern="^(syncs|failures|alerts|mappings)$"),
+    provider: str = Query(min_length=1, max_length=24),
+    start_date: date = Query(), end_date: date = Query(),
+    error: str | None = Query(default=None, max_length=250),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    """Return the provider records behind a row in the trends summary."""
+    if end_date < start_date or (end_date - start_date).days > 366:
+        raise HTTPException(status_code=422, detail="Choose an ordered date range no longer than 367 days")
+    provider = provider.casefold()
+    start_at = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+    end_before = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    if kind in {"syncs", "failures"}:
+        query = select(MasterDataSyncRunRecord).where(
+            MasterDataSyncRunRecord.provider == provider,
+            MasterDataSyncRunRecord.started_at >= start_at,
+            MasterDataSyncRunRecord.started_at < end_before)
+        if kind == "failures":
+            query = query.where(MasterDataSyncRunRecord.status == "FAILED")
+            if error:
+                query = query.where(MasterDataSyncRunRecord.error == error)
+        rows = session.scalars(query.order_by(MasterDataSyncRunRecord.started_at.desc()).limit(limit)).all()
+        items = [master_data_sync_run_result(row) for row in rows]
+    elif kind == "alerts":
+        rows = session.scalars(select(NotificationOutboxRecord).where(
+            NotificationOutboxRecord.provider == provider,
+            NotificationOutboxRecord.event_type.in_(
+                ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED",
+                 "MASTER_DATA_SYNC_ESCALATED", "MASTER_DATA_TREND_ANOMALY")),
+            NotificationOutboxRecord.created_at >= start_at,
+            NotificationOutboxRecord.created_at < end_before,
+        ).order_by(NotificationOutboxRecord.created_at.desc()).limit(limit)).all()
+        items = [{"id": row.id, "event_type": row.event_type, "payload": row.payload,
+            "delivery_state": row.state, "created_at": _timestamp(row.created_at),
+            "acknowledged_at": _timestamp(row.acknowledged_at),
+            "acknowledged_by": row.acknowledged_by, "resolved_at": _timestamp(row.resolved_at),
+            "snoozed_until": _timestamp(row.snoozed_until), "escalated_at": _timestamp(row.escalated_at)}
+            for row in rows]
+    else:
+        rows = session.scalars(select(AccountingMappingChangeRecord).where(
+            AccountingMappingChangeRecord.provider == provider,
+            AccountingMappingChangeRecord.created_at >= start_at,
+            AccountingMappingChangeRecord.created_at < end_before,
+        ).order_by(AccountingMappingChangeRecord.created_at.desc()).limit(limit)).all()
+        items = [mapping_change_result(row) for row in rows]
+    return {"kind": kind, "provider": provider,
+        "date_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
+        "count": len(items), "items": items}
 
 
 @app.post("/notifications/outbox/{notification_id}/retry", response_model=NotificationOutboxItem)
@@ -2351,6 +2664,13 @@ def accounting_master_sync_status(
             "max_diff_records": schedule.max_diff_records,
             "alert_escalation_enabled": schedule.alert_escalation_enabled,
             "alert_escalation_minutes": schedule.alert_escalation_minutes,
+            "trend_alerts_enabled": schedule.trend_alerts_enabled,
+            "trend_window_hours": schedule.trend_window_hours,
+            "sync_failure_threshold": schedule.sync_failure_threshold,
+            "alert_response_threshold_minutes": schedule.alert_response_threshold_minutes,
+            "alert_response_min_samples": schedule.alert_response_min_samples,
+            "mapping_change_threshold": schedule.mapping_change_threshold,
+            "trend_alert_cooldown_minutes": schedule.trend_alert_cooldown_minutes,
             "last_connection_check_at": _timestamp(schedule.last_connection_check_at),
             "next_connection_check_at": _timestamp(schedule.next_connection_check_at),
             "sync_status": _master_sync_status(schedule, now),
@@ -2415,6 +2735,40 @@ def update_accounting_master_sync_schedule(
             "alert_escalation_enabled": schedule.alert_escalation_enabled,
             "alert_escalation_minutes": schedule.alert_escalation_minutes,
             "next_run_at": _timestamp(schedule.next_run_at)}
+
+
+@app.put("/admin/accounting-connections/{provider}/trend-alert-settings")
+def update_accounting_trend_alert_settings(
+    provider: str, body: MasterDataTrendAlertSettingsUpdate,
+    session: Session = Depends(get_session), admin: Principal = Depends(require_admin),
+):
+    provider = provider.casefold()
+    connection = session.scalar(select(AccountingConnectionRecord).where(
+        AccountingConnectionRecord.provider == provider))
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Accounting connection not found")
+    schedule = session.scalar(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.provider == provider))
+    if schedule is None:
+        schedule = MasterDataSyncScheduleRecord(id=str(uuid4()), provider=provider)
+        session.add(schedule)
+    schedule.trend_alerts_enabled = body.enabled
+    schedule.trend_window_hours = body.window_hours
+    schedule.sync_failure_threshold = body.sync_failure_threshold
+    schedule.alert_response_threshold_minutes = body.alert_response_threshold_minutes
+    schedule.alert_response_min_samples = body.alert_response_min_samples
+    schedule.mapping_change_threshold = body.mapping_change_threshold
+    schedule.trend_alert_cooldown_minutes = body.cooldown_minutes
+    settings = {"enabled": body.enabled, "window_hours": body.window_hours,
+        "sync_failure_threshold": body.sync_failure_threshold,
+        "alert_response_threshold_minutes": body.alert_response_threshold_minutes,
+        "alert_response_min_samples": body.alert_response_min_samples,
+        "mapping_change_threshold": body.mapping_change_threshold,
+        "cooldown_minutes": body.cooldown_minutes}
+    session.add(AccountingConnectionEventRecord(provider=provider,
+        event_type="ACCOUNTING_TREND_ALERT_SETTINGS_UPDATED", actor=admin.name, details=settings))
+    session.commit()
+    return {"provider": provider, **settings}
 
 
 @app.post("/admin/accounting-connections/{provider}/test-connection")

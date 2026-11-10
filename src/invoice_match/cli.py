@@ -242,6 +242,7 @@ def deliver(
     from .database import SessionLocal
     from .delivery import deliver_pending
     from .credit_sync import sync_credit_applications
+    from .audit_export_retention import cleanup_expired_audit_exports
     from .accounting_status import refresh_due_accounting_statuses
 
     try:
@@ -334,7 +335,7 @@ def worker(
     from .adapters.factory import create_adapter_for_company
     from sqlalchemy import select
     from datetime import datetime, timezone
-    from .database import SessionLocal, WorkerHeartbeatRecord
+    from .database import SessionLocal, WorkerHeartbeatRecord, AdminAlertRouteRecord
     from .delivery import deliver_pending
     from .integration_auth import configured_company_ids
     from .notification_delivery import (
@@ -355,12 +356,10 @@ def worker(
     notification_max = int(os.getenv("NOTIFICATION_RETRY_MAX_SECONDS", "3600"))
     worker_name = os.getenv("DELIVERY_WORKER_NAME", "invoice-match-worker")
     notification_endpoint = os.getenv("NOTIFICATION_WEBHOOK_URL")
-    notification_adapter = None
-    if notification_endpoint:
-        notification_adapter = WebhookNotificationAdapter(
-            notification_endpoint, token=os.getenv("NOTIFICATION_WEBHOOK_TOKEN"),
-            secret=os.getenv("NOTIFICATION_WEBHOOK_SECRET"),
-        )
+    notification_adapter = WebhookNotificationAdapter(
+        notification_endpoint, token=os.getenv("NOTIFICATION_WEBHOOK_TOKEN"),
+        secret=os.getenv("NOTIFICATION_WEBHOOK_SECRET"),
+    )
     companies = configured_company_ids()
     while True:
         cycle = []
@@ -390,8 +389,11 @@ def worker(
                     session, provider, limit=limit, max_attempts=ap_attempts,
                     initial_retry_seconds=ap_initial, max_retry_seconds=ap_max,
                 )
+                export_cleanup = cleanup_expired_audit_exports(session, actor=f"{worker_name}:retention")
                 notifications = {"delivered": 0, "failed": 0, "dead_lettered": 0}
-                if notification_adapter:
+                has_alert_routes = bool(session.scalar(select(AdminAlertRouteRecord.id).where(
+                    AdminAlertRouteRecord.enabled.is_(True)).limit(1)))
+                if notification_endpoint or has_alert_routes:
                     escalated = escalate_overdue(
                         session, actor=os.getenv("NOTIFICATION_WORKER_NAME", "worker")
                     )
@@ -402,6 +404,7 @@ def worker(
                         max_attempts=notification_attempts,
                         initial_retry_seconds=notification_initial,
                         max_retry_seconds=notification_max,
+                        routed_only=not bool(notification_endpoint),
                     )
                     notifications["escalated"] = len(escalated)
                     notifications["reminders_queued"] = len(reminders)
@@ -428,6 +431,7 @@ def worker(
                               "master_data_syncs": master_data_syncs,
                               "connection_checks": connection_checks,
                               "credit_applications": credit_applications, "notifications": notifications,
+                              "audit_export_cleanup": export_cleanup,
                               "health": "DEGRADED" if failures else "HEALTHY"})
         typer.echo(json.dumps({"companies": cycle}, indent=2))
         if once:

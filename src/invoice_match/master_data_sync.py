@@ -3,15 +3,17 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import (
     AccountingConnectionEventRecord,
     AccountingConnectionHealthRecord,
     AccountingConnectionRecord,
+    AccountingMappingChangeRecord,
     MasterDataSyncRunRecord,
     MasterDataSyncScheduleRecord,
     NotificationOutboxRecord,
@@ -182,7 +184,8 @@ def sync_due_master_data(session: Session, *, company_id: str, adapter_factory, 
             summary["failed"] += 1
     queued = queue_stale_master_data_alerts(session)
     escalated = escalate_unacknowledged_master_data_alerts(session)
-    if queued or escalated:
+    trend_alerts = evaluate_accounting_trend_alerts(session)
+    if queued or escalated or trend_alerts:
         session.commit()
     return summary
 
@@ -290,7 +293,8 @@ def escalate_unacknowledged_master_data_alerts(session: Session) -> int:
     alerts = session.scalars(select(NotificationOutboxRecord).where(
         NotificationOutboxRecord.provider.is_not(None),
         NotificationOutboxRecord.event_type.in_(
-            ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED")),
+            ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED",
+             "MASTER_DATA_TREND_ANOMALY")),
         NotificationOutboxRecord.acknowledged_at.is_(None),
         NotificationOutboxRecord.resolved_at.is_(None),
         NotificationOutboxRecord.escalated_at.is_(None),
@@ -325,3 +329,99 @@ def escalate_unacknowledged_master_data_alerts(session: Session) -> int:
                      "event_type": alert.event_type, "escalated_at": now.isoformat()}))
         count += 1
     return count
+
+
+def evaluate_accounting_trend_alerts(session: Session) -> int:
+    """Detect configured provider trend anomalies and queue deduplicated webhooks."""
+    now = datetime.now(timezone.utc)
+    schedules = session.scalars(select(MasterDataSyncScheduleRecord).where(
+        MasterDataSyncScheduleRecord.trend_alerts_enabled.is_(True))).all()
+    queued = 0
+    for schedule in schedules:
+        cutoff = now - timedelta(hours=schedule.trend_window_hours)
+        failed_count = session.scalar(select(func.count()).select_from(MasterDataSyncRunRecord).where(
+            MasterDataSyncRunRecord.provider == schedule.provider,
+            MasterDataSyncRunRecord.status == "FAILED",
+            MasterDataSyncRunRecord.started_at >= cutoff,
+            MasterDataSyncRunRecord.started_at < now,
+        )) or 0
+        mapping_count = session.scalar(select(func.count()).select_from(AccountingMappingChangeRecord).where(
+            AccountingMappingChangeRecord.provider == schedule.provider,
+            AccountingMappingChangeRecord.created_at >= cutoff,
+            AccountingMappingChangeRecord.created_at < now,
+        )) or 0
+        alert_rows = session.scalars(select(NotificationOutboxRecord).where(
+            NotificationOutboxRecord.provider == schedule.provider,
+            NotificationOutboxRecord.event_type.in_(
+                ("MASTER_DATA_SYNC_FAILED", "MASTER_DATA_SYNC_STALE", "MASTER_DATA_SYNC_RECOVERED")),
+            NotificationOutboxRecord.acknowledged_at.is_not(None),
+            NotificationOutboxRecord.created_at >= cutoff,
+            NotificationOutboxRecord.created_at < now,
+        )).all()
+        response_minutes = []
+        for alert in alert_rows:
+            created_at, acknowledged_at = alert.created_at, alert.acknowledged_at
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if acknowledged_at.tzinfo is None:
+                acknowledged_at = acknowledged_at.replace(tzinfo=timezone.utc)
+            response_minutes.append(max(0, (acknowledged_at - created_at).total_seconds() / 60))
+        average_response = (sum(response_minutes) / len(response_minutes)
+                            if response_minutes else None)
+        anomalies = []
+        if failed_count >= schedule.sync_failure_threshold:
+            anomalies.append(("RISING_SYNC_FAILURES", {
+                "observed_failures": failed_count, "threshold": schedule.sync_failure_threshold}))
+        if (len(response_minutes) >= schedule.alert_response_min_samples and average_response is not None
+                and average_response >= schedule.alert_response_threshold_minutes):
+            anomalies.append(("SLOW_ALERT_RESPONSES", {
+                "average_ack_minutes": round(average_response, 2),
+                "samples": len(response_minutes),
+                "threshold_minutes": schedule.alert_response_threshold_minutes}))
+        if mapping_count >= schedule.mapping_change_threshold:
+            anomalies.append(("SUDDEN_MAPPING_CHANGES", {
+                "observed_changes": mapping_count, "threshold": schedule.mapping_change_threshold}))
+
+        for anomaly_type, metric in anomalies:
+            cooldown_seconds = schedule.trend_alert_cooldown_minutes * 60
+            bucket = int(now.timestamp()) // cooldown_seconds
+            start_date = cutoff.date().isoformat()
+            end_date = now.date().isoformat()
+            admin_base = os.getenv("INVOICE_MATCH_ADMIN_URL", "/reviewer/operations").rstrip("/")
+            parsed = urlsplit(admin_base)
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query.update({"provider": schedule.provider, "view": "trends",
+                "start_date": start_date, "end_date": end_date,
+                "trend_type": anomaly_type})
+            trend_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                urlencode(query), parsed.fragment))
+            payload = {"event_type": "MASTER_DATA_TREND_ANOMALY", "provider": schedule.provider,
+                "anomaly_type": anomaly_type,
+                "message": _trend_anomaly_message(anomaly_type, metric, schedule.trend_window_hours),
+                "metric": metric, "window_hours": schedule.trend_window_hours,
+                "admin_url": trend_url, "trend_url": trend_url,
+                "occurred_at": now.isoformat()}
+            notification = queue_system_notification(session, provider=schedule.provider,
+                kind="MASTER_DATA_TREND_ANOMALY",
+                dedupe_key=f"MASTER_DATA_TREND_ANOMALY:{schedule.provider}:{anomaly_type}:{bucket}",
+                payload=payload)
+            if notification is None:
+                continue
+            session.add(AccountingConnectionEventRecord(provider=schedule.provider,
+                event_type="ACCOUNTING_TREND_ANOMALY_DETECTED", actor="system",
+                details={"notification_id": notification.id, "anomaly_type": anomaly_type,
+                    "metric": metric, "window_hours": schedule.trend_window_hours,
+                    "trend_url": trend_url, "detected_at": now.isoformat()}))
+            queued += 1
+    return queued
+
+
+def _trend_anomaly_message(anomaly_type: str, metric: dict, window_hours: int) -> str:
+    if anomaly_type == "RISING_SYNC_FAILURES":
+        return (f"Provider sync failures reached {metric['observed_failures']} in the last "
+                f"{window_hours} hours (threshold {metric['threshold']}).")
+    if anomaly_type == "SLOW_ALERT_RESPONSES":
+        return (f"Average provider-alert acknowledgement time reached {metric['average_ack_minutes']} "
+                f"minutes across {metric['samples']} alerts (threshold {metric['threshold_minutes']} minutes).")
+    return (f"Provider mapping changed {metric['observed_changes']} times in the last "
+            f"{window_hours} hours (threshold {metric['threshold']}).")

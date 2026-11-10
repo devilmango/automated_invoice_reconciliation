@@ -437,6 +437,114 @@ def test_admin_can_acknowledge_and_snooze_provider_alerts(client, admin_headers,
         headers={"Authorization": "Bearer test-reviewer-secret-token-for-unit-tests-0001"}).status_code == 403
 
 
+def test_acknowledging_escalation_marks_original_alert(client, admin_headers):
+    with SessionLocal() as session:
+        session.add_all([
+            NotificationOutboxRecord(id="source-failure", provider="quickbooks", match_id=None,
+                dedupe_key="source-failure", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+                payload={"message": "sync failed"}, state="DELIVERED", attempt_count=1),
+            NotificationOutboxRecord(id="escalation-notice", provider="quickbooks", match_id=None,
+                dedupe_key="escalation-notice", event_type="MASTER_DATA_SYNC_ESCALATED", channel="webhook",
+                payload={"source_alert_id": "source-failure"}, state="DELIVERED", attempt_count=1),
+        ])
+        session.commit()
+    response = client.post("/admin/alerts/escalation-notice/acknowledge", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["source_alert_id"] == "source-failure"
+    source = next(item for item in client.get("/admin/alerts?state=ALL", headers=admin_headers).json()
+                  if item["id"] == "source-failure")
+    assert source["escalation_acknowledged_by"] == "cfo"
+    assert source["escalation_acknowledged_at"]
+
+
+def test_audit_export_retention_removes_only_file_and_records_cleanup(client, admin_headers):
+    import hashlib
+    from invoice_match.database import AuditExportRecord
+
+    generated = datetime.now(timezone.utc) - timedelta(days=3)
+    content = b"csv evidence bytes"
+    checksum = hashlib.sha256(content).hexdigest()
+    manifest = {"export_id": "expired-export", "generated_by": "cfo",
+        "date_range": {"start_date": "2026-01-01", "end_date": "2026-01-02"},
+        "filters": {"provider": None, "event_type": None, "actor": None},
+        "checksum_sha256": checksum}
+    with SessionLocal() as session:
+        session.add(AuditExportRecord(id="expired-export", generated_by="cfo", start_date="2026-01-01",
+            end_date="2026-01-02", checksum_sha256=checksum, row_count=0, manifest=manifest,
+            file_content=content, created_at=generated))
+        session.commit()
+    assert client.put("/admin/accounting-connections/audit-export-retention", headers=admin_headers,
+                      json={"retention_days": 1}).status_code == 200
+    cleanup = client.post("/admin/accounting-connections/audit-exports/cleanup", headers=admin_headers)
+    assert cleanup.status_code == 200
+    assert cleanup.json()["cleaned_count"] == 1
+    record = client.get("/admin/accounting-connections/audit-exports", headers=admin_headers).json()[0]
+    assert record["artifact_available"] is False
+    assert record["checksum_sha256"] == checksum
+    assert client.get("/admin/accounting-connections/audit-exports/expired-export", headers=admin_headers).status_code == 410
+    retained_manifest = client.get("/admin/accounting-connections/audit-exports/expired-export/manifest",
+                                   headers=admin_headers)
+    assert retained_manifest.status_code == 200
+    history = client.get("/admin/accounting-connections/audit-exports/cleanup-history", headers=admin_headers).json()
+    assert history[0]["export_id"] == "expired-export"
+    assert history[0]["bytes_removed"] == len(content)
+
+
+def test_alert_routes_select_provider_and_severity_specific_target(client, admin_headers):
+    from invoice_match.database import AdminAlertRouteRecord
+    from invoice_match.notification_delivery import WebhookNotificationAdapter, deliver_pending_notifications
+
+    with SessionLocal() as session:
+        session.add_all([
+            AdminAlertRouteRecord(id="global-warning", provider_key="*", severity="WARNING",
+                endpoint_url="https://hooks.example.com/warnings", enabled=True,
+                created_by="cfo", updated_by="cfo"),
+            AdminAlertRouteRecord(id="qb-critical", provider_key="quickbooks", severity="CRITICAL",
+                endpoint_url="https://hooks.example.com/qb-critical", enabled=True,
+                created_by="cfo", updated_by="cfo"),
+            NotificationOutboxRecord(id="routed-failure", provider="quickbooks", match_id=None,
+                dedupe_key="routed-failure", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+                payload={"message": "failed"}, state="PENDING", attempt_count=0),
+        ])
+        session.commit()
+
+        class CaptureAdapter(WebhookNotificationAdapter):
+            def __init__(self):
+                super().__init__("https://hooks.example.com/default")
+                self.target = None
+
+            def deliver(self, payload, *, idempotency_key, endpoint=None):
+                self.target = endpoint or self.endpoint
+                return "captured"
+
+        adapter = CaptureAdapter()
+        summary = deliver_pending_notifications(session, adapter, limit=1)
+        assert adapter.target == "https://hooks.example.com/qb-critical"
+        assert summary["items"][0]["route_id"] == "qb-critical"
+
+    created = client.post("/admin/alert-routes", headers=admin_headers, json={
+        "provider": "xero", "severity": "CRITICAL", "endpoint_url": "https://hooks.example.com/xero",
+        "enabled": True})
+    assert created.status_code == 200
+    assert client.post("/admin/alert-routes", headers=admin_headers, json={
+        "provider": "xero", "severity": "CRITICAL", "endpoint_url": "https://hooks.example.com/other",
+        "enabled": True}).status_code == 409
+
+
+def test_routed_only_delivery_leaves_non_alert_notifications_pending():
+    from invoice_match.notification_delivery import WebhookNotificationAdapter, deliver_pending_notifications
+
+    with SessionLocal() as session:
+        session.add(NotificationOutboxRecord(id="unrouted-reviewer-notice", provider=None, match_id=None,
+            dedupe_key="unrouted-reviewer-notice", event_type="APPROVAL_DUE_SOON", channel="webhook",
+            payload={}, state="PENDING", attempt_count=0))
+        session.commit()
+        adapter = WebhookNotificationAdapter(None)
+        summary = deliver_pending_notifications(session, adapter, routed_only=True)
+        assert summary["items"] == []
+        assert session.get(NotificationOutboxRecord, "unrouted-reviewer-notice").state == "PENDING"
+
+
 def test_admin_audit_export_includes_sync_mapping_connection_and_alert_records(
     client, admin_headers, monkeypatch,
 ):
@@ -517,6 +625,24 @@ def test_audit_export_filters_manifest_checksum_and_saved_download(client, admin
     downloaded = client.get(saved["download_url"], headers=admin_headers)
     assert downloaded.content == response.content
     assert downloaded.headers["x-audit-export-sha256"] == checksum
+    verified = client.post(f"/admin/accounting-connections/audit-exports/{export_id}/verify",
+                           headers=admin_headers)
+    assert verified.status_code == 200
+    assert verified.json()["valid"] is True
+    assert verified.json()["checks"]["embedded_manifest_matches_record"] is True
+    from invoice_match.database import AuditExportRecord
+    with SessionLocal() as session:
+        saved_export = session.get(AuditExportRecord, export_id)
+        saved_export.file_content = saved_export.file_content.replace(b"filtered-export-run", b"changed-export-run")
+        session.commit()
+    tampered = client.post(f"/admin/accounting-connections/audit-exports/{export_id}/verify",
+                           headers=admin_headers)
+    assert tampered.status_code == 200
+    assert tampered.json()["valid"] is False
+    assert tampered.json()["checks"]["data_prefix_checksum_valid"] is False
+    verification_history = client.get(
+        f"/admin/accounting-connections/audit-exports/{export_id}/verifications", headers=admin_headers)
+    assert [item["valid"] for item in verification_history.json()] == [False, True]
 
 
 def test_accounting_trends_summarize_sync_failure_alert_response_and_mapping_activity(
@@ -558,6 +684,72 @@ def test_accounting_trends_summarize_sync_failure_alert_response_and_mapping_act
     assert trends["alert_response_series"][0]["avg_resolution_minutes"] == 50
     assert trends["mapping_series"][0]["count"] == 1
     assert trends["mapping_series"][0]["by_category"] == {"supplier": 1}
+    sync_details = client.get(trends["sync_series"][0]["drilldown_url"], headers=admin_headers)
+    failure_details = client.get(trends["recurring_failures"][0]["drilldown_url"], headers=admin_headers)
+    alert_details = client.get(trends["alert_response_series"][0]["drilldown_url"], headers=admin_headers)
+    mapping_details = client.get(trends["mapping_series"][0]["drilldown_url"], headers=admin_headers)
+    assert sync_details.json()["count"] == 3
+    assert failure_details.json()["count"] == 2
+    assert alert_details.json()["items"][0]["id"] == "trend-alert"
+    assert mapping_details.json()["items"][0]["id"] == "trend-map"
+
+
+def test_configured_trend_anomalies_queue_linked_deduplicated_webhooks(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    from invoice_match.database import AccountingMappingChangeRecord, MasterDataSyncScheduleRecord
+    from invoice_match.master_data_sync import evaluate_accounting_trend_alerts
+
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        session.add(MasterDataSyncScheduleRecord(id="trend-alert-schedule", provider="quickbooks",
+            enabled=False, interval_minutes=1440, stale_after_minutes=2880,
+            trend_alerts_enabled=True, trend_window_hours=24, sync_failure_threshold=2,
+            alert_response_threshold_minutes=10, alert_response_min_samples=1,
+            mapping_change_threshold=1, trend_alert_cooldown_minutes=60))
+        for run_id in ("anomaly-failure-1", "anomaly-failure-2"):
+            session.add(MasterDataSyncRunRecord(id=run_id, provider="quickbooks",
+                trigger_type="SCHEDULED", actor="worker", status="FAILED", counts={}, changes={},
+                details={}, error="provider timeout", started_at=now, finished_at=now))
+        session.add(NotificationOutboxRecord(id="slow-alert", provider="quickbooks", match_id=None,
+            dedupe_key="slow-alert-once", event_type="MASTER_DATA_SYNC_FAILED", channel="webhook",
+            payload={"message": "failure"}, state="DELIVERED", attempt_count=1,
+            created_at=now - timedelta(minutes=30), acknowledged_at=now - timedelta(minutes=5)))
+        session.add(AccountingMappingChangeRecord(id="anomaly-map", provider="quickbooks",
+            category="supplier", source_label="ABC", previous_source_id=None,
+            previous_source_label=None, new_source_id="vendor-1", new_source_label="ABC",
+            change_type="ACCEPTED", actor="cfo", created_at=now))
+        session.commit()
+        assert evaluate_accounting_trend_alerts(session) == 3
+        session.commit()
+        assert evaluate_accounting_trend_alerts(session) == 0
+        session.commit()
+        alerts = session.query(NotificationOutboxRecord).filter_by(
+            event_type="MASTER_DATA_TREND_ANOMALY").all()
+        assert {item.payload["anomaly_type"] for item in alerts} == {
+            "RISING_SYNC_FAILURES", "SLOW_ALERT_RESPONSES", "SUDDEN_MAPPING_CHANGES"}
+        assert all("trend_url" in item.payload and "provider=quickbooks" in item.payload["trend_url"]
+                   for item in alerts)
+
+    response = client.get("/admin/alerts?state=ALL", headers=admin_headers)
+    assert response.status_code == 200
+    assert sum(item["event_type"] == "MASTER_DATA_TREND_ANOMALY" for item in response.json()) == 3
+
+
+def test_admin_can_configure_provider_trend_alert_thresholds(client, admin_headers, monkeypatch):
+    seed_admin_data(monkeypatch)
+    settings = {"enabled": True, "window_hours": 12, "sync_failure_threshold": 4,
+        "alert_response_threshold_minutes": 45, "alert_response_min_samples": 2,
+        "mapping_change_threshold": 8, "cooldown_minutes": 180}
+    response = client.put("/admin/accounting-connections/quickbooks/trend-alert-settings",
+                          headers=admin_headers, json=settings)
+    assert response.status_code == 200
+    assert response.json()["enabled"] is True
+    assert response.json()["sync_failure_threshold"] == 4
+    status = client.get("/admin/accounting-connections/sync-status", headers=admin_headers)
+    provider_status = next(row for row in status.json() if row["provider"] == "quickbooks")
+    assert provider_status["trend_alerts_enabled"] is True
+    assert provider_status["trend_window_hours"] == 12
+    assert provider_status["alert_response_threshold_minutes"] == 45
 
 
 def test_stale_provider_sync_queues_a_deduplicated_webhook_alert(monkeypatch):
